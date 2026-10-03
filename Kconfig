@@ -1,0 +1,11 @@
+mainmenu "Axys Kernel"
+
+config AXYS_CONSOLE_SERIAL
+	bool "16550 serial console"
+	default y
+
+config AXYS_CONSOLE_VGA
+	bool "VGA text console"
+	default y
+
+comment "GDT and IDT are mandatory for the current x86_64 kernel."

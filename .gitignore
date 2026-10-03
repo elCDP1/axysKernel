@@ -1,0 +1,8 @@
+# Build artifacts
+build/
+
+# Compiled binaries and objects
+*.o
+*.d
+*.elf
+*.exe
