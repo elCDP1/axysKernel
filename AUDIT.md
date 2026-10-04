@@ -436,3 +436,26 @@ to the public GitHub branch cannot be checked here. The old delivery note named
 referenced by the current build. `SHA256SUMS` was stale and included those
 missing paths; it has been regenerated for the files actually present, excluding
 the checksum file itself and ignored build outputs.
+
+### Boot order: PIT before disk drivers
+
+- `kernel/main.c` probed disks (`axys_disk_init()`) before the PIT was
+  programmed and before interrupts were enabled. AHCI COMRESET and settle waits
+  use `axys_pit_sleep_ms()`, which returns immediately while `pit_hz == 0`
+  (skipping required delays) and would spin forever if the timer were programmed
+  with interrupts still masked. Fixed by running `axys_sched_init()`,
+  `axys_pit_start()`, `axys_pit_init()` and `axys_cpu_enable_interrupts()`
+  before the disk probe. `make check`, `check-ahci` and `check-nvme` pass;
+  `check-highmem` needs 5 GiB of host RAM and could not run in a 4 GiB sandbox.
+
+### Shell input hardening (found by driving the booted kernel over serial)
+
+- `console_read()` (`kernel/syscall.c`): after an over-long line the error was
+  printed but `line_len` was not reset, so the editor buffer stayed full and every
+  following line also reported "line too long": the shell never returned to its
+  prompt. The partial line is now discarded and an empty line is returned.
+- `parse_num()` (`user/init.c`): it wrapped on overflow and returned 0 when no
+  digits were present, so `su abc` meant uid 0 and `su 99999999999` meant a
+  truncated uid. It now rejects missing digits, trailing garbage and values above
+  32 bits; `su`, `chmod` and `chown` report -22 (EINVAL).
+- Regression coverage for both was added to stage 2 of `tools/qemu-test.sh`.

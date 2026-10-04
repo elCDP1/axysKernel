@@ -164,11 +164,21 @@ void axys_kmain(axys_uint32_t multiboot_magic, axys_uint32_t multiboot_informati
         }
         axys_printf("\n");
     }
+    /*
+     * The PIT must tick before any disk driver runs: AHCI COMRESET and NVMe
+     * readiness waits use axys_pit_sleep_ms(), which returns immediately while
+     * the timer is unprogrammed (pit_hz == 0) and spins forever if interrupts
+     * are still masked. Register the handler first, then program the timer,
+     * then enable interrupts.
+     */
+    axys_sched_init();
+    axys_pit_start();
+    axys_pit_init(AXYS_PIT_DEFAULT_HZ);
+    axys_cpu_enable_interrupts();
+
     /* The probe is idempotent, so persist_init asking again later is free. */
     (void)axys_disk_init();
     axys_printf("disk: %s\n", axys_disk_backend_note());
-
-    axys_cpu_enable_interrupts();
 
     /*
      * Prove the exception path works before entering the idle loop. Nothing in
@@ -185,9 +195,6 @@ void axys_kmain(axys_uint32_t multiboot_magic, axys_uint32_t multiboot_informati
      * registered would be counted by nobody and the total would be permanently
      * off by one.
      */
-    axys_sched_init();
-    axys_pit_start();
-    axys_pit_init(AXYS_PIT_DEFAULT_HZ);
     axys_pit_sleep_ms(250);
 
     axys_printf("pit: %u Hz, %u ticks in 250 ms (%u IRQs dispatched)\n",

@@ -235,9 +235,14 @@ static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, a
                  * report the error to the user instead of delivering the
                  * partial line. */
                 if (oversize) {
+                    /* Drop the partial line entirely and hand the reader an
+                     * empty one, so the shell prints its prompt again. Not
+                     * resetting line_len left the buffer full, which made
+                     * every later line overflow too: the shell was wedged. */
                     axys_console_write("line too long\n");
-                    oversize = 0;
-                    continue;
+                    proc->line_len = 0;
+                    proc->line[proc->line_len++] = '\n';
+                    break;
                 }
                 axys_console_putc('\n');
                 if (c == '\n') {

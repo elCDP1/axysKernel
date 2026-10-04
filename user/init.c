@@ -99,15 +99,27 @@ static void cmd_ls(const char *path)
     }
 }
 
-static u32 parse_num(const char **s, u32 base)
+/* Parse an unsigned number. Returns 0 and stores the value, or -1 when there
+ * is no digit or the value overflows 32 bits. Silently wrapping or returning 0
+ * turned typos like "su abc" or "chown 4294967297 f" into uid 0 / uid 1. */
+static int parse_num(const char **s, u32 base, u32 *out)
 {
-    u32 v = 0;
+    u64 v = 0;
+    int digits = 0;
 
     while (**s >= '0' && **s < (char)('0' + (base > 10 ? 10 : base))) {
-        v = v * base + (u32)(**s - '0');
+        v = v * base + (u64)(**s - '0');
+        if (v > 0xffffffffull) {
+            return -1;
+        }
         ++*s;
+        ++digits;
     }
-    return v;
+    if (digits == 0 || (**s != '\0' && **s != ' ')) {
+        return -1;
+    }
+    *out = (u32)v;
+    return 0;
 }
 
 static void cmd_cat(const char *path)
@@ -256,9 +268,12 @@ int main(const char *args, size_t len)
             puts("\n");
         } else if (strcmp(cmd, "su") == 0) {
             const char *a = rest;
-            u32 id = parse_num(&a, 10);
-            int r = setgid(id);
+            u32 id = 0;
+            int r = parse_num(&a, 10, &id) == 0 ? 0 : -22;
 
+            if (r == 0) {
+                r = setgid(id);
+            }
             if (r == 0) {
                 r = setuid(id);
             }
@@ -267,28 +282,36 @@ int main(const char *args, size_t len)
             }
         } else if (strcmp(cmd, "chmod") == 0) {
             const char *a = rest;
-            u32 mode = parse_num(&a, 8);
+            u32 mode = 0;
+            int r = parse_num(&a, 8, &mode) == 0 ? 0 : -22;
 
             while (*a == ' ') {
                 ++a;
             }
-            int r = chmod(a, mode);
+            if (r == 0) {
+                r = chmod(a, mode);
+            }
             if (r < 0) {
                 print_status("chmod", r);
             }
         } else if (strcmp(cmd, "chown") == 0) {
             const char *a = rest;
-            u32 uid = parse_num(&a, 10);
+            u32 uid = 0;
+            u32 gid = 0;
+            int r = parse_num(&a, 10, &uid) == 0 ? 0 : -22;
 
             while (*a == ' ') {
                 ++a;
             }
-            u32 gid = parse_num(&a, 10);
-
+            if (r == 0 && parse_num(&a, 10, &gid) != 0) {
+                r = -22;
+            }
             while (*a == ' ') {
                 ++a;
             }
-            int r = chown(a, uid, gid);
+            if (r == 0) {
+                r = chown(a, uid, gid);
+            }
             if (r < 0) {
                 print_status("chown", r);
             }
