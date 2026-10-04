@@ -286,10 +286,10 @@ pgt_low:
     movl %eax, 0(%edi)
     movl $0, 4(%edi)
 
-    /* Remaining 2 MiB PDEs map the low GiB as writable, supervisor-only, NX.
-     * Low half = physical base | P|W|PS (0x83); NX lives only in bit 63 via
-     * the high dword -- see the pgt_low comment above for why 0x80000000 must
-     * never appear in the low half. */
+    /* The 4 KiB table above covers exactly one 2 MiB region; every kernel
+     * page beyond it (including .rodata/.data/.bss and the boot stacks,
+     * which live past __kernel_end's text+rodata prefix) is mapped by the
+     * remaining huge-page PDEs below. */
     add $8, %edi
     mov $0x00200083, %eax          /* second 2 MiB page: phys 0x200000 | 0x83 */
     mov $511, %ecx

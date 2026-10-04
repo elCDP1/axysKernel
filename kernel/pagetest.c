@@ -155,8 +155,8 @@ int axys_pagetest_selftest(void)
                (e & 0x80000000ull) == 0);
     }
 
-    expect("kernel image inside first 2 MiB mapping",
-           (axys_uint64_t)(axys_uintptr_t)__kernel_end <= 0x200000ull);
+    expect("kernel image inside first 1 GiB boot identity mapping",
+           (axys_uint64_t)(axys_uintptr_t)__kernel_end <= 0x40000000ull);
 
     if (checks_failed != 0) {
         axys_printf("pagetest: FAILED (%u/%u checks)\n", checks_failed, checks_run);

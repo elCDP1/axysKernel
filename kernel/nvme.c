@@ -1,4 +1,6 @@
 #include "axys/nvme.h"
+#include "axys/cpu.h"
+#include "axys/pit.h"
 #include "axys/pci.h"
 #include "axys/pmm.h"
 #include "axys/printf.h"
@@ -29,6 +31,7 @@
 #define CAP_CSS(cap) ((axys_uint32_t)(((cap) >> 37) & 0xffu))
 #define CAP_MPSMIN(cap) ((axys_uint32_t)(((cap) >> 48) & 0x0fu))
 #define CAP_MPSMAX(cap) ((axys_uint32_t)(((cap) >> 52) & 0x0fu))
+#define CAP_TO_MS(cap) ((axys_uint64_t)(((cap) >> 24) & 0xffu) * 500u)
 #define CAP_DSTRD(cap) ((axys_uint32_t)(((cap) >> 32) & 0x0fu))
 
 #define CSTS_RDY 0x01u
@@ -53,7 +56,27 @@
 #define SECTOR_SIZE 512u
 #define PAGE_SIZE 4096u
 #define SECTORS_PER_PAGE (PAGE_SIZE / SECTOR_SIZE)
-#define WAIT_SPINS 30000000u
+/* Time-bounded polling budgets (milliseconds), like the AHCI driver: counting
+ * MMIO reads made the real wait depend on CPU speed and host latency. CAP.TO
+ * (in 500 ms units) is the controller's own advertised startup timeout and is
+ * honored at enable time; these are the ceilings for waits that have no CAP
+ * field. The NVMe spec allows a formatted drive up to 2 minutes to complete a
+ * command before it must report failure, so command/completion waits get that;
+ * CSTS.RDY transitions after an enable/disable follow CC.TIMEOUT instead,
+ * which we cap here. */
+#define NVME_TIMEOUT_CMD_MS      120000u /* completion of any submitted command */
+#define NVME_TIMEOUT_READY_MS     30000u /* CSTS.RDY transitions (fallback if CAP.TO is 0) */
+#define NVME_TIMEOUT_SHUTDOWN_MS   5000u /* CC.SHN handshake */
+
+static axys_uint64_t nvme_deadline_ms(axys_uint64_t ms)
+{
+    return axys_pit_millis() + ms;
+}
+
+static int nvme_expired(axys_uint64_t deadline)
+{
+    return (axys_int64_t)(deadline - axys_pit_millis()) <= 0;
+}
 
 struct nvme_command {
     axys_uint32_t dword[16];
@@ -76,6 +99,7 @@ static axys_uint8_t identify_page[PAGE_SIZE] AXYS_ALIGN(PAGE_SIZE);
 static axys_uint64_t register_base;
 static axys_uint64_t sectors;
 static axys_uint64_t capability;
+static axys_uint64_t startup_timeout_ms; /* CAP.TO, clamped */
 static axys_uint32_t queue_depth;
 static axys_uint32_t doorbell_stride;
 static axys_uint32_t admin_sq_tail;
@@ -120,9 +144,11 @@ static void ring_doorbell(axys_uint32_t queue_id, int completion, axys_uint32_t 
     __sync_synchronize();
 }
 
-static int wait_ready(int ready)
+static int wait_ready(int ready, axys_uint64_t ms)
 {
-    for (axys_uint32_t spin = 0; spin < WAIT_SPINS; ++spin) {
+    axys_uint64_t deadline = nvme_deadline_ms(ms);
+
+    for (;;) {
         axys_uint32_t status = read_reg32(REG_CSTS);
 
         if ((status & CSTS_CFS) != 0u) {
@@ -131,9 +157,11 @@ static int wait_ready(int ready)
         if (((status & CSTS_RDY) != 0u) == (ready != 0)) {
             return 0;
         }
-        __asm__ volatile("pause");
+        if (nvme_expired(deadline)) {
+            return -1;
+        }
+        axys_cpu_relax();
     }
-    return -1;
 }
 
 static axys_uint16_t next_cid(void)
@@ -157,7 +185,10 @@ static int take_completion(volatile struct nvme_completion *queue, axys_uint32_t
                            axys_uint32_t *head, axys_uint32_t *phase,
                            axys_uint32_t queue_id, axys_uint16_t expected_cid)
 {
-    for (axys_uint32_t spin = 0; spin < WAIT_SPINS; ++spin) {
+    {
+    axys_uint64_t deadline = nvme_deadline_ms(NVME_TIMEOUT_CMD_MS);
+
+    for (;;) {
         axys_uint32_t status = queue[*head].dword[3];
 
         /* CQE DW3 packs CID in bits 15:0 and status in bits 31:16;
@@ -184,9 +215,12 @@ static int take_completion(volatile struct nvme_completion *queue, axys_uint32_t
         if ((read_reg32(REG_CSTS) & CSTS_CFS) != 0u) {
             return -1;
         }
-        __asm__ volatile("pause");
+        if (nvme_expired(deadline)) {
+            return -1;
+        }
+        axys_cpu_relax();
     }
-    return -1;
+    }
 }
 
 static int admin_command(struct nvme_command *command)
@@ -341,6 +375,14 @@ int axys_nvme_init(void)
         axys_snprintf(summary, sizeof(summary), "NVMe doorbells are not in reserved MMIO space");
         return -1;
     }
+    /* CAP.TO: worst-case time for CSTS.RDY to reach 1 after CC.EN is set, in
+     * 500 ms units. Controllers are allowed to advertise up to 127.5 s; use
+     * the real value instead of a fixed guess so slow-but-healthy hardware is
+     * not declared dead, while a broken one still fails within a bound. */
+    startup_timeout_ms = CAP_TO_MS(capability);
+    if (startup_timeout_ms == 0u || startup_timeout_ms > NVME_TIMEOUT_READY_MS) {
+        startup_timeout_ms = NVME_TIMEOUT_READY_MS;
+    }
     version = read_reg32(REG_VS);
     controller_major = (axys_uint32_t)(version >> 16);
     if (controller_major != 1u) {
@@ -352,7 +394,10 @@ int axys_nvme_init(void)
     /* Interrupts remain masked: all completions are polled. */
     write_reg32(REG_INTMS, 0xffffffffu);
     write_reg32(REG_CC, read_reg32(REG_CC) & ~CC_EN);
-    if (wait_ready(0) != 0) {
+    /* A disable transition has no advertised bound in CAP (TO covers startup
+     * only); NVMe implementations take RDY down within their startup timeout
+     * in practice, so reuse it with a sane fallback. */
+    if (wait_ready(0, startup_timeout_ms) != 0) {
         axys_snprintf(summary, sizeof(summary), "controller did not stop");
         return -1;
     }
@@ -375,7 +420,7 @@ int axys_nvme_init(void)
     *reg64(REG_ACQ) = (axys_uint64_t)(axys_uintptr_t)admin_cq;
     __sync_synchronize();
     write_reg32(REG_CC, CC_EN | CC_IOSQES_64 | CC_IOCQES_16);
-    if (wait_ready(1) != 0) {
+    if (wait_ready(1, startup_timeout_ms) != 0) {
         axys_snprintf(summary, sizeof(summary), "controller failed to become ready");
         return -1;
     }

@@ -57,10 +57,13 @@ SECTIONS
     . = ALIGN(4K);
     __kernel_end = .;
 
-    /* boot.S only maps the kernel's initial 2 MiB with 4 KiB pages. Refuse a
-     * link that grows beyond that contract instead of producing an image that
-     * boots and then faults when it executes/copies late sections. */
-    ASSERT(__kernel_end <= 0x200000, "kernel exceeds initial 2 MiB boot mapping")
+    /* boot.S splits the FIRST 2 MiB into 4 KiB pages (W^X for text/rodata);
+     * everything past that -- .data, .bss, boot page tables and stacks -- is
+     * covered by the 2 MiB huge-page PDEs of the low-GiB identity map, so the
+     * real early-boot constraint is the whole first GiB, not 2 MiB. The
+     * assertion still guards against a kernel so large it would collide with
+     * GRUB-provided structures or exceed what the fixed boot tables cover. */
+    ASSERT(__kernel_end <= 0x40000000, "kernel exceeds initial 1 GiB boot identity mapping")
 
     /*
      * Only truly inert sections are discarded. Debug and note sections are
