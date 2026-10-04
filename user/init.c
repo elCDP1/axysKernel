@@ -177,7 +177,7 @@ static void cmd_echo(char *rest)
 
 static void help(void)
 {
-    puts("builtins: help ls cat echo mkdir rm uptime random pid id su chmod chown sync sleep run poweroff reboot exit\n"
+    puts("builtins: help ls cat echo mkdir rm mv rmtree meminfo uptime random pid id su chmod chown sync sleep run poweroff reboot exit\n"
          "any other word runs /bin/<word> (arguments are passed through)\n"
          "try: hello world | crash null | crash kexec | crash badptr | heap | fileio\n");
 }
@@ -239,6 +239,45 @@ int main(const char *args, size_t len)
             int r = unlink(rest);
             if (r < 0) {
                 print_status("rm", r);
+            }
+        } else if (strcmp(cmd, "mv") == 0) {
+            char *dst = rest;
+
+            while (*dst && *dst != ' ') {
+                ++dst;
+            }
+            if (*dst) {
+                *dst++ = '\0';
+            }
+            while (*dst == ' ') {
+                ++dst;
+            }
+            if (*rest == '\0' || *dst == '\0') {
+                print_status("mv", -22);
+            } else {
+                int r = rename(rest, dst);
+                if (r < 0) {
+                    print_status("mv", r);
+                }
+            }
+        } else if (strcmp(cmd, "rmtree") == 0) {
+            print_status("rmtree", rmtree(rest));
+        } else if (strcmp(cmd, "meminfo") == 0) {
+            struct meminfo mi;
+            int r = meminfo(&mi);
+
+            if (r < 0) {
+                print_status("meminfo", r);
+            } else {
+                puts("frames_free=");
+                put_u64(mi.free_frames);
+                puts(" heap_used=");
+                put_u64(mi.heap_used);
+                puts(" heap_free=");
+                put_u64(mi.heap_free);
+                puts(" live_nodes=");
+                put_u64(mi.live_nodes);
+                puts("\n");
             }
         } else if (strcmp(cmd, "uptime") == 0) {
             u64 ms = uptime_ms();
@@ -321,12 +360,18 @@ int main(const char *args, size_t len)
                 print_status("sync", r);
             }
         } else if (strcmp(cmd, "sleep") == 0) {
-            u64 s = 0;
+            const char *a = rest;
+            u32 s = 0;
+            int r = parse_num(&a, 10, &s);
 
-            for (const char *c = rest; *c >= '0' && *c <= '9'; ++c) {
-                s = s * 10 + (u64)(*c - '0');
+            while (*a == ' ') {
+                ++a;
             }
-            sleep_ms(s * 1000);
+            if (r != 0 || *a != '\0') {
+                print_status("sleep", -22);
+            } else {
+                sleep_ms((u64)s * 1000);
+            }
         } else if (strcmp(cmd, "run") == 0) {
             char *a = rest;
 

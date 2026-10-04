@@ -4,6 +4,7 @@
 #include "axys/pci.h"
 #include "axys/pmm.h"
 #include "axys/printf.h"
+#include "axys/sched.h"
 #include "axys/spinlock.h"
 #include "axys/string.h"
 #include "axys/vmm.h"
@@ -113,6 +114,7 @@ static axys_uint16_t last_command_status;
 static int present;
 static char summary[192];
 static struct axys_spinlock nvme_lock;
+static int nvme_busy;
 
 static volatile axys_uint32_t *reg32(axys_uint32_t offset)
 {
@@ -385,7 +387,11 @@ int axys_nvme_init(void)
     }
     version = read_reg32(REG_VS);
     controller_major = (axys_uint32_t)(version >> 16);
-    if (controller_major != 1u) {
+    /* The 1.x and 2.x controller interfaces are identical for the subset used
+     * here (admin queues, Identify, Read/Write/Flush with PRPs): 2.0
+     * reorganized the specification, not the registers. Refusing 2.x would
+     * turn away working hardware for no functional reason. */
+    if (controller_major != 1u && controller_major != 2u) {
         axys_snprintf(summary, sizeof(summary), "unsupported NVMe version %u.%u",
                       controller_major, (axys_uint32_t)((version >> 8) & 0xffu));
         return -1;
@@ -481,16 +487,44 @@ static int request_valid(axys_uint64_t lba, axys_uint32_t count, const void *buf
            (axys_uint64_t)count <= sectors - lba;
 }
 
+/* Commands serialize on a flag, AHCI-style, rather than under the spinlock
+ * with interrupts masked. The completion polls are bounded by pit_millis(),
+ * which only advances on IRQ0: holding an irqsave lock across a 120 s wait
+ * would freeze the very clock the timeout reads, turning a dead controller
+ * into an infinite loop with interrupts disabled. Interrupts stay enabled
+ * here (no handler touches the queues), so the deadline keeps working. */
+static void nvme_lock_take(void)
+{
+    for (;;) {
+        axys_uint64_t flags = axys_spin_lock_irqsave(&nvme_lock);
+
+        if (!nvme_busy) {
+            nvme_busy = 1;
+            axys_spin_unlock_irqrestore(&nvme_lock, flags);
+            return;
+        }
+        axys_spin_unlock_irqrestore(&nvme_lock, flags);
+        axys_yield();
+    }
+}
+
+static void nvme_lock_release(void)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&nvme_lock);
+
+    nvme_busy = 0;
+    axys_spin_unlock_irqrestore(&nvme_lock, flags);
+}
+
 int axys_nvme_read(axys_uint64_t lba, axys_uint32_t count, void *buffer)
 {
     axys_uint8_t *output = (axys_uint8_t *)buffer;
-    axys_uint64_t flags;
     int result = 0;
 
     if (!request_valid(lba, count, buffer)) {
         return -1;
     }
-    flags = axys_spin_lock_irqsave(&nvme_lock);
+    nvme_lock_take();
     while (count != 0u) {
         axys_uint32_t chunk = count > SECTORS_PER_PAGE ? SECTORS_PER_PAGE : count;
         axys_size_t bytes = chunk * SECTOR_SIZE;
@@ -504,20 +538,19 @@ int axys_nvme_read(axys_uint64_t lba, axys_uint32_t count, void *buffer)
         lba += chunk;
         count -= chunk;
     }
-    axys_spin_unlock_irqrestore(&nvme_lock, flags);
+    nvme_lock_release();
     return result;
 }
 
 int axys_nvme_write(axys_uint64_t lba, axys_uint32_t count, const void *buffer)
 {
     const axys_uint8_t *input = (const axys_uint8_t *)buffer;
-    axys_uint64_t flags;
     int result = 0;
 
     if (!request_valid(lba, count, buffer)) {
         return -1;
     }
-    flags = axys_spin_lock_irqsave(&nvme_lock);
+    nvme_lock_take();
     while (count != 0u) {
         axys_uint32_t chunk = count > SECTORS_PER_PAGE ? SECTORS_PER_PAGE : count;
         axys_size_t bytes = chunk * SECTOR_SIZE;
@@ -531,20 +564,19 @@ int axys_nvme_write(axys_uint64_t lba, axys_uint32_t count, const void *buffer)
         lba += chunk;
         count -= chunk;
     }
-    axys_spin_unlock_irqrestore(&nvme_lock, flags);
+    nvme_lock_release();
     return result;
 }
 
 int axys_nvme_flush(void)
 {
-    axys_uint64_t flags;
     int result;
 
     if (!present) {
         return -1;
     }
-    flags = axys_spin_lock_irqsave(&nvme_lock);
+    nvme_lock_take();
     result = submit_io(IO_FLUSH, 0u, 0u);
-    axys_spin_unlock_irqrestore(&nvme_lock, flags);
+    nvme_lock_release();
     return result;
 }

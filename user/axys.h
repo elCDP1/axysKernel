@@ -19,7 +19,14 @@ enum {
     SYS_EXIT, SYS_WRITE, SYS_READ, SYS_OPEN, SYS_CLOSE, SYS_LSEEK, SYS_SLEEP_MS, SYS_GETPID,
     SYS_GETRANDOM, SYS_YIELD, SYS_UPTIME_MS, SYS_SBRK, SYS_SPAWN, SYS_WAIT, SYS_MKDIR,
     SYS_UNLINK, SYS_READDIR, SYS_STAT, SYS_POWER, SYS_KILL, SYS_GETUID, SYS_GETGID, SYS_SETUID,
-    SYS_SETGID, SYS_CHMOD, SYS_CHOWN, SYS_SYNC
+    SYS_SETGID, SYS_CHMOD, SYS_CHOWN, SYS_SYNC, SYS_RENAME, SYS_RMDIR_TREE, SYS_MEMINFO
+};
+
+struct meminfo {
+    u64 free_frames;
+    u64 heap_used;
+    u64 heap_free;
+    u64 live_nodes;
 };
 
 struct stat_info {
@@ -76,6 +83,9 @@ static inline int chmod(const char *path, u32 mode) { return (int)sys3(SYS_CHMOD
 static inline int chown(const char *path, u32 uid, u32 gid) { return (int)sys3(SYS_CHOWN, path, uid, gid); }
 static inline int sync(void) { return (int)sys3(SYS_SYNC, 0, 0, 0); }
 static inline int power(int reboot) { return (int)sys3(SYS_POWER, reboot, 0, 0); }
+static inline int rename(const char *from, const char *to) { return (int)sys3(SYS_RENAME, from, to, 0); }
+static inline int rmtree(const char *path) { return (int)sys3(SYS_RMDIR_TREE, path, 0, 0); }
+static inline int meminfo(struct meminfo *out) { return (int)sys3(SYS_MEMINFO, out, 0, 0); }
 
 void *memcpy(void *dst, const void *src, size_t n);
 void *memset(void *dst, int c, size_t n);

@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "axys/vfs.h"
@@ -120,6 +121,45 @@ static void test_failed_replace_keeps_contents(void)
     assert(axys_vfs_size(f) == 4 && axys_vfs_read(f, buf, 4) == 4 && buf[0] == 'k');
 }
 
+/* Regression: rm -rf with 10 children freed only 6 (swap-remove skipped the
+ * entry swapped into the hole while the forward index kept advancing). */
+static void test_remove_tree_frees_all_children(void)
+{
+    char path[32];
+
+    axys_vfs_init();
+    assert(axys_vfs_create("/tmp/wide", AXYS_VFS_DIR) >= 0);
+    for (int i = 0; i < 10; ++i) {
+        snprintf(path, sizeof(path), "/tmp/wide/f%d", i);
+        assert(axys_vfs_create(path, AXYS_VFS_FILE) >= 0);
+    }
+    assert(axys_vfs_remove_tree("/tmp/wide") == 11); /* dir + 10 files */
+    assert(axys_vfs_lookup("/tmp/wide") == -1);
+    for (int i = 0; i < 10; ++i) {
+        snprintf(path, sizeof(path), "/tmp/wide/f%d", i);
+        assert(axys_vfs_lookup(path) == -1);
+    }
+    /* Nested directories go too, and the count covers every node. */
+    assert(axys_vfs_mkdirs("/tmp/deep/a/b") == 0);
+    assert(axys_vfs_create("/tmp/deep/a/f", AXYS_VFS_FILE) >= 0);
+    assert(axys_vfs_remove_tree("/tmp/deep") == 4);
+    assert(axys_vfs_lookup("/tmp/deep") == -1);
+    assert(axys_vfs_remove_tree("/") == -1); /* never the root */
+}
+
+/* Regression: rename accepted "." and ".." as the destination leaf, planting
+ * nodes with those names in the tree. */
+static void test_rename_rejects_dot_names(void)
+{
+    axys_vfs_init();
+    assert(axys_vfs_create("/tmp/src", AXYS_VFS_FILE) >= 0);
+    assert(axys_vfs_rename("/tmp/src", "/tmp/.") != 0);
+    assert(axys_vfs_rename("/tmp/src", "/tmp/..") != 0);
+    assert(axys_vfs_lookup("/tmp/src") >= 0); /* source untouched */
+    assert(axys_vfs_rename("/tmp/src", "/moved") == 0); /* root parent works */
+    assert(axys_vfs_lookup("/moved") >= 0 && axys_vfs_lookup("/tmp/src") == -1);
+}
+
 int main(void)
 {
     test_permissions();
@@ -129,5 +169,7 @@ int main(void)
     test_create_and_io_still_work();
     test_slot_reuse_changes_generation();
     test_failed_replace_keeps_contents();
+    test_remove_tree_frees_all_children();
+    test_rename_rejects_dot_names();
     return 0;
 }

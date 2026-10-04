@@ -541,9 +541,13 @@ static int rename_split_target(const char *to, char *parent_path, axys_size_t pa
             }
         }
         if (last == to) {
-            return -1; /* "/name": destination parent is "/" itself */
-        }
-        {
+            /* "/name": the destination parent is the root itself. */
+            if (parent_cap < 2u) {
+                return -1;
+            }
+            parent_path[0] = '/';
+            parent_path[1] = '\0';
+        } else {
             axys_size_t parent_len = (axys_size_t)(last - to);
 
             if (parent_len >= parent_cap) {
@@ -562,6 +566,15 @@ static int rename_split_target(const char *to, char *parent_path, axys_size_t pa
         }
         if (*name_len_out == 0) {
             return -1; /* trailing slash */
+        }
+        /* "." and ".." are never valid entry names: walk() rejects them so
+         * the destination could otherwise smuggle a node with such a name
+         * into the tree, aliasing the parent or breaking future walks. */
+        if (*name_len_out == 1 && (*name_out)[0] == '.') {
+            return -1;
+        }
+        if (*name_len_out == 2 && (*name_out)[0] == '.' && (*name_out)[1] == '.') {
+            return -1;
         }
     }
     return 0;
@@ -596,6 +609,10 @@ static int node_rename(axys_int32_t node, axys_int32_t new_parent, const char *n
     }
 
     if (new_name_len >= AXYS_VFS_NAME_MAX) {
+        return -1;
+    }
+    if ((new_name_len == 1 && new_name[0] == '.') ||
+        (new_name_len == 2 && new_name[0] == '.' && new_name[1] == '.')) {
         return -1;
     }
     if (dir->child_count == dir->child_cap) {
@@ -726,15 +743,14 @@ axys_int32_t axys_vfs_remove_tree(const char *path)
     axys_int32_t result = -1;
 
     if (node > 0) {
-        /* Explicit stack of pending directory frames. Each entry remembers
-         * which child index has already been dispatched, so no recursion is
-         * needed and memory pressure can never turn into a stack overflow. */
-        struct remove_frame {
-            axys_int32_t dir;
-            axys_uint32_t next_child;
-        };
-        struct remove_frame *stack =
-            axys_kmalloc(AXYS_VFS_MAX_NODES * sizeof(*stack));
+        /* Explicit stack of pending directories. Each entry is a directory
+         * whose descendants are still being released. The traversal always
+         * takes the LAST child of the top directory: removing the last slot
+         * is a trivial pop that never moves the remaining children, so no
+         * entry is ever skipped. (The previous forward-index walk called
+         * node_unlink_from_parent(), which swap-removes an arbitrary slot;
+         * with 10 children only 6 were freed and the rest leaked forever.) */
+        axys_int32_t *stack = axys_kmalloc(AXYS_VFS_MAX_NODES * sizeof(*stack));
         axys_size_t top = 0;
 
         if (stack == AXYS_NULL) {
@@ -743,25 +759,25 @@ axys_int32_t axys_vfs_remove_tree(const char *path)
             axys_int32_t removed = 0;
             int failed = 0;
 
-            stack[top].dir = node;
-            stack[top].next_child = 0;
-            ++top;
+            stack[top++] = node;
 
             while (top != 0 && !failed) {
-                struct remove_frame *frame = &stack[top - 1];
-                axys_int32_t target = frame->dir;
+                axys_int32_t target = stack[top - 1];
 
                 if (!node_valid(target)) {
                     /* stale reference inside our own stack: drop the frame */
                     --top;
                     continue;
                 }
-                if (frame->next_child < nodes[target].child_count) {
-                    axys_int32_t child = nodes[target].children[frame->next_child];
+                if (nodes[target].child_count != 0) {
+                    axys_int32_t child =
+                        nodes[target].children[nodes[target].child_count - 1u];
 
-                    ++frame->next_child;
                     if (!node_valid(child)) {
-                        continue; /* inconsistent tree: skip the stale link */
+                        /* inconsistent tree: drop the stale link (it is the
+                         * last slot, so no other child moves). */
+                        --nodes[target].child_count;
+                        continue;
                     }
                     if (nodes[child].type == AXYS_VFS_DIR &&
                         nodes[child].child_count != 0) {
@@ -769,9 +785,7 @@ axys_int32_t axys_vfs_remove_tree(const char *path)
                             failed = 1; /* cannot happen: dirs <= nodes */
                             break;
                         }
-                        stack[top].dir = child;
-                        stack[top].next_child = 0;
-                        ++top;
+                        stack[top++] = child;
                     } else {
                         node_unlink_from_parent(child);
                         node_release(child);
@@ -896,6 +910,15 @@ axys_uint32_t axys_vfs_generation(axys_vfs_node_t node)
     return gen;
 }
 
+axys_uint64_t axys_vfs_live_nodes(void)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    axys_uint64_t live = live_nodes;
+
+    axys_spin_unlock_irqrestore(&vfs_lock, flags);
+    return live;
+}
+
 axys_int32_t axys_vfs_chmod(axys_vfs_node_t node, axys_uint32_t mode)
 {
     axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
@@ -978,7 +1001,7 @@ void axys_vfs_selftest(void)
 {
     axys_vfs_node_t hostname;
     axys_vfs_node_t big;
-    const char msg[] = "axys";
+    static const char msg[] = "axys\n";
     char readback[8];
     static const char tail[] = "END";
     char probe[3];
@@ -1009,12 +1032,12 @@ void axys_vfs_selftest(void)
     }
 
     hostname = axys_vfs_lookup("/etc/hostname");
-    if (axys_vfs_write(hostname, msg, sizeof(msg)) != (axys_int32_t)sizeof(msg)) {
+    if (axys_vfs_write(hostname, msg, sizeof(msg) - 1u) != (axys_int32_t)(sizeof(msg) - 1u)) {
         axys_panic("vfs: write returned wrong length");
     }
     axys_memset(readback, 0, sizeof(readback));
-    if (axys_vfs_read(hostname, readback, sizeof(readback)) != (axys_int32_t)sizeof(msg) ||
-        axys_memcmp(readback, msg, sizeof(msg)) != 0) {
+    if (axys_vfs_read(hostname, readback, sizeof(readback)) != (axys_int32_t)(sizeof(msg) - 1u) ||
+        axys_memcmp(readback, msg, sizeof(msg) - 1u) != 0) {
         axys_panic("vfs: read data did not match write");
     }
     if (axys_vfs_write(0, msg, sizeof(msg)) >= 0) {
@@ -1058,6 +1081,21 @@ void axys_vfs_selftest(void)
     }
     if (axys_vfs_mkdirs("/usr/local/share/axys") != 0 || axys_vfs_lookup("/usr/local/share/axys") < 0) {
         axys_panic("vfs: mkdirs failed");
+    }
+
+    /* The selftest runs on the live tree, not on a scratch copy: everything
+     * it created above must be removed again, otherwise /etc/hostname keeps a
+     * test payload (hiding the real default installed later) and /home/user
+     * stays owned by uid 0 instead of the 1000:1000 owner that
+     * axys_initrd_install_defaults() would assign on a clean tree. */
+    if (axys_vfs_unlink("/etc/hostname") != 0) {
+        axys_panic("vfs: selftest cleanup of /etc/hostname failed");
+    }
+    if (axys_vfs_unlink("/home/user") != 0) {
+        axys_panic("vfs: selftest cleanup of /home/user failed");
+    }
+    if (axys_vfs_remove_tree("/usr/local") < 0) {
+        axys_panic("vfs: selftest cleanup of /usr/local failed");
     }
 
     axys_printf("vfs: selftest passed (%u live nodes)\n", live_nodes);

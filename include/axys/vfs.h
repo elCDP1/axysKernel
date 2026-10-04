@@ -99,6 +99,9 @@ axys_int32_t axys_vfs_access(axys_vfs_node_t node, axys_uint32_t uid, axys_uint3
  * persistence layer uses it to know when a snapshot is worth writing. */
 axys_uint64_t axys_vfs_mutations(void);
 
+/* Nodes currently allocated (for the MEMINFO leak detector). */
+axys_uint64_t axys_vfs_live_nodes(void);
+
 /* Print the whole tree to the console (used at boot to prove the namespace
  * is up). */
 void axys_vfs_dump(void);

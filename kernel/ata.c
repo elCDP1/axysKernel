@@ -171,6 +171,17 @@ int axys_ata_read(axys_uint32_t lba, axys_uint32_t count, void *buffer)
             break;
         }
         axys_insw(ATA_DATA, out + (axys_size_t)i * AXYS_SECTOR_SIZE, 256);
+        {
+            int status = wait_not_busy();
+
+            /* Same post-transfer verdict as the write path: a fault that
+             * arrives with the data must fail the sector, not return bytes
+             * the drive disowned. */
+            if (status < 0 || (status & (ST_ERR | ST_DF)) != 0) {
+                rc = -1;
+                break;
+            }
+        }
     }
     unlock();
     return rc;
@@ -198,8 +209,15 @@ int axys_ata_write(axys_uint32_t lba, axys_uint32_t count, const void *buffer)
             break;
         }
         axys_outsw(ATA_DATA, in + (axys_size_t)i * AXYS_SECTOR_SIZE, 256);
-        if (wait_not_busy() < 0) {
-            rc = -1;
+        {
+            int status = wait_not_busy();
+
+            /* The drive reports write faults after the transfer, not before:
+             * ignoring the post-write status confirms writes that never
+             * landed. */
+            if (status < 0 || (status & (ST_ERR | ST_DF)) != 0) {
+                rc = -1;
+            }
         }
     }
     unlock();
@@ -209,15 +227,21 @@ int axys_ata_write(axys_uint32_t lba, axys_uint32_t count, const void *buffer)
 int axys_ata_flush(void)
 {
     int rc = 0;
+    int status;
 
     if (total_sectors == 0) {
         return -1;
     }
     lock();
-    axys_outb(ATA_DRIVE, 0xe0);
-    axys_outb(ATA_COMMAND, CMD_FLUSH);
     if (wait_not_busy() < 0) {
         rc = -1;
+    } else {
+        axys_outb(ATA_DRIVE, 0xe0);
+        axys_outb(ATA_COMMAND, CMD_FLUSH);
+        status = wait_not_busy();
+        if (status < 0 || (status & (ST_ERR | ST_DF)) != 0) {
+            rc = -1;
+        }
     }
     unlock();
     return rc;

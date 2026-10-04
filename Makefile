@@ -54,9 +54,11 @@ HOST_VFS_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_VFS_TEST_SOURCES))
 HOST_PERSIST_TEST_SOURCES := tests/test_persist.c tests/ramdisk.c tests/vfs_stub.c kernel/persist.c kernel/vfs.c lib/string.c lib/printf.c
 HOST_ACPI_TEST_SOURCES := tests/test_acpi.c kernel/acpi_aml.c
 HOST_ELF_TEST_SOURCES := tests/test_elf.c kernel/elf.c lib/string.c
+HOST_PATH_TEST_SOURCES := tests/test_path.c lib/string.c lib/path.c
 HOST_PERSIST_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PERSIST_TEST_SOURCES))
 HOST_ACPI_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ACPI_TEST_SOURCES))
 HOST_ELF_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ELF_TEST_SOURCES))
+HOST_PATH_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PATH_TEST_SOURCES))
 
 .PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci
 
@@ -65,7 +67,7 @@ all: kernel
 kernel: build/axys.elf
 
 # Regenerate objects if any header changed, not just the .c file itself.
--include $(KERNEL_OBJECTS:.o=.d) $(HOST_STRING_TEST_OBJECTS:.o=.d) $(HOST_MB2_TEST_OBJECTS:.o=.d) $(HOST_FRAME_TEST_OBJECTS:.o=.d) $(HOST_EXCEPTION_TEST_OBJECTS:.o=.d) $(HOST_VFS_TEST_OBJECTS:.o=.d) $(HOST_PERSIST_TEST_OBJECTS:.o=.d) $(HOST_ACPI_TEST_OBJECTS:.o=.d) $(HOST_ELF_TEST_OBJECTS:.o=.d)
+-include $(KERNEL_OBJECTS:.o=.d) $(HOST_STRING_TEST_OBJECTS:.o=.d) $(HOST_MB2_TEST_OBJECTS:.o=.d) $(HOST_FRAME_TEST_OBJECTS:.o=.d) $(HOST_EXCEPTION_TEST_OBJECTS:.o=.d) $(HOST_VFS_TEST_OBJECTS:.o=.d) $(HOST_PERSIST_TEST_OBJECTS:.o=.d) $(HOST_ACPI_TEST_OBJECTS:.o=.d) $(HOST_ELF_TEST_OBJECTS:.o=.d) $(HOST_PATH_TEST_OBJECTS:.o=.d)
 
 build/axys.elf: $(KERNEL_OBJECTS) scripts/linker.ld
 	$(LD) $(KERNEL_LDFLAGS) -o $@ $(KERNEL_OBJECTS)
@@ -111,7 +113,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -120,6 +122,7 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_persist.exe
 	./build/test_acpi.exe
 	./build/test_elf.exe
+	./build/test_path.exe
 
 build/test_string.exe: $(HOST_STRING_TEST_OBJECTS)
 	@$(MKDIR)
@@ -152,6 +155,10 @@ build/test_elf.exe: $(HOST_ELF_TEST_OBJECTS)
 build/test_vfs.exe: $(HOST_VFS_TEST_OBJECTS)
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_VFS_TEST_OBJECTS)
+
+build/test_path.exe: $(HOST_PATH_TEST_OBJECTS)
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_PATH_TEST_OBJECTS)
 
 build/host/%.o: %.c
 	@$(MKDIR)

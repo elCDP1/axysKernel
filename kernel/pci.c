@@ -52,22 +52,29 @@ void axys_pci_enable_bus_master(const struct axys_pci_device *device)
     cfg_write32(device->bus, device->device, device->function, AXYS_PCI_ID_COMMAND, command);
 }
 
-/* BARs are 32-bit slots whose meaning depends on bits 2:1 of the slot. A 64-bit
- * memory BAR consumes two consecutive slots, and the low half carries bit 0 set
- * to mark the pair; the upper half contains address bits only. Memory BAR
- * attributes occupy the low four bits, so they must all be masked from the
- * address (masking only bits 1:0 leaves the 64-bit type bit in the result). */
+/* BARs are 32-bit slots whose meaning depends on bit 0 first, then bits 2:1.
+ * A 64-bit memory BAR consumes two consecutive slots, and the low half carries
+ * bit 0 set to mark the pair; the upper half contains address bits only.
+ * Memory BAR attributes occupy the low four bits, so they must all be masked
+ * from the address (masking only bits 1:0 leaves the 64-bit type bit in the
+ * result). An I/O BAR (bit 0 set) with type bits 00 would otherwise decode as
+ * a 32-bit memory BAR at a wrong, truncated address, and a future driver
+ * mapping that address would touch unrelated hardware. */
 static void decode_bars(struct axys_pci_device *device, axys_uint8_t bus, axys_uint8_t slot,
                         axys_uint8_t function)
 {
     for (axys_uint8_t i = 0; i < AXYS_PCI_BAR_COUNT; ++i) {
         axys_uint32_t raw = cfg_read32(bus, slot, function, AXYS_PCI_ID_BAR0 + i * 4u);
-        axys_uint32_t type = (raw >> 1) & 3u;
+        axys_uint32_t type;
 
         device->bars[i] = AXYS_PCI_BAR_NONE;
         if (raw == 0u || raw == 0xffffffffu) {
             continue; /* unimplemented BAR */
         }
+        if ((raw & 1u) != 0u) {
+            continue; /* I/O port BAR: nothing in the kernel maps those */
+        }
+        type = (raw >> 1) & 3u;
         if (type == AXYS_PCI_BAR_MEM32) {
             device->bars[i] = raw & 0xfffffff0u;
         } else if (type == AXYS_PCI_BAR_MEM64) {

@@ -185,7 +185,9 @@ static void probe_vfs(void)
     check("create under a missing parent fails", open("/tmp/nodir/x", O_CREAT | O_RDWR) == -2, 53);
 
     /* Error codes must say what actually went wrong, not a blanket ENOENT. */
-    check("mkdir under a missing parent is ENOENT", mkdir("/tmp/nodir3/x") == -2, 67);
+    check("mkdir -p creates a missing parent", mkdir("/tmp/nodir3/x") == 0, 67);
+    check("nested leaf is a directory", stat("/tmp/nodir3/x", &st) == 0 && st.type == 2, 76);
+    check("nested parents are removed", rmtree("/tmp/nodir3") == 2, 96);
     check("create under a file is ENOTDIR", open("/bin/hello/y", O_CREAT | O_RDWR) == -20, 68);
     check("mkdir under a file is ENOTDIR", mkdir("/bin/hello/z") == -20, 69);
 
@@ -364,6 +366,50 @@ static void probe_exhaust(void)
     check("kernel still alive after exhaustion", uptime_ms() > 0, 66);
 }
 
+static void probe_rename_tree(void)
+{
+    struct stat_info st;
+    struct meminfo before;
+    struct meminfo after;
+    int fd;
+
+    check("meminfo works", meminfo(&before) == 0, 80);
+
+    /* Multi-level mkdir -p through the syscall (used to fail with ENOENT). */
+    check("mkdir -p of three levels", mkdir("/tmp/rn/a/b") == 0, 81);
+    check("nested leaf is a directory", stat("/tmp/rn/a/b", &st) == 0 && st.type == 2, 82);
+    fd = open("/tmp/rn/a/f", O_CREAT | O_TRUNC | O_RDWR);
+    check("file inside the new tree", fd >= 0, 83);
+    if (fd >= 0) {
+        close(fd);
+    }
+
+    /* rename() moves within the VFS, including onto the root directory. */
+    check("rename file to root level", rename("/tmp/rn/a/f", "/tmp/rn-moved") == 0, 84);
+    check("old name is gone", stat("/tmp/rn/a/f", &st) == -2, 85);
+    check("new name resolves", stat("/tmp/rn-moved", &st) == 0 && st.type == 1, 86);
+    check("rename onto a directory is EISDIR", rename("/tmp/rn-moved", "/tmp/rn") == -21, 87);
+    check("dotted destination canonicalizes onto a directory",
+          rename("/tmp/rn-moved", "/tmp/.") == -21, 88);
+    check("rename of a file onto the root is EISDIR", rename("/tmp/rn-moved", "/..") == -21, 95);
+    check("rename of a directory onto the root is EINVAL", rename("/tmp/rn", "/") == -22, 97);
+    check("rename of a missing file is ENOENT", rename("/tmp/nope", "/tmp/nope2") == -2, 89);
+
+    /* rmtree() removes recursively and reports the node count. */
+    {
+        int removed = rmtree("/tmp/rn");
+
+        check("rmtree removed the tree", removed == 3, 90);
+    }
+    check("tree is gone", stat("/tmp/rn", &st) == -2, 91);
+    check("rmtree of a missing path fails", rmtree("/tmp/rn") < 0, 92);
+    unlink("/tmp/rn-moved");
+
+    /* No VFS nodes leaked: the count must be back where it started. */
+    check("meminfo still works", meminfo(&after) == 0, 93);
+    check("no VFS nodes leaked", after.live_nodes == before.live_nodes, 94);
+}
+
 int main(const char *args, size_t len)
 {
     (void)args;
@@ -375,6 +421,7 @@ int main(const char *args, size_t len)
     probe_procs();
     probe_vfs();
     probe_exhaust();
+    probe_rename_tree();
     unlink("/tmp/probe.fd");
     unlink("/tmp/probe.seek");
     if (failures == 0) {

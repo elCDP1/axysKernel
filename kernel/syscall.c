@@ -4,11 +4,14 @@
 #include "axys/cpu.h"
 #include "axys/disk.h"
 #include "axys/gdt.h"
+#include "axys/heap.h"
 #include "axys/input.h"
 #include "axys/io.h"
 #include "axys/pit.h"
+#include "axys/pmm.h"
 #include "axys/printf.h"
 #include "axys/persist.h"
+#include "axys/path.h"
 #include "axys/process.h"
 #include "axys/random.h"
 #include "axys/sched.h"
@@ -72,10 +75,20 @@ static struct axys_fd *fd_get(struct axys_process *proc, axys_uint64_t fdn)
 
 static axys_int64_t user_path(struct axys_process *proc, axys_uint64_t ptr, char *out)
 {
-    if (axys_aspace_copy_string(&proc->space, out, ptr, MAX_PATH) < 0) {
+    char raw[MAX_PATH];
+    int rc;
+
+    if (axys_aspace_copy_string(&proc->space, raw, ptr, MAX_PATH) < 0) {
         return err(AXYS_EFAULT);
     }
-    return 0;
+    /* Canonicalize before any permission or lookup check so "//", "/./",
+     * "/../" and trailing slashes cannot bypass prefix validation, and so a
+     * relative path fails with EINVAL instead of a misleading ENOENT. */
+    rc = axys_path_normalize(raw, out, MAX_PATH);
+    if (rc == 0) {
+        return 0;
+    }
+    return err(rc == -2 ? AXYS_ENAMETOOLONG : AXYS_EINVAL);
 }
 
 /* The VFS reports every create/remove failure as a single -1, which would surface
@@ -572,46 +585,83 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (rc != 0) {
             return rc;
         }
-        rc = search_check(proc, path);
-        if (rc != 0) {
-            return rc;
-        }
         if (axys_vfs_lookup(path) >= 0) {
             return err(AXYS_EEXIST);
         }
-        rc = parent_check(proc, path, AXYS_PERM_W | AXYS_PERM_X);
-        if (rc != 0) {
-            return rc;
-        }
         /* mkdir -p semantics: create every missing ancestor, not just the
-         * final component. Each intermediate directory is owned by the caller
-         * with mode 0755, exactly like the leaf. Trailing slashes are
-         * normalized away first so "/a/b/" behaves like "/a/b" instead of
-         * trying to create an empty-named leaf (which would fail with ENOENT
-         * after /a/b already exists). */
+         * final component. Each level is owned by the caller with mode 0755.
+         * The path is already canonical (no "//", "/./", "/../" or trailing
+         * slash), so components can be walked with plain slash scans.
+         * Every existing ancestor must be a searchable directory; the first
+         * missing level needs write+search permission on its parent, which
+         * is then inherited level by level (each created directory is owned
+         * by the caller with 0755, so creation cannot fail on permissions
+         * below the first missing level). The old code ran search_check()
+         * over the full path first, which rejected any missing intermediate
+         * with ENOENT and made multi-level creation impossible. */
         {
             axys_size_t len = axys_strlen(path);
+            axys_size_t i = 1;
+            char prefix[MAX_PATH];
+            int missing_seen = 0;
 
-            while (len > 1 && path[len - 1] == '/') {
-                path[--len] = '\0';
+            if (axys_vfs_access(0, proc->uid, proc->gid, AXYS_PERM_X) != 0) {
+                return err(AXYS_EACCES);
             }
-            for (axys_size_t i = 1; i < len; ++i) {
-                char saved;
+            while (i <= len) {
+                axys_size_t j = i;
+                axys_vfs_node_t n;
 
-                if (path[i] != '/') {
-                    continue;
+                while (j < len && path[j] != '/') {
+                    ++j;
                 }
-                saved = path[i];
-                path[i] = '\0';
-                if (axys_vfs_lookup(path) < 0 &&
-                    axys_vfs_create_as(path, AXYS_VFS_DIR, 0755u, proc->uid, proc->gid) < 0) {
-                    path[i] = saved;
-                    return err(path_errno(path));
+                axys_memcpy(prefix, path, j);
+                prefix[j] = '\0';
+                n = axys_vfs_lookup(prefix);
+                if (n < 0) {
+                    if (!missing_seen) {
+                        /* Parent of the first missing level: "/" when the
+                         * missing component hangs off the root (i == 1),
+                         * otherwise the path up to the previous slash. */
+                        if (i == 1) {
+                            prefix[0] = '/';
+                            prefix[1] = '\0';
+                        } else {
+                            axys_memcpy(prefix, path, i - 1);
+                            prefix[i - 1] = '\0';
+                        }
+                        axys_vfs_node_t parent = axys_vfs_lookup(prefix);
+                        if (parent < 0) {
+                            return err(AXYS_ENOENT);
+                        }
+                        if (axys_vfs_access(parent, proc->uid, proc->gid,
+                                            AXYS_PERM_W | AXYS_PERM_X) != 0) {
+                            return err(AXYS_EACCES);
+                        }
+                        axys_memcpy(prefix, path, j);
+                        prefix[j] = '\0';
+                        missing_seen = 1;
+                    }
+                    if (axys_vfs_create_as(prefix, AXYS_VFS_DIR, 0755u, proc->uid,
+                                           proc->gid) < 0) {
+                        return err(path_errno(prefix));
+                    }
+                } else {
+                    if (missing_seen) {
+                        return err(AXYS_EEXIST); /* cannot happen: prefixes nest */
+                    }
+                    if (axys_vfs_type(n) != AXYS_VFS_DIR) {
+                        return err(AXYS_ENOTDIR);
+                    }
+                    if (j != len &&
+                        axys_vfs_access(n, proc->uid, proc->gid, AXYS_PERM_X) != 0) {
+                        return err(AXYS_EACCES);
+                    }
                 }
-                path[i] = saved;
+                i = j + 1;
             }
         }
-        return axys_vfs_create_as(path, AXYS_VFS_DIR, 0755u, proc->uid, proc->gid) >= 0 ? 0 : err(path_errno(path));
+        return 0;
     case AXYS_SYS_UNLINK: {
         axys_vfs_node_t node;
         axys_uint32_t type;
@@ -724,6 +774,16 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
     }
     case AXYS_SYS_SYNC:
         return axys_persist_sync() == 0 ? 0 : err(AXYS_ENODEV);
+    case AXYS_SYS_MEMINFO: {
+        struct axys_meminfo info;
+
+        info.free_frames = axys_pmm_free_frames();
+        info.heap_used = axys_heap_bytes_in_use();
+        info.heap_free = axys_heap_bytes_free();
+        info.live_nodes = axys_vfs_live_nodes();
+        return axys_aspace_copy_to(&proc->space, a0, &info, sizeof(info)) == 0 ? 0
+                                                                               : err(AXYS_EFAULT);
+    }
     case AXYS_SYS_RENAME: {
         char to[MAX_PATH];
         axys_vfs_node_t src;

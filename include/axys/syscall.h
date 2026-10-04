@@ -39,7 +39,15 @@ enum axys_syscall_number {
     AXYS_SYS_SYNC = 26,     /* sync() - write the file system to disk */
     AXYS_SYS_RENAME = 27,   /* rename(from, to) - move within the VFS */
     AXYS_SYS_RMDIR_TREE = 28, /* rmdir_tree(path) - recursive remove (rm -rf) */
+    AXYS_SYS_MEMINFO = 29,  /* meminfo(&struct axys_meminfo) - read-only stats */
     AXYS_SYS_COUNT
+};
+
+struct axys_meminfo {
+    axys_uint64_t free_frames; /* unallocated physical 4 KiB frames */
+    axys_uint64_t heap_used;   /* kernel heap payload bytes in use */
+    axys_uint64_t heap_free;   /* kernel heap payload bytes free */
+    axys_uint64_t live_nodes;  /* VFS nodes currently allocated */
 };
 
 struct axys_stat {

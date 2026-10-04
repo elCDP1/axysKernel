@@ -63,3 +63,38 @@ device DMA address handling; adding a “DDR driver” would not solve those lim
 
 The project will publish concrete device IDs and tested QEMU models as drivers
 land. “All hardware” is not a finite testable support target.
+
+## Driver audit notes (2026-10-05)
+
+Existing drivers were re-read against the AHCI 1.3, NVMe 1.x/2.0, ATA-ATAPI,
+PCI 3.0 and 8042 behaviors and against the Linux equivalents (`ahci`,
+`nvme`, `ata_piix`, `i8042`). Findings fixed:
+
+- AHCI `PxCMD` bits were misnamed (`FISRE`/`FISRX`/`CRQ`): bit 3 is CLO,
+  bit 4 is FRE, bit 28 is ICC. The run value is now `ST|FRE|ICC_ACTIVE`
+  (as in Linux `PORT_CMD_*`), the per-command ICC set/clear no-op is gone,
+  `PxSERR` clears use all-ones (W1C), and a failed command COMRESETs the
+  port instead of leaving `PxCI` wedged.
+- AHCI `IDENTIFY` gated LBA48 on word 100 bit 10 with a 12-bit mask; the
+  capability bit is word 83 bit 10 and words 100-103 are used whole.
+  Disks under 128 GiB never noticed; larger ones could lose capacity.
+- NVMe serialized commands under an irqsave spinlock across polls of up to
+  120 s bounded by the IRQ0 tick: a dead controller would freeze the clock
+  and hang forever with interrupts off. Now a busy-flag + yield, AHCI-style.
+- NVMe refused major version 2.x although the used subset (admin queues,
+  Identify, Read/Write/Flush over PRPs) is unchanged in 2.0. Now accepts
+  1.x and 2.x.
+- PCI BAR decode could mistake an I/O BAR with type bits 00 for a 32-bit
+  memory BAR at a truncated address; I/O BARs are now skipped by bit 0 first.
+- ATA PIO now checks `ERR|DF` after each transfer and before `FLUSH`
+  (faults used to be confirmed as success); `disk_read`/`disk_write`
+  reject `NULL` buffers.
+
+Deliberately not added: USB (UHCI/OHCI/EHCI/xHCI + HID + mass storage),
+Ethernet (e.g. e1000/virtio-net), Wi-Fi (802.11 + regulatory + firmware),
+GPU modesetting/acceleration, SMP, audio. Each is thousands of lines plus
+a stack the kernel does not have yet (PCI DMA/IOMMU + MSI/MSI-X lifecycle
+for USB and NICs; 802.11/net stack for Wi-Fi; per-vendor command submission
+and memory management for GPUs). Untested driver code that merely compiles
+would contradict the audit above, so these remain roadmap items in the
+order listed, not shipped stubs.

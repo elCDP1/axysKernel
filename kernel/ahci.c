@@ -82,26 +82,30 @@
  * delivered, or a port status change, or a command that ended in an error. */
 #define IS_REPORTED 0x40000003u /* PSS | TFES | DHRS */
 
-/* PxCMD bit layout. ST is bit 0, the command list length is 15:8 and CRQ is bit
- * 28; since AHCI 1.1 the number of FIS receive entries is fixed at five, so there
- * is no FRE field to program.
+/* PxCMD bit layout (AHCI 1.3 section 3.3.5). ST is bit 0, SUD bit 1, POD bit
+ * 2, CLO bit 3, FRE bit 4; bits 31:28 are ICC. Two corrections to an earlier
+ * reading of this register that shipped here:
  *
- * Two separate bits gate FIS reception and they are easy to conflate: FISRE (bit
- * 3) is the original AHCI 1.0 "accept FISes" flag, while FISRX (bit 4) is the
- * bit that actually starts the receive DMA engine. QEMU only looks at FISRX, so
- * a driver that sets FISRE alone leaves the receive area unmapped and then waits
- * forever for an answer that was never going to be written anywhere. */
+ *  - Bit 3 is CLO (Command List Override, self-clearing), not "FISRE": there
+ *    is no FRE/FISRX pair of enable bits, there is a single FRE (bit 4) that
+ *    starts the FIS receive DMA engine. Setting CLO from idle is harmless but
+ *    pointless, so it is deliberately left out (Linux does the same).
+ *  - Bit 28 is ICC bit 0, not "command list running": running state is the
+ *    read-only CR bit 15, which software never writes. ICC=1 requests the
+ *    Active link power state, which is also what Linux programs
+ *    (PORT_CMD_ICC_ACTIVE); the per-command set/clear dance around it was a
+ *    no-op either way and is gone. PxCI alone is what hands a slot to the
+ *    HBA, on QEMU and on silicon. */
 #define CMD_ST 0x00000001u    /* start */
-#define CMD_SP 0x00000002u    /* spin up */
-#define CMD_CR 0x00000004u    /* command list override */
-#define CMD_FISRE 0x00000008u /* FIS receive enable */
-#define CMD_FISRX 0x00000010u /* FIS receive DMA engine enable */
+#define CMD_SUD 0x00000002u   /* spin up */
+#define CMD_POD 0x00000004u   /* power on device */
+#define CMD_CLO 0x00000008u   /* command list override (unused, see above) */
+#define CMD_FRE 0x00000010u   /* FIS receive enable: runs the receive engine */
+#define CMD_ICC_ACTIVE 0x10000000u /* ICC=Active link power request */
 #define CMD_PRDTL_SHIFT 8u
-#define CMD_CRQ 0x10000000u   /* command list running */
 
-/* The PxCMD value that leaves a port started with reception enabled. CRQ is
- * included for real hardware, where it is what tells the HBA to work the list. */
-#define CMD_PORT_RUN (CMD_ST | CMD_FISRE | CMD_FISRX | CMD_CRQ)
+/* The PxCMD value that leaves a port started with reception enabled. */
+#define CMD_PORT_RUN (CMD_ST | CMD_FRE | CMD_ICC_ACTIVE)
 
 /* PxSSTS.DEV: the HBA sets it once a device has answered on the port. */
 #define SSTS_DEV_PF 0x0001u
@@ -417,7 +421,7 @@ static int port_reset(axys_uint8_t index)
     port_write(index, PX_FB, (axys_uint32_t)(axys_uintptr_t)fis_for(index));
     port_write(index, PX_CLB, (axys_uint32_t)(axys_uintptr_t)command_list);
     port_write(index, PX_CLBU, 0u);
-    port_write(index, PX_SERR, 0u);
+    port_write(index, PX_SERR, 0xffffffffu); /* write-1-to-clear: acknowledge everything */
 
     /* COMRESET with the spec's minimum assertion time and a settle window.
      * Waiting for software-detected DET to clear on its own is not enough:
@@ -447,7 +451,7 @@ static int port_count_multipliers(axys_uint8_t index)
     build_header(0u, 0u);
 
     port_write(index, PX_SCTL, SCTL_DET_INIT);
-    port_write(index, PX_SERR, 1u);
+    port_write(index, PX_SERR, 0xffffffffu); /* clear stale errors before sampling */
     port_write(index, PX_CMD, CMD_PORT_RUN);
     port_write(index, PX_CI, 1u << CMD_SLOT);
 
@@ -582,12 +586,8 @@ static int run_command(void)
      * than an earlier one. */
     port_write(drive_port, PX_IS, 0xffffffffu);
 
-    /* CRQ is what makes real hardware work through the list. QEMU instead only
-     * looks at PxCI, so that is written too: a compliant controller treats the
-     * register as read-only and discards the write, while QEMU takes it as the
-     * request to run the slot. Setting only CRQ leaves the command sitting in
-     * memory forever on one and the other. */
-    port_write(drive_port, PX_CMD, (read32(port_reg(drive_port, PX_CMD)) & ~CMD_CRQ) | CMD_CRQ);
+    /* The port is already started (ST|FRE); handing the slot over is PxCI
+     * alone, on QEMU and on silicon. */
     port_write(drive_port, PX_CI, 1u << CMD_SLOT);
 
     /* Wait for the command to finish. Waiting for the slot to appear in PxCI
@@ -627,9 +627,14 @@ static int run_command(void)
         }
     }
     if (!retired) {
+        /* A command that errored can leave PxCI set: the next port_idle would
+         * then wait out the full 30 s budget and fail too, wedging the disk
+         * after a single bad sector. COMRESET the port (fixed ~65 ms settle,
+         * no completion wait) so the next command starts from idle. The
+         * command itself still reports failure. */
+        (void)port_reset(drive_port);
         return -1;
     }
-    port_write(drive_port, PX_CMD, read32(port_reg(drive_port, PX_CMD)) & ~CMD_CRQ);
     return ata_status_ok(drive_port) ? 0 : -1;
 }
 
@@ -658,14 +663,17 @@ static int identify_capacity(axys_uint64_t *out)
      * look like an error: it moves the low half up sixteen bits, and a drive of
      * 65536 sectors comes back as one sector. */
     lba28 = ((axys_uint64_t)words[61] << 16) | words[60];
-    /* Words 100-103 hold the LBA48 count as four little-endian 16-bit pieces,
-     * and word 100 bit 10 announces that the drive really implements it.
-     * Without that bit the 28-bit value is all there is. */
-    if ((words[100] & 0x0400u) == 0u) {
+    /* Word 83 bit 10 announces LBA48 support; words 100-103 then hold the
+     * full count as four little-endian 16-bit pieces. Testing a bit of word
+     * 100 instead (as an earlier version did) reads sector-count data as a
+     * capability flag: any disk under 128 GiB still resolves through the
+     * 28-bit value, but a larger disk whose word 100 happens to have bit 10
+     * clear silently loses capacity. There is no 12-bit mask on word 100. */
+    if ((words[83] & 0x0400u) == 0u) {
         *out = lba28;
         return *out != 0u ? 0 : -1;
     }
-    lba48 = (axys_uint64_t)(words[100] & 0x0fffu) | ((axys_uint64_t)words[101] << 16) |
+    lba48 = (axys_uint64_t)words[100] | ((axys_uint64_t)words[101] << 16) |
             ((axys_uint64_t)words[102] << 32) | ((axys_uint64_t)words[103] << 48);
     *out = lba48;
     return *out != 0u ? 0 : -1;

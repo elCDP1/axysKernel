@@ -92,7 +92,7 @@ axys_uint32_t axys_disk_sectors(void)
 
 int axys_disk_read(axys_uint32_t lba, axys_uint32_t count, void *buffer)
 {
-    if (!range_ok(lba, count)) {
+    if (!range_ok(lba, count) || buffer == AXYS_NULL) {
         return -1;
     }
     if (backend == DISK_AHCI) {
@@ -106,7 +106,7 @@ int axys_disk_read(axys_uint32_t lba, axys_uint32_t count, void *buffer)
 
 int axys_disk_write(axys_uint32_t lba, axys_uint32_t count, const void *buffer)
 {
-    if (!range_ok(lba, count)) {
+    if (!range_ok(lba, count) || buffer == AXYS_NULL) {
         return -1;
     }
     if (backend == DISK_AHCI) {
