@@ -30,7 +30,7 @@ KERNEL_C_SOURCES := $(wildcard kernel/*.c lib/*.c arch/$(ARCH)/*.c)
 KERNEL_AS_SOURCES := $(wildcard arch/$(ARCH)/*.S)
 # User programs (ELF64 static-PIE) embedded into the kernel image as the initial
 # file system; each is installed into the VFS at boot. Format: name:/install/path
-USER_PROGS := init:/sbin/init hello:/bin/hello crash:/bin/crash heap:/bin/heap fileio:/bin/fileio perms:/bin/perms probe:/bin/probe
+USER_PROGS := init:/sbin/init hello:/bin/hello crash:/bin/crash heap:/bin/heap fileio:/bin/fileio perms:/bin/perms probe:/bin/probe fuzz:/bin/fuzz
 USER_ELFS := $(foreach p,$(USER_PROGS),build/user/$(word 1,$(subst :, ,$(p))).elf)
 USER_CFLAGS := -std=c17 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -Iuser
 USER_LDFLAGS := -pie --no-dynamic-linker -z max-page-size=0x1000 -z noseparate-code -z norelro --build-id=none -e _start
@@ -55,12 +55,13 @@ HOST_PERSIST_TEST_SOURCES := tests/test_persist.c tests/ramdisk.c tests/vfs_stub
 HOST_ACPI_TEST_SOURCES := tests/test_acpi.c kernel/acpi_aml.c
 HOST_ELF_TEST_SOURCES := tests/test_elf.c kernel/elf.c lib/string.c
 HOST_PATH_TEST_SOURCES := tests/test_path.c lib/string.c lib/path.c
+HOST_FUZZ_SOURCES := tests/fuzz.c tests/vfs_stub.c kernel/vfs.c kernel/elf.c lib/string.c lib/printf.c lib/path.c
 HOST_PERSIST_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PERSIST_TEST_SOURCES))
 HOST_ACPI_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ACPI_TEST_SOURCES))
 HOST_ELF_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ELF_TEST_SOURCES))
 HOST_PATH_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PATH_TEST_SOURCES))
 
-.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci
+.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz
 
 all: kernel
 
@@ -159,6 +160,23 @@ build/test_vfs.exe: $(HOST_VFS_TEST_OBJECTS)
 build/test_path.exe: $(HOST_PATH_TEST_OBJECTS)
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_PATH_TEST_OBJECTS)
+
+# Host fuzzer: always sanitized, never -Werror (bounded strncpy/strncat
+# patterns warn under -Wstringop-truncation by design here).
+FUZZ_CC ?= gcc
+FUZZ_CFLAGS := -std=c17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Iinclude -DAXYS_HOST_TEST
+FUZZ_SEED ?= 1
+FUZZ_ITERS ?= 4000
+
+fuzz: build/fuzz.exe
+	./build/fuzz.exe $(FUZZ_SEED) $(FUZZ_ITERS)
+
+build/fuzz.exe: $(HOST_FUZZ_SOURCES)
+	@$(MKDIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $(HOST_FUZZ_SOURCES)
+
+check-fuzz: iso
+	@sh tools/qemu-fuzz.sh
 
 build/host/%.o: %.c
 	@$(MKDIR)

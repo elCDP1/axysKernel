@@ -79,7 +79,7 @@ static void test_permissions(void)
     assert(axys_vfs_chmod(f, 0755) == 0 && axys_vfs_access(f, 0, 0, AXYS_PERM_X) == 0);
     assert(axys_vfs_chown(f, 7, 8) == 0 && axys_vfs_getattr(f, &a) == 0 && a.uid == 7 && a.gid == 8);
     assert(axys_vfs_getattr(axys_vfs_lookup("/root"), &a) == 0 && a.mode == 0700);
-    assert(axys_vfs_getattr(axys_vfs_lookup("/tmp"), &a) == 0 && a.mode == 0777);
+    assert(axys_vfs_getattr(axys_vfs_lookup("/tmp"), &a) == 0 && a.mode == 01777);
     assert(axys_vfs_access(axys_vfs_lookup("/etc"), 1000, 1000, AXYS_PERM_R | AXYS_PERM_X) == 0);
     assert(axys_vfs_access(axys_vfs_lookup("/etc"), 1000, 1000, AXYS_PERM_W) == -1);
     assert(axys_vfs_create_as("/tmp/q", (axys_vfs_type_t)9, 0, 0, 0) == -1);
@@ -160,6 +160,42 @@ static void test_rename_rejects_dot_names(void)
     assert(axys_vfs_lookup("/moved") >= 0 && axys_vfs_lookup("/tmp/src") == -1);
 }
 
+static void test_name_copy_and_sticky(void)
+{
+    char buf[AXYS_VFS_NAME_MAX];
+    char small[4];
+    axys_vfs_node_t tmp;
+    axys_vfs_node_t victim;
+    axys_vfs_node_t mine;
+    axys_vfs_node_t plain;
+
+    axys_vfs_init();
+    tmp = axys_vfs_lookup("/tmp");
+    assert(tmp >= 0);
+    victim = axys_vfs_create_as("/tmp/victim", AXYS_VFS_FILE, 0644, 0, 0);
+    mine = axys_vfs_create_as("/tmp/mine", AXYS_VFS_FILE, 0644, 1000, 1000);
+    assert(victim >= 0 && mine >= 0);
+
+    /* name_copy under lock. */
+    assert(axys_vfs_name_copy(victim, buf, sizeof(buf)) == 6);
+    assert(strcmp(buf, "victim") == 0);
+    assert(axys_vfs_name_copy(-1, buf, sizeof(buf)) == -1);
+    assert(axys_vfs_name_copy(victim, buf, 0) == -1);
+    assert(axys_vfs_name_copy(victim, small, sizeof(small)) == -1); /* too small */
+
+    /* Sticky /tmp: uid 1000 may not remove root's file... */
+    assert(axys_vfs_sticky_ok(tmp, victim, 1000) == -1);
+    /* ...but may remove their own, and root may remove anything. */
+    assert(axys_vfs_sticky_ok(tmp, mine, 1000) == 0);
+    assert(axys_vfs_sticky_ok(tmp, victim, 0) == 0);
+    assert(axys_vfs_sticky_ok(-1, victim, 1000) == -1);
+
+    /* Non-sticky directories impose no extra restriction. */
+    plain = axys_vfs_create_as("/var/plain", AXYS_VFS_FILE, 0644, 0, 0);
+    assert(plain >= 0);
+    assert(axys_vfs_sticky_ok(axys_vfs_lookup("/var"), plain, 1000) == 0);
+}
+
 int main(void)
 {
     test_permissions();
@@ -171,5 +207,6 @@ int main(void)
     test_failed_replace_keeps_contents();
     test_remove_tree_frees_all_children();
     test_rename_rejects_dot_names();
+    test_name_copy_and_sticky();
     return 0;
 }

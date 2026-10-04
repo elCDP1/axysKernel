@@ -49,6 +49,18 @@ axys_int32_t axys_vfs_read(axys_vfs_node_t node, void *buffer, axys_size_t lengt
 axys_uint32_t axys_vfs_generation(axys_vfs_node_t node);
 
 const char *axys_vfs_name(axys_vfs_node_t node);
+
+/* Copy a node's name into `out` (always NUL-terminated) while holding the VFS
+ * lock, so the bytes cannot change under the reader. Returns the name length
+ * (excluding NUL), or -1 when the node is invalid or `cap` is 0. Prefer this
+ * over axys_vfs_name() for any name that outlives the call. */
+axys_int32_t axys_vfs_name_copy(axys_vfs_node_t node, char *out, axys_size_t cap);
+
+/* Sticky-directory check (the /tmp rule): in a directory with mode bit 01000,
+ * removing or renaming `target` additionally requires uid 0, ownership of the
+ * file, or ownership of the directory. Returns 0 when allowed, -1 otherwise. */
+int axys_vfs_sticky_ok(axys_vfs_node_t parent, axys_vfs_node_t target, axys_uint32_t uid);
+
 axys_vfs_type_t axys_vfs_type(axys_vfs_node_t node);
 
 /* Iterate children of a directory node: pass child = -1 to get the first
@@ -60,7 +72,7 @@ axys_vfs_node_t axys_vfs_next_child(axys_vfs_node_t dir, axys_vfs_node_t child);
 axys_int32_t axys_vfs_mkdirs(const char *path);      /* mkdir -p: 0 or -1 */
 axys_int32_t axys_vfs_unlink(const char *path);      /* file or empty dir: 0 or -1 */
 axys_int32_t axys_vfs_rename(const char *from, const char *to); /* move/rename: 0 or -1 */
-axys_int32_t axys_vfs_remove_tree(const char *path); /* rm -rf: nodes removed, or -1 */
+axys_int32_t axys_vfs_remove_tree(const char *path); /* rm -rf: nodes removed, -1 bad path, -2 no memory */
 axys_int32_t axys_vfs_size(axys_vfs_node_t node);    /* file size, -1 for dirs/invalid */
 
 /* Positional I/O. pwrite grows the file (zero-filling any gap) up to

@@ -366,6 +366,33 @@ static void probe_exhaust(void)
     check("kernel still alive after exhaustion", uptime_ms() > 0, 66);
 }
 
+static void probe_create_emfile(void)
+{
+    int fds[80];
+    int n = 0;
+    struct stat_info st;
+
+    /* Unknown flag bits fail closed instead of being silently ignored. */
+    check("unknown open flags are EINVAL", open("/tmp/probe.fd", 0x100) == -22, 102);
+
+    /* Fill the table, then confirm a failed O_CREAT leaves no litter. */
+    for (int i = 0; i < 80; ++i) {
+        fds[i] = open("/tmp/probe.fd", O_CREAT | O_TRUNC | O_RDWR);
+        if (fds[i] < 0) {
+            break;
+        }
+        ++n;
+    }
+    check("table filled again", n >= 8, 103);
+    check("O_CREAT with a full table is EMFILE",
+          open("/tmp/probe.litter", O_CREAT | O_RDWR) == -24, 104);
+    check("the failed create left no file behind", stat("/tmp/probe.litter", &st) == -2, 105);
+    for (int i = 0; i < n; ++i) {
+        close(fds[i]);
+    }
+    check("table usable again", open("/tmp/probe.fd", 0) >= 0, 106);
+}
+
 static void probe_rename_tree(void)
 {
     struct stat_info st;
@@ -422,8 +449,10 @@ int main(const char *args, size_t len)
     probe_vfs();
     probe_exhaust();
     probe_rename_tree();
+    probe_create_emfile();
     unlink("/tmp/probe.fd");
     unlink("/tmp/probe.seek");
+    unlink("/tmp/probe.litter");
     if (failures == 0) {
         puts("probe: all checks passed\n");
         return 0;

@@ -181,34 +181,89 @@ static void serialize_node(struct buffer *b, const char *path, axys_vfs_node_t n
     }
 }
 
-static void serialize_tree(struct buffer *b, const char *path, axys_vfs_node_t dir, unsigned depth)
+static void serialize_tree(struct buffer *b, const char *path, axys_vfs_node_t dir)
 {
-    axys_vfs_node_t child = -1;
+    /* Explicit stack instead of recursion: tree depth is attacker-influenced
+     * (nested mkdirs), so recursion risks a kernel stack overflow, and the
+     * old `depth > 16 → return` silently dropped every deeper subtree while
+     * still reporting sync success (data loss with no error). Depth here is
+     * naturally bounded by the 255-byte path ceiling (~127 levels of 1-char
+     * names); the 512-entry cap is unreachable defense that fails the sync
+     * loudly instead of losing data quietly. */
+    struct ser_frame {
+        axys_vfs_node_t dir;
+        axys_vfs_node_t child;
+        axys_size_t path_len;
+    };
+    enum { SER_STACK_CAP = 512 };
+    char cur[MAX_PATH_LEN + 1];
+    char name_buf[AXYS_VFS_NAME_MAX];
+    axys_size_t len = axys_strlen(path);
+    struct ser_frame *stack;
+    axys_size_t top = 0;
 
-    if (depth > 16) {
+    if (len >= sizeof(cur)) {
+        return;
+    }    axys_memcpy(cur, path, len + 1);
+    stack = axys_kmalloc(SER_STACK_CAP * sizeof(*stack));
+    if (stack == AXYS_NULL) {
+        b->failed = 1;
         return;
     }
-    while ((child = axys_vfs_next_child(dir, child)) >= 0) {
+    stack[top].dir = dir;
+    stack[top].child = -1;
+    stack[top].path_len = len;
+    ++top;
+    while (top != 0 && !b->failed) {
+        struct ser_frame *f = &stack[top - 1];
+        axys_vfs_node_t child = axys_vfs_next_child(f->dir, f->child);
         char child_path[MAX_PATH_LEN + 1];
-        axys_size_t pl = axys_strlen(path);
-        const char *name = axys_vfs_name(child);
+        axys_size_t pl;
+        axys_size_t nl;
+        axys_size_t cl;
 
-        if (pl + axys_strlen(name) + 2 > sizeof(child_path)) {
+        if (child < 0) {
+            --top;
+            if (top != 0) {
+                cur[stack[top - 1].path_len] = '\0';
+            }
             continue;
         }
-        axys_memcpy(child_path, path, pl);
-        if (pl > 1) {
-            child_path[pl++] = '/';
+        f->child = child;
+        pl = f->path_len;
+        if (axys_vfs_name_copy(child, name_buf, sizeof(name_buf)) < 0) {
+            continue; /* node went away under us: skip it */
         }
-        axys_strlcpy(child_path + pl, name, sizeof(child_path) - pl);
+        nl = axys_strlen(name_buf);
+        if (pl + nl + 2 > sizeof(child_path)) {
+            continue; /* too long for the format: skip subtree, as before */
+        }
+        axys_memcpy(child_path, cur, pl);
+        cl = pl;
+        if (cl > 1) {
+            child_path[cl++] = '/';
+        }
+        axys_strlcpy(child_path + cl, name_buf, sizeof(child_path) - cl);
         if (!path_persisted(child_path)) {
             continue;
         }
         serialize_node(b, child_path, child);
+        if (b->failed) {
+            break;
+        }
         if (axys_vfs_type(child) == AXYS_VFS_DIR) {
-            serialize_tree(b, child_path, child, depth + 1);
+            if (top == SER_STACK_CAP) {
+                b->failed = 1; /* unreachable via the path ceiling; fail loud */
+                break;
+            }
+            axys_memcpy(cur, child_path, sizeof(cur));
+            stack[top].dir = child;
+            stack[top].child = -1;
+            stack[top].path_len = axys_strlen(child_path);
+            ++top;
         }
     }
+    axys_kfree(stack);
 }
 
 /* Persisted roots that do not exist yet (they always do after vfs_init) are
@@ -224,7 +279,7 @@ static void serialize_all(struct buffer *b)
             continue;
         }
         serialize_node(b, persist_roots[i], root);
-        serialize_tree(b, persist_roots[i], root, 0);
+        serialize_tree(b, persist_roots[i], root);
     }
     buf_append(b, &end, sizeof(end));
 }
@@ -245,6 +300,186 @@ static int read_header(int slot, struct snap_header *h)
 
 /* Restore one payload into the VFS. Returns the number of files restored or -1
  * on a malformed stream (nothing after the bad record is applied). */
+
+struct seen_dir {
+    axys_size_t off;
+    axys_size_t len;
+};
+
+/* True when `parent` (exact bytes, not NUL-terminated) names a directory that
+ * applying the payload so far guarantees: a live directory, or one of the
+ * earlier DIR records. */
+static int dir_available(const axys_uint8_t *payload, const struct seen_dir *seen, axys_size_t nseen,
+                         const char *parent)
+{
+    char tmp[MAX_PATH_LEN + 1];
+    axys_size_t plen = axys_strlen(parent);
+
+    if (plen == 0 || plen > MAX_PATH_LEN) {
+        return 0;
+    }
+    axys_memcpy(tmp, parent, plen + 1);
+    if (axys_vfs_lookup(tmp) >= 0 && axys_vfs_type(axys_vfs_lookup(tmp)) == AXYS_VFS_DIR) {
+        return 1;
+    }
+    for (axys_size_t i = 0; i < nseen; ++i) {
+        if (seen[i].len == plen && axys_memcmp(payload + seen[i].off, parent, plen) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Every component must satisfy the same rules walk() enforces: non-empty,
+ * shorter than AXYS_VFS_NAME_MAX, and never "." or "..". */
+static int components_valid(const char *path, axys_size_t path_len)
+{
+    axys_size_t i = 1; /* skip the leading '/' */
+
+    if (path_len == 0 || path[0] != '/') {
+        return 0;
+    }
+    while (i < path_len) {
+        axys_size_t start = i;
+        axys_size_t seg_len = 0;
+
+        while (i < path_len && path[i] != '/') {
+            ++i;
+            ++seg_len;
+        }
+        if (seg_len == 0 || seg_len >= AXYS_VFS_NAME_MAX) {
+            return 0;
+        }
+        if ((seg_len == 1 && path[start] == '.') ||
+            (seg_len == 2 && path[start] == '.' && path[start + 1] == '.')) {
+            return 0;
+        }
+        if (i < path_len) {
+            ++i; /* skip '/' */
+        }
+    }
+    return 1;
+}
+
+/* Read-only validation pass over a snapshot payload (audit P0: transactional
+ * restore). Returns 0 when every record is well-formed AND applicable to the
+ * current VFS without mutation: framing, persisted-roots confinement, name
+ * rules, 128 MiB file cap, live type conflicts, parent availability through
+ * earlier DIR records, and node-budget fit. Returns -1 otherwise, leaving the
+ * VFS untouched so the caller falls back to the older slot on a pristine
+ * tree. Anything this accepts, apply_payload() below is guaranteed to apply
+ * short of heap/pool exhaustion at runtime. */
+static int validate_payload(const axys_uint8_t *p, axys_size_t len)
+{
+    axys_size_t off = 0;
+    struct seen_dir *seen = AXYS_NULL;
+    axys_size_t nseen = 0;
+    axys_size_t seencap = 0;
+    axys_uint64_t need = 0;
+    int rc = -1;
+
+    for (;;) {
+        struct record rec;
+        char path[MAX_PATH_LEN + 1];
+        char parent[MAX_PATH_LEN + 1];
+        axys_size_t plen;
+        axys_vfs_node_t node;
+
+        if (len - off < sizeof(rec)) {
+            goto out;
+        }
+        axys_memcpy(&rec, p + off, sizeof(rec));
+        off += sizeof(rec);
+        if (rec.path_len == 0) {
+            rc = 0; /* clean end of stream */
+            goto out;
+        }
+        if (rec.path_len > MAX_PATH_LEN || len - off < rec.path_len ||
+            (rec.type != 1 && rec.type != 2)) {
+            goto out;
+        }
+        if (rec.type == 1 &&
+            (len - off - rec.path_len < rec.size || rec.size > AXYS_VFS_MAX_FILE_BYTES)) {
+            goto out;
+        }
+        axys_memcpy(path, p + off, rec.path_len);
+        path[rec.path_len] = '\0';
+        off += rec.path_len;
+        if (rec.type == 1) {
+            off += rec.size;
+        }
+        plen = rec.path_len;
+        if (!components_valid(path, plen) || plen >= AXYS_VFS_MAX_PATH || !path_persisted(path)) {
+            goto out; /* not absolute, not confined, or not walkable */
+        }
+        /* Parent availability: "/" always exists; otherwise a live directory
+         * or an earlier DIR record of this same payload. */
+        {
+            axys_size_t slash = 0;
+
+            for (axys_size_t i = 0; i < plen; ++i) {
+                if (path[i] == '/') {
+                    slash = i;
+                }
+            }
+            if (slash == 0) {
+                axys_memcpy(parent, "/", 2);
+            } else {
+                if (slash > sizeof(parent) - 1) {
+                    goto out;
+                }
+                axys_memcpy(parent, path, slash);
+                parent[slash] = '\0';
+            }
+        }
+        if (!dir_available(p, seen, nseen, parent)) {
+            goto out;
+        }
+        node = axys_vfs_lookup(path);
+        if (rec.type == 2) {
+            if (node >= 0 && axys_vfs_type(node) != AXYS_VFS_DIR) {
+                goto out; /* dir record over a live file can never apply */
+            }
+            if (node < 0) {
+                if (nseen == seencap) {
+                    axys_size_t ncap = seencap ? seencap * 2u : 16u;
+                    struct seen_dir *grown = axys_kmalloc(ncap * sizeof(*grown));
+
+                    if (grown == AXYS_NULL) {
+                        goto out;
+                    }
+                    if (seen != AXYS_NULL) {
+                        axys_memcpy(grown, seen, nseen * sizeof(*grown));
+                        axys_kfree(seen);
+                    }
+                    seen = grown;
+                    seencap = ncap;
+                }
+                seen[nseen].off = off - (rec.type == 1 ? rec.size : 0u) - plen;
+                seen[nseen].len = plen;
+                ++nseen;
+                ++need;
+            }
+        } else {
+            if (node >= 0 && axys_vfs_type(node) != AXYS_VFS_FILE) {
+                goto out; /* file record over a live directory can never apply */
+            }
+            if (node < 0) {
+                ++need;
+            }
+        }
+    }
+out:
+    axys_kfree(seen);
+    if (rc == 0 && need > AXYS_VFS_MAX_NODES - axys_vfs_live_nodes()) {
+        rc = -1; /* would exhaust the node pool mid-apply: refuse upfront */
+    }
+    return rc;
+}
+
+/* Restore a payload that validate_payload() already accepted. Still
+ * defensive (returns -1 on any surprise), but the only failures left here
+ * are runtime resource exhaustion, never malformed input. */
 static int apply_payload(const axys_uint8_t *p, axys_size_t len)
 {
     axys_size_t off = 0;
@@ -280,6 +515,8 @@ static int apply_payload(const axys_uint8_t *p, axys_size_t len)
             } else if (axys_vfs_type(node) == AXYS_VFS_DIR) {
                 (void)axys_vfs_chmod(node, rec.mode);
                 (void)axys_vfs_chown(node, rec.uid, rec.gid);
+            } else {
+                return -1; /* dir record over a live file: refuse, like validation */
             }
             if (node < 0) {
                 return -1;
@@ -317,7 +554,8 @@ static int load_slot(int slot, const struct snap_header *h)
         return -1;
     }
     if (axys_disk_read(slot_start(slot) + 1u, sectors, payload) == 0 &&
-        axys_crc32(0, payload, len) == h->payload_crc) {
+        axys_crc32(0, payload, len) == h->payload_crc &&
+        validate_payload(payload, len) == 0) {
         rc = apply_payload(payload, len);
     }
     axys_kfree(payload);

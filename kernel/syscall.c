@@ -160,9 +160,30 @@ static axys_int64_t search_check(struct axys_process *proc, const char *path)
     return 0;
 }
 
-/* Creating or removing an entry needs write + search permission on its parent. */
-static axys_int64_t parent_check(struct axys_process *proc, const char *path, axys_uint32_t want)
+/* The parent directory node of an already-normalized absolute path. */
+static axys_vfs_node_t path_parent_node(const char *path)
 {
+    char parent[MAX_PATH];
+    axys_size_t len = axys_strlen(path);
+    axys_size_t slash = 0;
+
+    for (axys_size_t i = 0; i < len; ++i) {
+        if (path[i] == '/') {
+            slash = i;
+        }
+    }
+    if (slash == 0) {
+        parent[0] = '/';
+        parent[1] = '\0';
+    } else {
+        axys_memcpy(parent, path, slash);
+        parent[slash] = '\0';
+    }
+    return axys_vfs_lookup(parent);
+}
+
+/* Creating or removing an entry needs write + search permission on its parent. */
+static axys_int64_t parent_check(struct axys_process *proc, const char *path, axys_uint32_t want){
     char parent[MAX_PATH];
     axys_size_t len = axys_strlen(path);
     axys_size_t slash = 0;
@@ -334,13 +355,32 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     axys_vfs_node_t node;
     int writable = (flags & (AXYS_O_WRONLY | AXYS_O_RDWR)) != 0;
     int readable = (flags & AXYS_O_WRONLY) == 0;
+    int slot = -1;
     axys_int64_t rc = user_path(proc, path_ptr, path);
 
     if (rc != 0) {
         return rc;
     }
+    if ((flags & ~(axys_uint64_t)(AXYS_O_CREAT | AXYS_O_TRUNC | AXYS_O_APPEND | AXYS_O_WRONLY |
+                                 AXYS_O_RDWR)) != 0) {
+        return err(AXYS_EINVAL); /* unknown flag bits fail closed */
+    }
     if ((flags & (AXYS_O_TRUNC | AXYS_O_APPEND)) && !writable) {
         return err(AXYS_EINVAL);
+    }
+    /* Reserve the descriptor slot before any creation: creating the file and
+     * only then discovering a full table used to return EMFILE while leaving
+     * the new (empty, caller-owned) file behind in the VFS. The table is
+     * per-process and a process never runs concurrently with itself, so a
+     * slot found free here is still free below. */
+    for (int i = 3; i < AXYS_MAX_FDS; ++i) {
+        if (!proc->fds[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return err(AXYS_EMFILE);
     }
     rc = search_check(proc, path);
     if (rc != 0) {
@@ -371,20 +411,15 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
             (void)axys_vfs_write(node, "", 0);
         }
     }
-    for (int i = 3; i < AXYS_MAX_FDS; ++i) {
-        if (!proc->fds[i].used) {
-            proc->fds[i].used = 1;
-            proc->fds[i].console = 0;
-            proc->fds[i].readable = readable;
-            proc->fds[i].writable = writable;
-            proc->fds[i].node = node;
-            proc->fds[i].node_gen = axys_vfs_generation(node);
-            proc->fds[i].offset = 0;
-            proc->fds[i].flags = (axys_uint32_t)flags;
-            return i;
-        }
-    }
-    return err(AXYS_EMFILE);
+    proc->fds[slot].used = 1;
+    proc->fds[slot].console = 0;
+    proc->fds[slot].readable = readable;
+    proc->fds[slot].writable = writable;
+    proc->fds[slot].node = node;
+    proc->fds[slot].node_gen = axys_vfs_generation(node);
+    proc->fds[slot].offset = 0;
+    proc->fds[slot].flags = (axys_uint32_t)flags;
+    return slot;
 }
 
 static axys_int64_t sys_lseek(struct axys_process *proc, axys_uint64_t fdn, axys_int64_t off, axys_uint64_t whence)
@@ -470,8 +505,13 @@ static axys_int64_t sys_readdir(struct axys_process *proc, axys_uint64_t path_pt
         }
     }
     {
-        const char *name = axys_vfs_name(child);
-        axys_size_t len = axys_strlen(name) + 1;
+        char name[AXYS_VFS_NAME_MAX];
+        axys_size_t len;
+
+        if (axys_vfs_name_copy(child, name, sizeof(name)) < 0) {
+            return err(AXYS_ENOENT); /* node went away under us */
+        }
+        len = axys_strlen(name) + 1;
 
         if (size < len || axys_aspace_copy_to(&proc->space, buf, name, len) != 0) {
             return err(size < len ? AXYS_EINVAL : AXYS_EFAULT);
@@ -682,6 +722,11 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (rc != 0) {
             return rc;
         }
+        /* Sticky directory (/tmp): removing someone else's entry needs
+         * ownership or root, even with write permission on the directory. */
+        if (axys_vfs_sticky_ok(path_parent_node(path), node, proc->uid) != 0) {
+            return err(AXYS_EPERM);
+        }
         type = axys_vfs_type(node);
         if (axys_vfs_unlink(path) == 0) {
             return 0; /* empty directories are removable, as the contract states */
@@ -829,6 +874,11 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (rc != 0) {
             return rc;
         }
+        /* Sticky source directory: moving someone else's entry out needs
+         * ownership or root. */
+        if (axys_vfs_sticky_ok(path_parent_node(path), src, proc->uid) != 0) {
+            return err(AXYS_EPERM);
+        }
         /* a file cannot be renamed onto an existing directory: report EISDIR
          * instead of the generic failure the VFS layer returns. */
         {
@@ -837,6 +887,12 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
             if (dst >= 0 && axys_vfs_type(dst) == AXYS_VFS_DIR &&
                 axys_vfs_type(src) != AXYS_VFS_DIR) {
                 return err(AXYS_EISDIR);
+            }
+            /* Sticky destination directory: replacing someone else's entry
+             * needs ownership or root. */
+            if (dst >= 0 &&
+                axys_vfs_sticky_ok(path_parent_node(to), dst, proc->uid) != 0) {
+                return err(AXYS_EPERM);
             }
         }
         return axys_vfs_rename(path, to) == 0 ? 0 : err(AXYS_EINVAL);
@@ -856,13 +912,22 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (node < 0) {
             return err(AXYS_ENOENT);
         }
+        if (node == 0) {
+            return err(AXYS_EINVAL); /* the root itself is never removable */
+        }
         rc = parent_check(proc, path, AXYS_PERM_W | AXYS_PERM_X);
         if (rc != 0) {
             return rc;
         }
+        if (axys_vfs_sticky_ok(path_parent_node(path), node, proc->uid) != 0) {
+            return err(AXYS_EPERM);
+        }
         {
             axys_int32_t removed = axys_vfs_remove_tree(path);
 
+            if (removed == -2) {
+                return err(AXYS_ENOMEM);
+            }
             return removed >= 0 ? removed : err(AXYS_EACCES);
         }
     }

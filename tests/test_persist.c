@@ -157,6 +157,86 @@ int main(void)
         memcpy(d + (1 + target * 2047) * 512, header, 512);
         reboot_expect(3);          /* the forged (newest) snapshot is rejected; the honest one loads */
         assert(axys_vfs_lookup("/bin/evil") < 0);
+        assert(axys_persist_sync() == 0); /* heal the forged slot before the next test */
+    }
+
+    /* a CRC-valid snapshot that turns bad halfway applies NOTHING: the two
+     * good records must not leak into the VFS, and the older slot loads. */
+    {
+        unsigned char *d = ramdisk_bytes();        axys_uint64_t g0, g1;
+        unsigned newest, target;
+        unsigned char payload[1024];
+        struct { unsigned short len; unsigned char type, res; unsigned mode, uid, gid, size; } __attribute__((packed)) rec;
+        struct { unsigned short len; unsigned char type, res; unsigned mode, uid, gid, size; } __attribute__((packed)) end = {0, 0, 0, 0, 0, 0, 0};
+        unsigned char header[512];
+        axys_uint64_t gen, older;
+        unsigned plen = 0, crc;
+
+        memcpy(&g0, d + 1 * 512 + 8, 8);
+        memcpy(&g1, d + (1 + 2047) * 512 + 8, 8);
+        newest = g0 > g1 ? 0 : 1;
+        target = newest ? 0 : 1;
+        older = g0 > g1 ? g0 : g1; /* honest generation: the fallback lands here */
+        gen = older + 5;
+        memset(payload, 0, sizeof(payload));
+        rec.len = 10; rec.type = 1; rec.res = 0; rec.mode = 0644; rec.uid = 0; rec.gid = 0; rec.size = 4;
+        memcpy(payload + plen, &rec, sizeof(rec)); plen += sizeof(rec);
+        memcpy(payload + plen, "/home/good", 10); plen += 10;
+        memcpy(payload + plen, "good", 4); plen += 4;
+        rec.len = 12; rec.size = 6;
+        memcpy(payload + plen, &rec, sizeof(rec)); plen += sizeof(rec);
+        memcpy(payload + plen, "/home/second", 12); plen += 12;
+        memcpy(payload + plen, "second", 6); plen += 6;
+        rec.len = 3; rec.type = 9; rec.size = 0; /* malformed trailing record */
+        memcpy(payload + plen, &rec, sizeof(rec)); plen += sizeof(rec);
+        memcpy(payload + plen, &end, sizeof(end)); plen += sizeof(end);
+        memset(header, 0, sizeof(header));
+        memcpy(header, "AXSNAP01", 8);
+        memcpy(header + 8, &gen, 8);
+        memcpy(header + 16, &plen, 4);
+        crc = axys_crc32(0, payload, plen);
+        memcpy(header + 20, &crc, 4);
+        crc = axys_crc32(0, header, 24);
+        memcpy(header + 24, &crc, 4);
+        memcpy(d + (1 + target * 2047 + 1) * 512, payload, 1024);
+        memcpy(d + (1 + target * 2047) * 512, header, 512);
+        reboot_expect(3); /* falls back to the honest slot; nothing half-applied */
+        assert(axys_vfs_lookup("/home/good") < 0);
+        assert(axys_vfs_lookup("/home/second") < 0);
+        assert(axys_persist_generation() == older);
+        assert(read_file("/home/alice.txt", buf, sizeof(buf)) > 0);
+        assert(axys_persist_sync() == 0); /* heal the forged slot */
+    }
+
+    /* trees deeper than the old 16-level cutoff save and restore completely */
+    {
+        char path[128] = "/home/deep";
+        char leaf[160];
+
+        assert(axys_vfs_mkdirs(path) == 0);
+        for (int i = 0; i < 29; ++i) {
+            size_t l = strlen(path);
+
+            snprintf(path + l, sizeof(path) - l, "/d%d", i);
+            assert(axys_vfs_mkdirs(path) == 0);
+        }
+        snprintf(leaf, sizeof(leaf), "%s/bottom.txt", path);
+        put(leaf, "bottom", 0644, 0);
+        assert(axys_persist_sync() == 0);
+        {
+            int files = 0;
+            char probe[160];
+
+            axys_vfs_init();
+            files = axys_persist_init();
+            assert(files > 3);
+            assert(read_file(leaf, buf, sizeof(buf)) == 6 && strcmp(buf, "bottom") == 0);
+            snprintf(probe, sizeof(probe), "/home/deep/d0");
+            assert(axys_vfs_lookup(probe) >= 0);
+            (void)files;
+        }
+        assert(axys_vfs_remove_tree("/home/deep") > 0);
+        assert(axys_persist_sync() == 0);
     }
 
     /* a disk that holds somebody else's data is never touched */

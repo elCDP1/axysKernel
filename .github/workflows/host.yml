@@ -1,0 +1,23 @@
+# Host-side tests only. The QEMU integration checks (make check,
+# check-highmem, check-nvme, check-ahci, check-fuzz) need KVM for reasonable
+# speed and run on the maintainer's machine, not here.
+
+name: host-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: gcc --version
+      - name: host unit tests
+        run: make test
+      - name: host fuzzer (sanitized)
+        run: make fuzz FUZZ_ITERS=1000
+      - name: host fuzzer second seed
+        run: ./build/fuzz.exe 2 1000

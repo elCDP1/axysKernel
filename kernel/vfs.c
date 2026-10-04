@@ -276,7 +276,10 @@ static void vfs_init_nl(void)
         if (axys_strcmp(standard_dirs[i], "root") == 0) {
             nodes[walk(path, 0, AXYS_VFS_DIR)].mode = 0700u; /* root's home: private */
         } else if (axys_strcmp(standard_dirs[i], "tmp") == 0) {
-            nodes[walk(path, 0, AXYS_VFS_DIR)].mode = 0777u; /* world-writable scratch */
+            /* World-writable scratch with the sticky bit (01777): anyone may
+             * create entries, but only the owner, the directory owner or root
+             * may remove or rename them (see axys_vfs_sticky_ok). */
+            nodes[walk(path, 0, AXYS_VFS_DIR)].mode = 01777u;
         }
     }
 }
@@ -472,6 +475,38 @@ axys_vfs_type_t axys_vfs_type(axys_vfs_node_t node)
 
     axys_spin_unlock_irqrestore(&vfs_lock, flags);
     return type;
+}
+
+axys_int32_t axys_vfs_name_copy(axys_vfs_node_t node, char *out, axys_size_t cap)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    axys_int32_t rc = -1;
+
+    if (node_valid(node) && out != AXYS_NULL && cap != 0) {
+        axys_size_t len = axys_strlen(nodes[node].name);
+
+        if (len < cap) {
+            axys_memcpy(out, nodes[node].name, len + 1);
+            rc = (axys_int32_t)len;
+        }
+    }
+    axys_spin_unlock_irqrestore(&vfs_lock, flags);
+    return rc;
+}
+
+int axys_vfs_sticky_ok(axys_vfs_node_t parent, axys_vfs_node_t target, axys_uint32_t uid)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    int rc = -1;
+
+    if (node_valid(parent) && nodes[parent].type == AXYS_VFS_DIR && node_valid(target)) {
+        if ((nodes[parent].mode & 01000u) == 0u || uid == 0 ||
+            uid == nodes[target].uid || uid == nodes[parent].uid) {
+            rc = 0;
+        }
+    }
+    axys_spin_unlock_irqrestore(&vfs_lock, flags);
+    return rc;
 }
 
 static axys_vfs_node_t vfs_next_child_nl(axys_vfs_node_t dir, axys_vfs_node_t child)
@@ -735,7 +770,8 @@ axys_int32_t axys_vfs_unlink(const char *path)
  * an attacker-controlled tree up to AXYS_VFS_MAX_NODES deep would overflow
  * the kernel stack (hardware fault / triple state), so the traversal keeps
  * its bookkeeping in a bounded heap scratch array instead. Returns the
- * number of nodes released, or -1 if the start node is invalid/root. */
+ * number of nodes released, -1 if the start node is invalid/root, or -2 when
+ * the scratch array cannot be allocated (the tree is left untouched). */
 axys_int32_t axys_vfs_remove_tree(const char *path)
 {
     axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
@@ -754,7 +790,7 @@ axys_int32_t axys_vfs_remove_tree(const char *path)
         axys_size_t top = 0;
 
         if (stack == AXYS_NULL) {
-            result = -1; /* ENOMEM: refuse rather than half-remove anything */
+            result = -2; /* ENOMEM: refuse rather than half-remove anything */
         } else {
             axys_int32_t removed = 0;
             int failed = 0;
@@ -985,7 +1021,13 @@ static void dump_recursive(axys_vfs_node_t node, unsigned depth)
     if (node == 0) {
         axys_console_write("/\n");
     } else {
-        axys_printf("%s%s\n", axys_vfs_name(node), axys_vfs_type(node) == AXYS_VFS_DIR ? "/" : "");
+        char name[AXYS_VFS_NAME_MAX];
+
+        if (axys_vfs_name_copy(node, name, sizeof(name)) < 0) {
+            axys_console_write("?\n");
+        } else {
+            axys_printf("%s%s\n", name, axys_vfs_type(node) == AXYS_VFS_DIR ? "/" : "");
+        }
     }
     while ((child = axys_vfs_next_child(node, child)) >= 0) {
         dump_recursive(child, depth + 1);
