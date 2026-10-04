@@ -13,8 +13,8 @@
  */
 
 #define AXYS_VFS_NAME_MAX 32
-#define AXYS_VFS_MAX_NODES 1024
-#define AXYS_VFS_MAX_FILE_BYTES (16u * 1024u * 1024u)
+#define AXYS_VFS_MAX_NODES 4096
+#define AXYS_VFS_MAX_FILE_BYTES (128u * 1024u * 1024u)
 #define AXYS_VFS_MAX_PATH 256
 
 typedef enum {
@@ -59,6 +59,8 @@ axys_vfs_node_t axys_vfs_next_child(axys_vfs_node_t dir, axys_vfs_node_t child);
 /* Directory/file management beyond create. */
 axys_int32_t axys_vfs_mkdirs(const char *path);      /* mkdir -p: 0 or -1 */
 axys_int32_t axys_vfs_unlink(const char *path);      /* file or empty dir: 0 or -1 */
+axys_int32_t axys_vfs_rename(const char *from, const char *to); /* move/rename: 0 or -1 */
+axys_int32_t axys_vfs_remove_tree(const char *path); /* rm -rf: nodes removed, or -1 */
 axys_int32_t axys_vfs_size(axys_vfs_node_t node);    /* file size, -1 for dirs/invalid */
 
 /* Positional I/O. pwrite grows the file (zero-filling any gap) up to

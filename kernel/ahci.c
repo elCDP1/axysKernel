@@ -1,5 +1,7 @@
 #include "axys/ahci.h"
+#include "axys/cpu.h"
 #include "axys/io.h"
+#include "axys/pit.h"
 #include "axys/pci.h"
 #include "axys/printf.h"
 #include "axys/sched.h"
@@ -143,10 +145,31 @@
 
 #define PORT_MAX 8u
 #define MAX_SECTORS_PER_COMMAND 128u /* 64 KiB of Data FIS payload */
-#define SPIN_LIMIT 20000000u
-/* Device detection and the multiplier handshake are short waits; an empty port never
- * asserts DEV, so the budget has to be small enough to try every port quickly. */
-#define DEVICE_WAIT_LIMIT 2000000u
+
+/* Time-bounded polling budgets (milliseconds). Counting register reads was the
+ * previous scheme: its real duration depended on CPU speed and MMIO latency,
+ * so the same constant meant seconds on one machine and minutes on another --
+ * and a hung or slow device could hold ahci_lock (interrupts disabled) long
+ * enough to look like a system freeze. Deadlines measured against the PIT are
+ * hardware-independent. The AT spec itself allows a drive up to ~30 s to stay
+ * BUSY after a reset/soft-reset before we may call it dead, so command waits
+ * use that; detection is a quick probe run across every port, so it stays
+ * short. The presence budget must also cover the worst case of the multiplier
+ * handshake on top of the plain DEV wait (both are DETECT_MS), because one
+ * empty port costs comreset settle + DEV wait + handshake + reset + DEV wait. */
+#define AHCI_TIMEOUT_CMD_MS   30000u /* command completion and spin-up */
+#define AHCI_TIMEOUT_RESET_MS 30000u /* reserved: the AT spec bound for a future SRST path; COMRESET uses fixed settle delays */
+#define AHCI_TIMEOUT_DETECT_MS 4000u /* per-port device-presence probe */
+
+static axys_uint64_t ahci_deadline_ms(axys_uint64_t ms)
+{
+    return axys_pit_millis() + ms;
+}
+
+static int ahci_expired(axys_uint64_t deadline)
+{
+    return (axys_int64_t)(deadline - axys_pit_millis()) <= 0;
+}
 
 /* The ABAR is at least a page; ask for two so a controller that implements
  * more than the minimum is still mapped. */
@@ -296,15 +319,17 @@ static void build_header(axys_uint16_t flags, axys_uint16_t prdtl)
  * non-zero on success: a caller that ignores this cannot tell a port that
  * finished from one that never will. */
 static int spin_wait(axys_uint32_t address, axys_uint32_t mask, axys_uint32_t wanted,
-                     axys_uint32_t limit)
+                     axys_uint64_t deadline)
 {
-    for (axys_uint32_t i = 0; i < limit; ++i) {
+    for (;;) {
         if ((read32(address) & mask) == wanted) {
             return 1;
         }
-        __asm__ volatile("" ::: "memory");
+        if (ahci_expired(deadline)) {
+            return 0;
+        }
+        axys_cpu_relax();
     }
-    return 0;
 }
 
 /* Wait for a port to become quiescent, and report whether it did.
@@ -317,16 +342,23 @@ static int spin_wait(axys_uint32_t address, axys_uint32_t mask, axys_uint32_t wa
  * the previous command. */
 static int port_idle(axys_uint8_t index)
 {
-    if (!spin_wait(port_reg(index, PX_CI), 0xffffffffu, 0u, SPIN_LIMIT)) {
+    if (!spin_wait(port_reg(index, PX_CI), 0xffffffffu, 0u,
+                   ahci_deadline_ms(AHCI_TIMEOUT_CMD_MS))) {
         return 0;
     }
-    for (axys_uint32_t i = 0; i < SPIN_LIMIT; ++i) {
-        if (((port_read(index, PX_TFD) & 0xffu) & ATA_STATUS_BSY) == 0u) {
-            return 1;
+    {
+        axys_uint64_t deadline = ahci_deadline_ms(AHCI_TIMEOUT_CMD_MS);
+
+        for (;;) {
+            if (((port_read(index, PX_TFD) & 0xffu) & ATA_STATUS_BSY) == 0u) {
+                return 1;
+            }
+            if (ahci_expired(deadline)) {
+                return 0;
+            }
+            axys_cpu_relax();
         }
-        __asm__ volatile("" ::: "memory");
     }
-    return 0;
 }
 
 /* Wait for the HBA to report a device on the port. The port reset is
@@ -334,13 +366,41 @@ static int port_idle(axys_uint8_t index)
  * afterwards, so reading the bit once after the reset says nothing. */
 static int wait_for_device(axys_uint8_t index)
 {
-    for (axys_uint32_t i = 0; i < DEVICE_WAIT_LIMIT; ++i) {
+    axys_uint64_t deadline = ahci_deadline_ms(AHCI_TIMEOUT_DETECT_MS);
+
+    for (;;) {
         if ((port_read(index, PX_SSTS) & SSTS_DEV_PF) != 0u) {
             return 1;
         }
-        __asm__ volatile("" ::: "memory");
+        if (ahci_expired(deadline)) {
+            return 0;
+        }
+        axys_cpu_relax();
     }
-    return 0;
+}
+
+/* Full COMRESET/COMINIT/COMWAKE settle with the delays the spec requires.
+ *
+ * Writing SCTL.DET=1 and merely waiting for DET to clear again is NOT a
+ * complete reset: AHCI 1.3 section 7.1 states software must hold COMRESET
+ * asserted for at least 10 ms before deasserting it, and a drive needs up to
+ * 10 ms after COMRESET is released before it drives DAS/DET with its
+ * signature. A write that lands and is cleared microseconds later is a pulse
+ * too short for real hardware to even see, and polling SSTS in the instant
+ * after it can latch a stale "no device" state. So: assert DET, sleep past the
+ * 10 ms floor, release DET, then sleep past the power-on/settle window before
+ * anybody reads SSTS. */
+static void port_comreset(axys_uint8_t index)
+{
+    port_write(index, PX_SCTL, SCTL_DET_COMRESET);
+    axys_pit_sleep_ms(15u);
+    port_write(index, PX_SCTL, SCTL_DET_NORMAL);
+    /* IDENTIFY DEVICE itself may take up to 30 s on an old drive; this covers
+     * only the electrical settle plus the HBA's own signature check. */
+    axys_pit_sleep_ms(50u);
+    /* Give the HBA one extra poll round-trip budget (a few ms) rather than
+     * trusting the settle sleep alone; wait_for_device still owns the final
+     * deadline. */
 }
 
 /* Bring a port out of reset, give the HBA the locations it needs, and leave the
@@ -359,12 +419,11 @@ static int port_reset(axys_uint8_t index)
     port_write(index, PX_CLBU, 0u);
     port_write(index, PX_SERR, 0u);
 
-    /* COMRESET. The HBA resets the attached device and clears DET when done. */
-    port_write(index, PX_SCTL, SCTL_DET_COMRESET);
-    if (!spin_wait(port_reg(index, PX_SCTL), SCTL_DET_MASK, SCTL_DET_NORMAL, SPIN_LIMIT)) {
-        return -1;
-    }
-    port_write(index, PX_SCTL, SCTL_DET_NORMAL);
+    /* COMRESET with the spec's minimum assertion time and a settle window.
+     * Waiting for software-detected DET to clear on its own is not enough:
+     * it can clear before the drive has even powered up its interface, and
+     * an empty port leaves DET stuck at COMRESET until we release it. */
+    port_comreset(index);
 
     /* PRDTL of 0 means all 32 command list entries are usable. */
     port_write(index, PX_CMD, CMD_PORT_RUN);
@@ -392,12 +451,19 @@ static int port_count_multipliers(axys_uint8_t index)
     port_write(index, PX_CMD, CMD_PORT_RUN);
     port_write(index, PX_CI, 1u << CMD_SLOT);
 
-    for (axys_uint32_t i = 0; i < DEVICE_WAIT_LIMIT; ++i) {
-        if ((received[0] & FIS_TYPE_MASK) == FIS_SIGNATURE) {
-            seen = 1;
-            break;
+    {
+        axys_uint64_t deadline = ahci_deadline_ms(AHCI_TIMEOUT_DETECT_MS);
+
+        for (;;) {
+            if ((received[0] & FIS_TYPE_MASK) == FIS_SIGNATURE) {
+                seen = 1;
+                break;
+            }
+            if (ahci_expired(deadline)) {
+                break;
+            }
+            axys_cpu_relax();
         }
-        __asm__ volatile("" ::: "memory");
     }
     port_write(index, PX_SCTL, SCTL_DET_NORMAL);
     return seen;
@@ -535,20 +601,30 @@ static int run_command(void)
      * stale status and read the buffer before the data lands. PxIS is the
      * register that actually changes hands, so wait for the drive to report and
      * then for it to stop being busy. */
-    for (axys_uint32_t i = 0; i < SPIN_LIMIT; ++i) {
-        axys_uint32_t status;
+    {
+        axys_uint64_t deadline = ahci_deadline_ms(AHCI_TIMEOUT_CMD_MS);
 
-        if ((port_read(drive_port, PX_IS) & IS_REPORTED) == 0u) {
-            __asm__ volatile("" ::: "memory");
-            continue;
+        for (;;) {
+            axys_uint32_t status;
+
+            if ((port_read(drive_port, PX_IS) & IS_REPORTED) == 0u) {
+                if (ahci_expired(deadline)) {
+                    break;
+                }
+                axys_cpu_relax();
+                continue;
+            }
+            status = port_read(drive_port, PX_TFD) & 0xffu;
+            if ((status & ATA_STATUS_BSY) == 0u &&
+                (status & (ATA_STATUS_DRDY | ATA_STATUS_ERR)) != 0u) {
+                retired = 1;
+                break;
+            }
+            if (ahci_expired(deadline)) {
+                break;
+            }
+            axys_cpu_relax();
         }
-        status = port_read(drive_port, PX_TFD) & 0xffu;
-        if ((status & ATA_STATUS_BSY) == 0u &&
-            (status & (ATA_STATUS_DRDY | ATA_STATUS_ERR)) != 0u) {
-            retired = 1;
-            break;
-        }
-        __asm__ volatile("" ::: "memory");
     }
     if (!retired) {
         return -1;
@@ -691,13 +767,12 @@ int axys_ahci_init(void)
         if ((implemented & (1u << i)) == 0u) {
             continue;
         }
-        /* Force a COMRESET on the port. Enabling the HBA already reset every
-         * port, but a second explicit reset is what makes a drive that was
-         * spun up or left in a strange state answer again, and it costs one
-         * register write on a cold controller. */
-        port_write(index, PX_SCTL, SCTL_DET_COMRESET);
-        (void)spin_wait(port_reg(index, PX_SCTL), SCTL_DET_MASK, SCTL_DET_NORMAL, SPIN_LIMIT);
-        port_write(index, PX_SCTL, SCTL_DET_NORMAL);
+        /* Full COMRESET with the spec's assertion/settle timing. Enabling the
+         * HBA already pulsed reset, but that pulse is not guaranteed to meet
+         * the 10 ms floor and a drive left in a strange state answers only to
+         * a proper reset. DET must be released before we start the port; on
+         * this hardware path there is no device yet, so nothing can be busy. */
+        port_comreset(index);
         port_write(index, PX_CMD, CMD_PORT_RUN);
 
         if (wait_for_device(index) == 0) {

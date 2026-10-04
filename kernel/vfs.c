@@ -118,7 +118,10 @@ static axys_int32_t node_find_child(axys_int32_t dir, const char *name, axys_siz
     for (axys_uint32_t i = 0; i < nodes[dir].child_count; ++i) {
         axys_int32_t child = nodes[dir].children[i];
 
-        if (axys_strncmp(nodes[child].name, name, name_len) == 0 &&
+        /* node_valid() before dereferencing: a stale index left behind by an
+         * inconsistent tree must never make us read another slot's name. */
+        if (node_valid(child) &&
+            axys_strncmp(nodes[child].name, name, name_len) == 0 &&
             nodes[child].name[name_len] == '\0') {
             return child;
         }
@@ -150,8 +153,13 @@ static int node_link(axys_int32_t parent, axys_int32_t child)
 
 static void node_unlink_from_parent(axys_int32_t child)
 {
-    struct vfs_node *dir = &nodes[nodes[child].parent];
+    axys_int32_t parent = nodes[child].parent;
+    struct vfs_node *dir;
 
+    if (!node_valid(parent) || nodes[parent].type != AXYS_VFS_DIR) {
+        return; /* defensive: never touch a stale/free parent slot */
+    }
+    dir = &nodes[parent];
     for (axys_uint32_t i = 0; i < dir->child_count; ++i) {
         if (dir->children[i] == child) {
             dir->children[i] = dir->children[--dir->child_count];
@@ -189,6 +197,16 @@ static axys_vfs_node_t walk(const char *path, int create, axys_vfs_type_t create
             }
         }
         if (segment_len == 0) {
+            return -1;
+        }
+        /* Reject "." and ".." outright: the tree has no hard links, so a link
+         * named "." would make node_find_child() match the parent itself and
+         * walk("/x/./y") would loop forever. Creating them is an error, and
+         * looking them up fails cleanly instead of hanging or aliasing. */
+        if (segment_len == 1 && segment_start[0] == '.') {
+            return -1;
+        }
+        if (segment_len == 2 && segment_start[0] == '.' && segment_start[1] == '.') {
             return -1;
         }
         is_last = (segment_start[segment_len] == '\0');
@@ -287,6 +305,11 @@ static axys_int32_t vfs_mkdirs_nl(const char *path)
     length = axys_strlen(path);
     if (length >= sizeof(partial)) {
         return -1;
+    }
+    /* Trailing slashes ("/a/b/") must not produce an empty final component:
+     * normalize them away before the ancestor walk. */
+    while (length > 1 && path[length - 1] == '/') {
+        --length;
     }
     for (axys_size_t i = 1; i <= length; ++i) {
         if (path[i] != '/' && path[i] != '\0') {
@@ -469,6 +492,179 @@ static axys_vfs_node_t vfs_next_child_nl(axys_vfs_node_t dir, axys_vfs_node_t ch
     return start < nodes[dir].child_count ? nodes[dir].children[start] : -1;
 }
 
+/* Depth of a directory from the root (root itself is 0), following parent
+ * links. A consistent tree terminates at 0; if a corrupted parent chain ever
+ * looped, this returns -1 after a bounded walk instead of hanging forever. */
+static axys_int32_t dir_depth(axys_int32_t node)
+{
+    axys_int32_t depth = 0;
+
+    while (node != 0) {
+        node = nodes[node].parent;
+        if (!node_valid(node)) {
+            return -1;
+        }
+        if (++depth > AXYS_VFS_MAX_NODES) {
+            return -1; /* impossible in a sane tree: cycle guard */
+        }
+    }
+    return depth;
+}
+
+/* Split `to` into destination-directory path + final component name. The
+ * destination's parent must already exist; the final component must not.
+ * Returns 0 and fills the outputs, -1 on any malformed/occupied spelling. */
+static int rename_split_target(const char *to, char *parent_path, axys_size_t parent_cap,
+                               const char **name_out, axys_size_t *name_len_out)
+{
+    const char *slash;
+
+    if (to == AXYS_NULL || to[0] != '/') {
+        return -1;
+    }
+    slash = to;
+    while (*slash != '\0' && *slash != '/') {
+        ++slash;
+    }
+    /* only '/' or empty -> renaming onto the root itself */
+    if (*slash == '\0' || slash[1] == '\0') {
+        return -1;
+    }
+    /* find the last slash */
+    {
+        const char *last = AXYS_NULL;
+        const char *c;
+
+        for (c = to; *c != '\0'; ++c) {
+            if (*c == '/') {
+                last = c;
+            }
+        }
+        if (last == to) {
+            return -1; /* "/name": destination parent is "/" itself */
+        }
+        {
+            axys_size_t parent_len = (axys_size_t)(last - to);
+
+            if (parent_len >= parent_cap) {
+                return -1;
+            }
+            axys_memcpy(parent_path, to, parent_len);
+            parent_path[parent_len] = '\0';
+        }
+        *name_out = last + 1;
+        *name_len_out = 0;
+        while ((*name_out)[*name_len_out] != '\0') {
+            ++(*name_len_out);
+            if (*name_len_out >= AXYS_VFS_NAME_MAX) {
+                return -1;
+            }
+        }
+        if (*name_len_out == 0) {
+            return -1; /* trailing slash */
+        }
+    }
+    return 0;
+}
+
+/* Move `node` under the (already validated) destination directory `new_parent`
+ * as `new_name`. Rejects moving a directory into its own subtree (which would
+ * orphan every node below it and let walk() loop forever). Caller holds vfs_lock. */
+static int node_rename(axys_int32_t node, axys_int32_t new_parent, const char *new_name,
+                       axys_size_t new_name_len)
+{
+    struct vfs_node *dir = &nodes[new_parent];
+    axys_int32_t check;
+
+    if (nodes[node].type == AXYS_VFS_DIR) {
+        check = new_parent;
+        for (;;) {
+            if (check == node) {
+                return -1; /* cannot move a directory into itself/its subtree */
+            }
+            if (check == 0) {
+                break;
+            }
+            check = nodes[check].parent;
+            if (!node_valid(check)) {
+                return -1;
+            }
+        }
+        if (dir_depth(node) + dir_depth(new_parent) > AXYS_VFS_MAX_NODES) {
+            return -1; /* bounded depth keeps future walks O(n) at worst */
+        }
+    }
+
+    if (new_name_len >= AXYS_VFS_NAME_MAX) {
+        return -1;
+    }
+    if (dir->child_count == dir->child_cap) {
+        /* Grow first so we never unlink from the old parent on ENOMEM. */
+        axys_uint32_t new_cap = dir->child_cap ? dir->child_cap * 2u : 8u;
+        axys_int32_t *grown = axys_kmalloc((axys_size_t)new_cap * sizeof(axys_int32_t));
+
+        if (grown == AXYS_NULL) {
+            return -1;
+        }
+        if (dir->children != AXYS_NULL) {
+            axys_memcpy(grown, dir->children, (axys_size_t)dir->child_count * sizeof(axys_int32_t));
+            axys_kfree(dir->children);
+        }
+        dir->children = grown;
+        dir->child_cap = new_cap;
+    }
+    node_unlink_from_parent(node);
+    axys_strlcpy(nodes[node].name, new_name, sizeof(nodes[node].name));
+    nodes[node].parent = new_parent;
+    dir->children[dir->child_count++] = node;
+    return 0;
+}
+
+/* rename(2)-style move. Both paths are resolved under one lock acquisition,
+ * so there is no TOCTOU window between lookup and the actual relink. Moving a
+ * directory into its own subtree is rejected (it would orphan its descendants
+ * and make walks non-terminating). Files may overwrite an existing regular
+ * file at the destination (POSIX semantics); directories never do. */
+axys_int32_t axys_vfs_rename(const char *from, const char *to)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    axys_int32_t rc = -1;
+    axys_vfs_node_t src;
+    char to_parent[AXYS_VFS_MAX_PATH];
+    const char *name;
+    axys_size_t name_len;
+    axys_vfs_node_t dst_dir;
+    axys_int32_t existing;
+
+    src = walk(from, 0, AXYS_VFS_DIR);
+    if (src <= 0) { /* missing or the root itself */
+        goto out;
+    }
+    if (rename_split_target(to, to_parent, sizeof(to_parent), &name, &name_len) != 0) {
+        goto out;
+    }
+    dst_dir = walk(to_parent, 0, AXYS_VFS_DIR);
+    if (dst_dir < 0 || nodes[dst_dir].type != AXYS_VFS_DIR) {
+        goto out;
+    }
+    existing = node_find_child(dst_dir, name, name_len);
+    if (existing >= 0) {
+        if (nodes[existing].type == AXYS_VFS_DIR ||
+            nodes[src].type != AXYS_VFS_FILE || existing == src) {
+            goto out; /* dir->dir replace, file->dir, or self-rename */
+        }
+        node_unlink_from_parent(existing);
+        node_release(existing);
+    }
+    if (node_rename(src, dst_dir, name, name_len) == 0) {
+        ++mutation_count;
+        rc = 0;
+    }
+out:
+    axys_spin_unlock_irqrestore(&vfs_lock, flags);
+    return rc;
+}
+
 void axys_vfs_init(void)
 {
     axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
@@ -512,6 +708,92 @@ axys_int32_t axys_vfs_unlink(const char *path)
     ++mutation_count;
     axys_int32_t result = vfs_unlink_nl(path);
 
+    axys_spin_unlock_irqrestore(&vfs_lock, flags);
+    return result;
+}
+
+/* Iterative post-order release of `node` and every descendant. A plain
+ * unlink still refuses non-empty directories; this is the explicit recursive
+ * removal used by rm -rf in user space. Recursion is deliberately avoided:
+ * an attacker-controlled tree up to AXYS_VFS_MAX_NODES deep would overflow
+ * the kernel stack (hardware fault / triple state), so the traversal keeps
+ * its bookkeeping in a bounded heap scratch array instead. Returns the
+ * number of nodes released, or -1 if the start node is invalid/root. */
+axys_int32_t axys_vfs_remove_tree(const char *path)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    axys_vfs_node_t node = walk(path, 0, AXYS_VFS_DIR);
+    axys_int32_t result = -1;
+
+    if (node > 0) {
+        /* Explicit stack of pending directory frames. Each entry remembers
+         * which child index has already been dispatched, so no recursion is
+         * needed and memory pressure can never turn into a stack overflow. */
+        struct remove_frame {
+            axys_int32_t dir;
+            axys_uint32_t next_child;
+        };
+        struct remove_frame *stack =
+            axys_kmalloc(AXYS_VFS_MAX_NODES * sizeof(*stack));
+        axys_size_t top = 0;
+
+        if (stack == AXYS_NULL) {
+            result = -1; /* ENOMEM: refuse rather than half-remove anything */
+        } else {
+            axys_int32_t removed = 0;
+            int failed = 0;
+
+            stack[top].dir = node;
+            stack[top].next_child = 0;
+            ++top;
+
+            while (top != 0 && !failed) {
+                struct remove_frame *frame = &stack[top - 1];
+                axys_int32_t target = frame->dir;
+
+                if (!node_valid(target)) {
+                    /* stale reference inside our own stack: drop the frame */
+                    --top;
+                    continue;
+                }
+                if (frame->next_child < nodes[target].child_count) {
+                    axys_int32_t child = nodes[target].children[frame->next_child];
+
+                    ++frame->next_child;
+                    if (!node_valid(child)) {
+                        continue; /* inconsistent tree: skip the stale link */
+                    }
+                    if (nodes[child].type == AXYS_VFS_DIR &&
+                        nodes[child].child_count != 0) {
+                        if (top == AXYS_VFS_MAX_NODES) {
+                            failed = 1; /* cannot happen: dirs <= nodes */
+                            break;
+                        }
+                        stack[top].dir = child;
+                        stack[top].next_child = 0;
+                        ++top;
+                    } else {
+                        node_unlink_from_parent(child);
+                        node_release(child);
+                        ++removed;
+                    }
+                    continue;
+                }
+                /* all children dispatched: release the directory itself
+                 * (never the root, which cannot appear here since node > 0
+                 * and no child index can be the root in a valid tree). */
+                --top;
+                node_unlink_from_parent(target);
+                node_release(target);
+                ++removed;
+            }
+            axys_kfree(stack);
+            if (!failed) {
+                ++mutation_count;
+                result = removed;
+            }
+        }
+    }
     axys_spin_unlock_irqrestore(&vfs_lock, flags);
     return result;
 }

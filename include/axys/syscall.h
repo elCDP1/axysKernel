@@ -37,6 +37,8 @@ enum axys_syscall_number {
     AXYS_SYS_CHMOD = 24,    /* chmod(path, mode) - owner or root  */
     AXYS_SYS_CHOWN = 25,    /* chown(path, uid, gid) - root only  */
     AXYS_SYS_SYNC = 26,     /* sync() - write the file system to disk */
+    AXYS_SYS_RENAME = 27,   /* rename(from, to) - move within the VFS */
+    AXYS_SYS_RMDIR_TREE = 28, /* rmdir_tree(path) - recursive remove (rm -rf) */
     AXYS_SYS_COUNT
 };
 

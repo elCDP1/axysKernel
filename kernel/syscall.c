@@ -217,6 +217,8 @@ static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, a
     axys_uint64_t n;
 
     if (proc->line_pos >= proc->line_len) {
+        int oversize = 0; /* one discarded-remainder flag per over-long line */
+
         proc->line_len = proc->line_pos = 0;
         for (;;) {
             int c = axys_input_getc();
@@ -225,6 +227,18 @@ static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, a
                 return 0; /* EOF */
             }
             if (c == '\n' || c == 4) {
+                /* A line that overflowed the editor buffer had its extra
+                 * keystrokes silently dropped while still echoing them: the
+                 * shell would run a truncated command with no indication, and
+                 * a truncated argument can turn "rm -rf /a/b" into "rm -rf /a".
+                 * Discard the rest of the physical line without echoing, then
+                 * report the error to the user instead of delivering the
+                 * partial line. */
+                if (oversize) {
+                    axys_console_write("line too long\n");
+                    oversize = 0;
+                    continue;
+                }
                 axys_console_putc('\n');
                 if (c == '\n') {
                     proc->line[proc->line_len++] = '\n';
@@ -232,15 +246,19 @@ static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, a
                 break;
             }
             if (c == '\b') {
-                if (proc->line_len > 0) {
+                if (!oversize && proc->line_len > 0) {
                     --proc->line_len;
                     axys_console_write("\b \b");
                 }
                 continue;
             }
-            if (c >= 0x20 && c < 0x7f && proc->line_len < sizeof(proc->line) - 1) {
-                proc->line[proc->line_len++] = (char)c;
-                axys_console_putc((char)c);
+            if (c >= 0x20 && c < 0x7f) {
+                if (proc->line_len < sizeof(proc->line) - 1) {
+                    proc->line[proc->line_len++] = (char)c;
+                    axys_console_putc((char)c);
+                } else {
+                    oversize = 1;
+                }
             }
         }
     }
@@ -560,6 +578,34 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (rc != 0) {
             return rc;
         }
+        /* mkdir -p semantics: create every missing ancestor, not just the
+         * final component. Each intermediate directory is owned by the caller
+         * with mode 0755, exactly like the leaf. Trailing slashes are
+         * normalized away first so "/a/b/" behaves like "/a/b" instead of
+         * trying to create an empty-named leaf (which would fail with ENOENT
+         * after /a/b already exists). */
+        {
+            axys_size_t len = axys_strlen(path);
+
+            while (len > 1 && path[len - 1] == '/') {
+                path[--len] = '\0';
+            }
+            for (axys_size_t i = 1; i < len; ++i) {
+                char saved;
+
+                if (path[i] != '/') {
+                    continue;
+                }
+                saved = path[i];
+                path[i] = '\0';
+                if (axys_vfs_lookup(path) < 0 &&
+                    axys_vfs_create_as(path, AXYS_VFS_DIR, 0755u, proc->uid, proc->gid) < 0) {
+                    path[i] = saved;
+                    return err(path_errno(path));
+                }
+                path[i] = saved;
+            }
+        }
         return axys_vfs_create_as(path, AXYS_VFS_DIR, 0755u, proc->uid, proc->gid) >= 0 ? 0 : err(path_errno(path));
     case AXYS_SYS_UNLINK: {
         axys_vfs_node_t node;
@@ -673,6 +719,88 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
     }
     case AXYS_SYS_SYNC:
         return axys_persist_sync() == 0 ? 0 : err(AXYS_ENODEV);
+    case AXYS_SYS_RENAME: {
+        char to[MAX_PATH];
+        axys_vfs_node_t src;
+
+        rc = user_path(proc, a0, path);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = user_path(proc, a1, to);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = search_check(proc, path);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = search_check(proc, to);
+        if (rc != 0) {
+            return rc;
+        }
+        src = axys_vfs_lookup(path);
+        if (src < 0) {
+            return err(AXYS_ENOENT);
+        }
+        /* permission on the source itself: renaming rewrites its parent's
+         * entry and the node's name, so it follows POSIX rename(): the caller
+         * must own the file (or be root) for the object being moved. */
+        {
+            struct axys_vfs_attr attr;
+
+            if (axys_vfs_getattr(src, &attr) != 0) {
+                return err(AXYS_ENOENT);
+            }
+            if (proc->uid != 0 && proc->uid != attr.uid) {
+                return err(AXYS_EPERM);
+            }
+        }
+        rc = parent_check(proc, path, AXYS_PERM_W | AXYS_PERM_X);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = parent_check(proc, to, AXYS_PERM_W | AXYS_PERM_X);
+        if (rc != 0) {
+            return rc;
+        }
+        /* a file cannot be renamed onto an existing directory: report EISDIR
+         * instead of the generic failure the VFS layer returns. */
+        {
+            axys_vfs_node_t dst = axys_vfs_lookup(to);
+
+            if (dst >= 0 && axys_vfs_type(dst) == AXYS_VFS_DIR &&
+                axys_vfs_type(src) != AXYS_VFS_DIR) {
+                return err(AXYS_EISDIR);
+            }
+        }
+        return axys_vfs_rename(path, to) == 0 ? 0 : err(AXYS_EINVAL);
+    }
+    case AXYS_SYS_RMDIR_TREE: {
+        axys_vfs_node_t node;
+
+        rc = user_path(proc, a0, path);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = search_check(proc, path);
+        if (rc != 0) {
+            return rc;
+        }
+        node = axys_vfs_lookup(path);
+        if (node < 0) {
+            return err(AXYS_ENOENT);
+        }
+        rc = parent_check(proc, path, AXYS_PERM_W | AXYS_PERM_X);
+        if (rc != 0) {
+            return rc;
+        }
+        {
+            axys_int32_t removed = axys_vfs_remove_tree(path);
+
+            return removed >= 0 ? removed : err(AXYS_EACCES);
+        }
+    }
     case AXYS_SYS_POWER:
         if (proc->uid != 0) {
             return err(AXYS_EPERM); /* only root may halt the machine */
