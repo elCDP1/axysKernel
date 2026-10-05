@@ -459,3 +459,26 @@ the checksum file itself and ignored build outputs.
   truncated uid. It now rejects missing digits, trailing garbage and values above
   32 bits; `su`, `chmod` and `chown` report -22 (EINVAL).
 - Regression coverage for both was added to stage 2 of `tools/qemu-test.sh`.
+
+### Heap tail pointer and process-spawn race (found by in-QEMU fuzzing)
+
+- `kmalloc_locked()` (`kernel/heap.c`): splitting the *last* block of the
+  arena list left `heap_tail` pointing at the allocated half. The next
+  `heap_grow()` then executed `heap_tail->next = new_arena`, overwriting the
+  link to the split-off remainder and dropping it, and everything after it,
+  from the list permanently (up to a whole arena of free memory), while
+  `bytes_in_use` kept counting. The tail is now advanced to the remainder.
+  `tests/test_heap.c` (in `make test`) includes the real allocator and checks,
+  after random alloc/free traffic, that every byte of every arena is reachable
+  from the block list, that the tail is the last block, and that
+  `bytes_in_use`/`bytes_free` match the sum over the blocks. It fails on the
+  old code ("heap_tail is not the last block").
+- `axys_process_spawn_as()` (`kernel/process.c`): the new task became runnable
+  inside `axys_task_create()`, before `axys_task_set_address_space()` attached
+  its page tables and process. A timer tick in that window runs the task on the
+  kernel's CR3 with no process: it takes a page fault on its first user
+  instruction (`process -1 (?) killed: exception 14`) and the real process slot
+  never exits, so the parent's `wait()` blocks forever. Interrupts are now
+  disabled across create + attach + detach. This was observed once as a hang
+  during fuzzing and could not be reproduced on demand afterwards, so the fix
+  rests on the code analysis rather than on a failing regression test.

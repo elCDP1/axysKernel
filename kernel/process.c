@@ -425,14 +425,27 @@ int axys_process_spawn_as(const char *path, const char *args, int parent,
     info->rsp = rsp;
     info->arg_ptr = arg_ptr;
     info->arg_len = arg_len;
-    task = axys_task_create(proc->name, user_task_entry, info);
-    if (task == AXYS_NULL) {
-        axys_kfree(info);
-        rc = -AXYS_ENOMEM;
-        goto fail_space;
+    {
+        /* A new task is runnable the moment it exists. If the timer preempted
+         * us before the address space and process were attached, the task
+         * would enter user mode on the kernel's page tables with no process:
+         * it faults on its first instruction ("process -1"), and the real
+         * process slot stays alive forever, so the parent's wait() never
+         * returns. Keep the whole sequence atomic on this (UP) CPU. */
+        axys_uint64_t irq_flags = axys_cpu_save_flags();
+
+        axys_cpu_disable_interrupts();
+        task = axys_task_create(proc->name, user_task_entry, info);
+        if (task == AXYS_NULL) {
+            axys_cpu_restore_flags(irq_flags);
+            axys_kfree(info);
+            rc = -AXYS_ENOMEM;
+            goto fail_space;
+        }
+        axys_task_set_address_space(task, proc->space.pml4, proc);
+        axys_task_detach(task); /* the process slot carries the exit status */
+        axys_cpu_restore_flags(irq_flags);
     }
-    axys_task_set_address_space(task, proc->space.pml4, proc);
-    axys_task_detach(task); /* the process slot carries the exit status */
     return proc->pid;
 
 fail_space:

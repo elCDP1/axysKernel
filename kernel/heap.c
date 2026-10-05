@@ -192,6 +192,13 @@ static void *kmalloc_locked(axys_size_t size)
                 remainder->free = 1;
                 remainder->next = block->next;
                 block->next = remainder;
+                if (heap_tail == block) {
+                    /* The remainder is now the last block. Leaving the tail
+                     * stale made the next heap_grow() overwrite
+                     * heap_tail->next and silently drop the remainder (and
+                     * everything after it) from the free list for good. */
+                    heap_tail = remainder;
+                }
                 block->size = size;
                 bytes_free -= sizeof(struct block);
             }

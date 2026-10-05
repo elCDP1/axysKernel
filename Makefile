@@ -114,7 +114,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -124,6 +124,7 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_acpi.exe
 	./build/test_elf.exe
 	./build/test_path.exe
+	./build/test_heap.exe
 
 build/test_string.exe: $(HOST_STRING_TEST_OBJECTS)
 	@$(MKDIR)
@@ -156,6 +157,10 @@ build/test_elf.exe: $(HOST_ELF_TEST_OBJECTS)
 build/test_vfs.exe: $(HOST_VFS_TEST_OBJECTS)
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_VFS_TEST_OBJECTS)
+
+build/test_heap.exe: tests/test_heap.c kernel/heap.c lib/string.c
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_heap.c lib/string.c
 
 build/test_path.exe: $(HOST_PATH_TEST_OBJECTS)
 	@$(MKDIR)
