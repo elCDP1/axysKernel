@@ -18,6 +18,11 @@ make check
 make check-highmem
 make check-nvme
 make check-ahci
+make check-usb
+make check-usb-hub
+make check-usb-storage
+make check-usb-storage-hub
+make check-net
 ```
 
 `make check` runs the host regression tests and drives a headless QEMU boot,
@@ -30,6 +35,12 @@ persistence.
 write, flush, and reboot persistence.
 `make check-ahci` places the test disk on the highest ICH9 AHCI port and checks
 the selected backend and reboot persistence.
+`make check-usb` boots with a USB keyboard behind xHCI and injects keystrokes;
+`make check-usb-hub` repeats it behind a USB hub, and `make check-usb-storage`
+and `make check-usb-storage-hub` use a USB mass-storage disk as the system
+disk on a root port and behind a hub, checking persistence across two boots.
+`make check-net` obtains a DHCPv4 lease and pings the gateway over the
+controller.
 
 ## Current platform
 
@@ -42,12 +53,19 @@ the selected backend and reboot persistence.
   mapped only on demand when the firmware marks their pages reserved.
 - PCI BAR MMIO is mapped uncached only when the firmware map marks the requested
   pages reserved; device DMA/IOMMU policy is still limited to the current drivers.
-- Console output is serial and VGA text. Keyboard input is serial or a PS/2
-  set-1 keyboard through the i8042 controller.
+- Console output is serial and VGA text. Keyboard input is serial, a PS/2
+  set-1 keyboard through the i8042 controller, or a USB boot keyboard through
+  xHCI, directly or behind a USB hub.
+- USB support is an polled xHCI host controller with hub traversal, boot
+  keyboards, and bulk-only mass storage usable as the system disk. Other USB
+  host controllers, HID classes, and audio are absent.
 - Storage support includes a polled PCI NVMe driver for a 512-byte-LBA
-  namespace, PCI AHCI, and primary-channel ATA PIO. NVMe is tested in QEMU;
-  USB storage, networking, Wi-Fi, audio, SMP, and vendor GPU acceleration are
-  not yet implemented.
+  namespace, PCI AHCI, primary-channel ATA PIO, and USB bulk-only mass storage.
+  All four backends are tested in QEMU, including reboot persistence.
+- Ethernet support is a polled Intel 82540EM-compatible controller with raw
+  user-space networking: `ping` speaks ARP/ICMP and `dhcp` performs a full
+  DHCPv4 handshake. There is no kernel socket layer, so TCP/UDP, DNS, Wi-Fi,
+  audio, SMP, and vendor GPU acceleration are not implemented.
 - DDR initialization belongs to motherboard firmware and the CPU memory
   controller. The kernel consumes the firmware memory map; it does not train
   DDR3, DDR4, or DDR5 memory.

@@ -30,7 +30,7 @@ KERNEL_C_SOURCES := $(wildcard kernel/*.c lib/*.c arch/$(ARCH)/*.c)
 KERNEL_AS_SOURCES := $(wildcard arch/$(ARCH)/*.S)
 # User programs (ELF64 static-PIE) embedded into the kernel image as the initial
 # file system; each is installed into the VFS at boot. Format: name:/install/path
-USER_PROGS := init:/sbin/init hello:/bin/hello crash:/bin/crash heap:/bin/heap fileio:/bin/fileio perms:/bin/perms probe:/bin/probe fuzz:/bin/fuzz
+USER_PROGS := init:/sbin/init hello:/bin/hello crash:/bin/crash heap:/bin/heap fileio:/bin/fileio perms:/bin/perms probe:/bin/probe fuzz:/bin/fuzz ping:/bin/ping dhcp:/bin/dhcp
 USER_ELFS := $(foreach p,$(USER_PROGS),build/user/$(word 1,$(subst :, ,$(p))).elf)
 USER_CFLAGS := -std=c17 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -Iuser
 USER_LDFLAGS := -pie --no-dynamic-linker -z max-page-size=0x1000 -z noseparate-code -z norelro --build-id=none -e _start
@@ -61,7 +61,7 @@ HOST_ACPI_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ACPI_TEST_SOURCES
 HOST_ELF_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ELF_TEST_SOURCES))
 HOST_PATH_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PATH_TEST_SOURCES))
 
-.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz
+.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-net
 
 all: kernel
 
@@ -114,7 +114,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -125,6 +125,8 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_elf.exe
 	./build/test_path.exe
 	./build/test_heap.exe
+	./build/test_pci.exe
+	./build/test_usb.exe
 
 build/test_string.exe: $(HOST_STRING_TEST_OBJECTS)
 	@$(MKDIR)
@@ -162,6 +164,14 @@ build/test_heap.exe: tests/test_heap.c kernel/heap.c lib/string.c
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_heap.c lib/string.c
 
+build/test_pci.exe: tests/test_pci.c kernel/pci.c kernel/dma.c lib/string.c lib/printf.c tests/console_stub.c
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_pci.c lib/string.c lib/printf.c tests/console_stub.c
+
+build/test_usb.exe: tests/test_usb.c kernel/usb_hid.c
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_usb.c kernel/usb_hid.c
+
 build/test_path.exe: $(HOST_PATH_TEST_OBJECTS)
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_PATH_TEST_OBJECTS)
@@ -182,6 +192,27 @@ build/fuzz.exe: $(HOST_FUZZ_SOURCES)
 
 check-fuzz: iso
 	@sh tools/qemu-fuzz.sh
+
+# USB keyboard through xHCI: enumeration at boot plus injected keystrokes.
+check-usb: iso
+	@python3 tools/qemu-usb.py
+
+# Same keyboard behind a USB hub, which also exercises route-string handling.
+check-usb-hub: iso
+	@TOPOLOGY=hub python3 tools/qemu-usb.py
+
+# USB mass storage (BOT) with persistence across two boots, on a root port.
+check-usb-storage: test iso
+	@EXPECT_USB=1 DISK_IF=if=none DISK_DEV='-device qemu-xhci,id=xhci -device usb-storage,drive=d0,bus=xhci.0' sh tools/qemu-test.sh
+
+# The same BOT disk behind a USB hub, which also exercises route strings for
+# bulk transfers.
+check-usb-storage-hub: test iso
+	@EXPECT_USB=1 DISK_IF=if=none DISK_DEV='-device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0 -device usb-storage,drive=d0,port=1.1' sh tools/qemu-test.sh
+
+# DHCPv4 lease over e1000 followed by an ICMP ping to the SLIRP gateway.
+check-net: test iso
+	@EXPECT_NET=1 sh tools/qemu-test.sh
 
 build/host/%.o: %.c
 	@$(MKDIR)

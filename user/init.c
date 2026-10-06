@@ -179,7 +179,7 @@ static void help(void)
 {
     puts("builtins: help ls cat echo mkdir rm mv rmtree meminfo uptime random pid id su chmod chown sync sleep run poweroff reboot exit\n"
          "any other word runs /bin/<word> (arguments are passed through)\n"
-         "try: hello world | crash null | crash kexec | crash badptr | heap | fileio\n");
+         "try: hello world | ping | dhcp | crash null | heap | fileio\n");
 }
 
 int main(const char *args, size_t len)

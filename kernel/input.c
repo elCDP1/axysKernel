@@ -35,20 +35,35 @@ static const char keymap[] = "\0\033" "1234567890-=\b\tqwertyuiop[]\n\0asdfghjkl
 static const char shiftmap[] = "\0\033" "!@#$%^&*()_+\b\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 ";
 #define KEYMAP_SIZE (sizeof(keymap) - 1u) /* keys actually mapped */
 
-/* Push from interrupt context (interrupts are already disabled there). */
+/* Push from interrupt context (interrupts are already disabled there) or from
+ * a polling kernel task (USB): the IRQ and task producers serialize here, so
+ * two keystrokes can never interleave into the same slot. */
 static void ring_push(char c)
 {
+    axys_uint64_t flags = axys_cpu_save_flags();
+
+    axys_cpu_disable_interrupts();
     if (c == 3 && axys_process_interrupt_foreground()) {
+        axys_cpu_restore_flags(flags);
         return; /* Ctrl-C consumed: it killed the foreground job */
     }
     axys_uint32_t next = (ring_head + 1u) & (RING_SIZE - 1u);
 
     if (next == ring_tail) {
         ++dropped;
-        return;
+    } else {
+        ring[ring_head] = (axys_uint8_t)c;
+        ring_head = next;
     }
-    ring[ring_head] = (axys_uint8_t)c;
-    ring_head = next;
+    axys_cpu_restore_flags(flags);
+}
+
+/* Entry point for non-IRQ producers (USB HID polling task). Wakes any task
+ * blocked in axys_input_getc() the same way the IRQ handlers do. */
+void axys_input_push_char(char c)
+{
+    ring_push(c);
+    axys_task_wake(&input_channel);
 }
 
 static void push_string(const char *text)

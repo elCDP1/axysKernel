@@ -5,6 +5,7 @@
 #include "axys/pci.h"
 #include "axys/printf.h"
 #include "axys/string.h"
+#include "axys/usb_storage.h"
 
 /* The system disk, behind one interface.
  *
@@ -22,6 +23,7 @@ enum disk_backend {
     DISK_AHCI = 1,
     DISK_ATA = 2,
     DISK_NVME = 3,
+    DISK_USB = 4,
 };
 
 static enum disk_backend backend;
@@ -55,8 +57,18 @@ int axys_disk_init(void)
                       (axys_uint32_t)capacity);
         return 0;
     }
+    /* USB mass storage last: it needs the xHCI poll loop up (which runs before
+     * this probe) and is slower than the PCI paths, but it is a real disk. */
+    if (axys_usb_storage_init() == 0) {
+        backend = DISK_USB;
+        capacity = axys_usb_storage_sectors();
+        axys_snprintf(backend_note, sizeof(backend_note), "usb storage: %llu sectors",
+                      (unsigned long long)capacity);
+        return 0;
+    }
     backend = DISK_NONE;
-    axys_snprintf(backend_note, sizeof(backend_note), "nvme: %s; ahci: %s; ata pio: no drive",
+    axys_snprintf(backend_note, sizeof(backend_note),
+                  "nvme: %s; ahci: %s; ata pio: no drive; usb storage: none",
                   axys_nvme_summary(), axys_ahci_summary());
     return -1;
 }
@@ -101,6 +113,9 @@ int axys_disk_read(axys_uint32_t lba, axys_uint32_t count, void *buffer)
     if (backend == DISK_NVME) {
         return axys_nvme_read(lba, count, buffer);
     }
+    if (backend == DISK_USB) {
+        return axys_usb_storage_read(lba, count, buffer);
+    }
     return axys_ata_read(lba, count, buffer);
 }
 
@@ -115,6 +130,9 @@ int axys_disk_write(axys_uint32_t lba, axys_uint32_t count, const void *buffer)
     if (backend == DISK_NVME) {
         return axys_nvme_write(lba, count, buffer);
     }
+    if (backend == DISK_USB) {
+        return axys_usb_storage_write(lba, count, buffer);
+    }
     return axys_ata_write(lba, count, buffer);
 }
 
@@ -125,6 +143,9 @@ int axys_disk_flush(void)
     }
     if (backend == DISK_NVME) {
         return axys_nvme_flush();
+    }
+    if (backend == DISK_USB) {
+        return 0; /* BOT has no cache flush; every write completed on the wire */
     }
     if (backend == DISK_ATA) {
         return axys_ata_flush();

@@ -6,6 +6,7 @@
 typedef unsigned long size_t;
 typedef long ssize_t;
 typedef unsigned char u8;
+typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long u64;
 
@@ -19,7 +20,8 @@ enum {
     SYS_EXIT, SYS_WRITE, SYS_READ, SYS_OPEN, SYS_CLOSE, SYS_LSEEK, SYS_SLEEP_MS, SYS_GETPID,
     SYS_GETRANDOM, SYS_YIELD, SYS_UPTIME_MS, SYS_SBRK, SYS_SPAWN, SYS_WAIT, SYS_MKDIR,
     SYS_UNLINK, SYS_READDIR, SYS_STAT, SYS_POWER, SYS_KILL, SYS_GETUID, SYS_GETGID, SYS_SETUID,
-    SYS_SETGID, SYS_CHMOD, SYS_CHOWN, SYS_SYNC, SYS_RENAME, SYS_RMDIR_TREE, SYS_MEMINFO
+    SYS_SETGID, SYS_CHMOD, SYS_CHOWN, SYS_SYNC, SYS_RENAME, SYS_RMDIR_TREE, SYS_MEMINFO,
+    SYS_NET_SEND, SYS_NET_RECV, SYS_NET_STAT, SYS_NET_SET_ADDR
 };
 
 struct meminfo {
@@ -27,6 +29,18 @@ struct meminfo {
     u64 heap_used;
     u64 heap_free;
     u64 live_nodes;
+};
+
+struct net_stat {
+    u8 mac[6];
+    u8 link;
+    u8 pad;
+    u32 speed;
+    u8 ip[4];
+    u8 ip_pad[4];
+    u64 tx_packets;
+    u64 rx_packets;
+    u64 rx_dropped;
 };
 
 struct stat_info {
@@ -86,6 +100,10 @@ static inline int power(int reboot) { return (int)sys3(SYS_POWER, reboot, 0, 0);
 static inline int rename(const char *from, const char *to) { return (int)sys3(SYS_RENAME, from, to, 0); }
 static inline int rmtree(const char *path) { return (int)sys3(SYS_RMDIR_TREE, path, 0, 0); }
 static inline int meminfo(struct meminfo *out) { return (int)sys3(SYS_MEMINFO, out, 0, 0); }
+static inline long net_send(const void *buf, size_t len) { return sys3(SYS_NET_SEND, buf, len, 0); }
+static inline long net_recv(void *buf, size_t cap) { return sys3(SYS_NET_RECV, buf, cap, 0); }
+static inline int net_stat(struct net_stat *out) { return (int)sys3(SYS_NET_STAT, out, 0, 0); }
+static inline int net_set_addr(const u8 ip[4]) { return (int)sys3(SYS_NET_SET_ADDR, ip, 0, 0); }
 
 void *memcpy(void *dst, const void *src, size_t n);
 void *memset(void *dst, int c, size_t n);

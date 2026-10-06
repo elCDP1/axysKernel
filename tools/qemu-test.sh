@@ -1,7 +1,10 @@
 #!/bin/sh
 # Headless QEMU boot tests. Stage 1 checks every boot milestone; stage 2 drives
-# the user-space shell over the serial port and checks its answers.
-# Usage: tools/qemu-test.sh [extra qemu args]      (env: ISO, TIMEOUT, MEM, EXPECT_HIGHMEM, EXPECT_NVME, EXPECT_AHCI)
+# the user-space shell over the serial port and checks its answers; stage 3
+# checks persistence across a reboot; stage 4 (EXPECT_NET=1) checks DHCP + ping.
+# Usage: tools/qemu-test.sh [extra qemu args]
+#   env: ISO, TIMEOUT, MEM, EXPECT_HIGHMEM, EXPECT_NVME, EXPECT_AHCI, EXPECT_USB,
+#        EXPECT_NET, DISK_IF, DISK_DEV
 set -u
 ISO="${ISO:-build/axys.iso}"
 # Stage 2 drives the shell for 7 s of settle plus one second per command (and
@@ -95,6 +98,9 @@ wait_for_shell() {
     if [ "${EXPECT_AHCI:-0}" = 1 ] && ! grep -q "^disk: ahci:" "$LOG"; then
         echo "PERSIST: expected the AHCI backend, got:"; grep "^disk:" "$LOG" || true; status=1
     fi
+    if [ "${EXPECT_USB:-0}" = 1 ] && ! grep -q "^disk: usb storage: [1-9]" "$LOG"; then
+        echo "PERSIST: expected the USB BOT backend, got:"; grep "^disk:" "$LOG" || true; status=1
+    fi
     if grep -q "^sync: -" "$LOG"; then echo "PERSIST: explicit sync failed"; cat "$LOG"; status=1; fi
     # Restoring a larger snapshot through a polled AHCI port can take longer
     # than the blank-disk startup, so let init finish before the first key.
@@ -108,6 +114,34 @@ wait_for_shell() {
     done
     if grep -q "gone" "$LOG"; then echo "PERSIST: /tmp survived a reboot"; status=1; fi
     if [ "$status" -ne 0 ]; then echo "--- persistence log ---"; cat "$LOG"; fi
+fi
+
+# ---- stage 4: user-space networking over the firmware's SLIRP -----------------
+# DHCP then ICMP to the gateway: proves the e1000 driver, the NET_* syscalls and
+# both user tools (DHCPv4 + ARP/ICMP) work end to end.
+if [ "$status" -eq 0 ] && [ "${EXPECT_NET:-0}" = 1 ]; then
+    : > "$LOG"
+    (attempts=0
+     while [ "$attempts" -lt 120 ]; do
+         grep -q "axys shell ready" "$LOG" && break
+         sleep 0.5
+         attempts=$((attempts + 1))
+     done
+     grep -q "axys shell ready" "$LOG" || { echo "NET: shell did not become ready"; exit 1; }
+     # The client waits 4 s for an offer and 4 s for the ack before giving up.
+     for cmd in "dhcp" "ping 10.0.2.2" "poweroff"; do
+         printf '%s\n' "$cmd"
+         case "$cmd" in dhcp) sleep 12 ;; ping*) sleep 8 ;; *) sleep 2 ;; esac
+     done
+     sleep 2) | timeout "$TIMEOUT" qemu-system-x86_64 -cdrom "$ISO" -m "${MEM:-256M}" -display none \
+        -serial stdio -no-reboot "$@" >"$LOG" 2>&1
+    net_boot_status=$?
+    if [ "$net_boot_status" -ne 0 ]; then echo "NET: QEMU did not exit cleanly (status $net_boot_status)"; status=1; fi
+    for want in "dhcp: offer 10\.0\.2\.15 from 10\.0\.2\.2" "dhcp: bound 10\.0\.2\.15 router 10\.0\.2\.2" \
+                "sent 4 received 4"; do
+        grep -q "$want" "$LOG" || { echo "NET MISSING: $want"; status=1; }
+    done
+    if [ "$status" -ne 0 ]; then echo "--- network log ---"; cat "$LOG"; else echo "network test: OK"; fi
 fi
 [ "$status" -eq 0 ] && echo "persistence test: OK"
 exit $status

@@ -40,6 +40,10 @@ enum axys_syscall_number {
     AXYS_SYS_RENAME = 27,   /* rename(from, to) - move within the VFS */
     AXYS_SYS_RMDIR_TREE = 28, /* rmdir_tree(path) - recursive remove (rm -rf) */
     AXYS_SYS_MEMINFO = 29,  /* meminfo(&struct axys_meminfo) - read-only stats */
+    AXYS_SYS_NET_SEND = 30, /* net_send(buf, len) - transmit a raw frame */
+    AXYS_SYS_NET_RECV = 31, /* net_recv(buf, cap) - oldest RX frame or -EAGAIN */
+    AXYS_SYS_NET_STAT = 32, /* net_stat(&struct axys_net_stat) - link/MAC/counters */
+    AXYS_SYS_NET_SET_ADDR = 33, /* net_set_addr(&ip[4]) - our IPv4, root only */
     AXYS_SYS_COUNT
 };
 

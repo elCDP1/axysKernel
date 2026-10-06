@@ -482,3 +482,70 @@ the checksum file itself and ignored build outputs.
   disabled across create + attach + detach. This was observed once as a hang
   during fuzzing and could not be reproduced on demand afterwards, so the fix
   rests on the code analysis rather than on a failing regression test.
+
+### USB HID keyboard (xHCI) and Intel Ethernet bring-up
+
+- New PCI foundation: per-BAR kind/base/size discovery, capability walks,
+  8/16-bit accessors, command-register updates that preserve W1C status, and
+  a `/proc/pci` inventory published at boot. `tests/test_pci.c` covers
+  decode, sizing, bridges, capabilities, rescans and the new DMA allocator.
+- New `kernel/dma.c`: zeroed contiguous PMM-backed buffers with alignment,
+  64 KiB-style boundary placement and an opt-in sub-4 GiB guarantee.
+- `kernel/xhci.c` + `kernel/usb_hid.c`: polled xHCI init (reset, rings,
+  DCBAA, scratchpad), root-hub reset, Address/Configure Endpoint, HID report
+  descriptor fetch and interrupt-IN polling into console input; keyboards also
+  hotplug after boot. `tests/test_usb.c` covers the report decoder;
+  `make check-usb` boots with usb-kbd and injects keystrokes through QMP.
+  Bugs found by bringing it up: the input-context Slot lives at offset 32
+  (not 8), Setup TRT is 3 for IN / 2 for OUT, doorbell targets are DCIs
+  (not DCI-1), Configure Endpoint needs A0 without A1, and polling must never
+  hold an irqsave lock across PIT-bounded waits.
+- `kernel/e1000.c` + `/bin/ping`: polled 82540EM rings, link/MAC readout, a
+  kernel RX frame queue with NET_SEND/NET_RECV/NET_STAT syscalls, and ARP +
+  ICMP echo in user space (QEMU user-network defaults). Bugs found: RDLEN and
+  TDLEN collided with RDBAL/TDBAH (silently reprogramming both ring bases),
+  and the transmit wait ran under an irqsave lock that would wedge the box
+  if the transmitter ever stalled. `ping 10.0.2.2` answers 3/3.
+- Robustness fix from USB testing: the process frame-leak selftest now
+  settles (bounded) instead of sampling once after a fixed sleep, so slow
+  reaping under scheduling variance cannot trip it; a genuine leak still
+  fails after the timeout.
+
+### USB hubs, USB mass storage and DHCPv4
+
+- `kernel/xhci.c`: USB hub support for polled traversal (hub class descriptor,
+  status/reset of downstream ports, hub- and device-level route strings, TT
+  parent fields only under a high-speed hub, nesting up to 5 levels). Devices
+  behind hubs now enumerate at boot *and* appear on the slow hotplug scan,
+  which initially only walked the first 8 downstream ports a hub can report;
+  the retry table now covers all 16. Bring-up bug: HID report completions that
+  arrived while a hub control transfer was in flight were discarded, so a
+  keyboard behind a hub went silent after the hub finished enumerating — those
+  events are now serviced (and rearmed) where they are consumed.
+- `kernel/usb_storage.c`: SCSI bulk-only transport (TEST UNIT READY,
+  INQUIRY, READ(10), WRITE(10), 512-byte sectors, Bulk-Only Reset before the
+  first command) exposed through `kernel/disk.c` as the `DISK_USB` backend so a
+  stick can be the system disk, with the persistence layer unchanged. Bugs
+  found: CBW and CSW signatures were compared byte-swapped (so only the
+  byte-swapped-compare path of a real host would have matched) and the
+  reset/ready constants were wrong, leaving sticks unusable.
+- `/bin/dhcp` + `NET_SET_ADDR`: DHCPv4 DISCOVER/OFFER/REQUEST/ACK, server
+  identification and option 3 router, built and parsed in user space with an
+  explicit UDP pseudo-header checksum. The option scan is bounded by the
+  received UDP length, so a truncated or hostile reply cannot walk past the
+  frame. `NET_RECV` used to dequeue a frame before validating the caller's
+  buffer, which both lost the packet and reported `EAGAIN` where `EFAULT` is
+  the only correct answer; it now checks the destination range first.
+- Automated coverage added (all passing): `make check-usb-hub` (keyboard behind
+  a hub), `make check-usb-storage` and `make check-usb-storage-hub` (BOT disk as
+  the system disk, persistence across two boots, on a root port and behind a
+  hub), `make check-net` (DHCP lease then ICMP ping), with `probe_net()` in
+  `/bin/probe` covering the `NET_*` syscall contract including `-EFAULT`
+  destination validation.
+- Attempted and rejected: a linear-framebuffer text console. GRUB's multiboot2
+  loader reports an EGA-text framebuffer tag (`type=2`, 80x25 at `0xb8000`) for
+  every VBE mode it sets, even with `all_video`, `gfxmode=1024x768x32`,
+  `gfxpayload=keep` and a graphical terminal, on both BIOS and UEFI boots
+  (`screendump` confirms the machine is back in 720x400 text mode once the
+  payload starts). Without a framebuffer tag the console would be untestable
+  here, so the code was removed rather than shipped unverified.

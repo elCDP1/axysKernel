@@ -15,6 +15,7 @@
 #include "axys/acpi.h"
 #include "axys/ahci.h"
 #include "axys/disk.h"
+#include "axys/e1000.h"
 #include "axys/initrd.h"
 #include "axys/pci.h"
 #include "axys/persist.h"
@@ -23,8 +24,10 @@
 #include "axys/syscall.h"
 #include "axys/random.h"
 #include "axys/sched.h"
+#include "axys/string.h"
 #include "axys/vfs.h"
 #include "axys/vmm.h"
+#include "axys/xhci.h"
 
 /* NO_SSP: this frame is live while the canary is replaced. */
 __attribute__((no_stack_protector))
@@ -163,6 +166,19 @@ void axys_kmain(axys_uint32_t multiboot_magic, axys_uint32_t multiboot_informati
                         device->function, device->vendor_id, device->device_id);
         }
         axys_printf("\n");
+        /* Publish the same inventory as /proc/pci so user space (and the
+         * shell's `cat`) can see BARs and capabilities. /proc is never
+         * persisted, so this snapshot only lives in RAM. */
+        {
+            static char pci_text[4096];
+            axys_vfs_node_t node;
+
+            axys_pci_format_all(pci_text, sizeof(pci_text));
+            node = axys_vfs_create_as("/proc/pci", AXYS_VFS_FILE, 0444u, 0, 0);
+            if (node >= 0) {
+                (void)axys_vfs_write(node, pci_text, axys_strlen(pci_text));
+            }
+        }
     }
     /*
      * The PIT must tick before any disk driver runs: AHCI COMRESET and NVMe
@@ -176,9 +192,31 @@ void axys_kmain(axys_uint32_t multiboot_magic, axys_uint32_t multiboot_informati
     axys_pit_init(AXYS_PIT_DEFAULT_HZ);
     axys_cpu_enable_interrupts();
 
+    /* USB before the disk probe: a USB mass-storage drive is a valid system
+     * disk, so enumeration (which needs the running timer for port resets)
+     * must happen first. With no xHCI controller this is a fast PCI miss. */
+    {
+        int kbds = axys_xhci_init();
+
+        axys_printf("usb: %s\n", axys_xhci_summary());
+        if (kbds < 0) {
+            axys_printf("usb: controller failed after reset\n");
+        }
+    }
+
     /* The probe is idempotent, so persist_init asking again later is free. */
     (void)axys_disk_init();
     axys_printf("disk: %s\n", axys_disk_backend_note());
+
+    /* Ethernet after USB (same timer dependency for link negotiation). */
+    {
+        int net = axys_e1000_init();
+
+        axys_printf("net: %s\n", axys_e1000_summary());
+        if (net < 0) {
+            axys_printf("net: controller failed after reset\n");
+        }
+    }
 
     /*
      * Prove the exception path works before entering the idle loop. Nothing in

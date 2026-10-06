@@ -3,6 +3,7 @@
 #include "axys/console.h"
 #include "axys/cpu.h"
 #include "axys/disk.h"
+#include "axys/e1000.h"
 #include "axys/gdt.h"
 #include "axys/heap.h"
 #include "axys/input.h"
@@ -828,6 +829,73 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         info.live_nodes = axys_vfs_live_nodes();
         return axys_aspace_copy_to(&proc->space, a0, &info, sizeof(info)) == 0 ? 0
                                                                                : err(AXYS_EFAULT);
+    }
+    case AXYS_SYS_NET_SEND: {
+        char frame[AXYS_NET_FRAME_MAX];
+        axys_size_t len = a1 > sizeof(frame) ? sizeof(frame) : (axys_size_t)a1;
+
+        if (a1 == 0 || a1 > sizeof(frame)) {
+            return err(AXYS_EINVAL);
+        }
+        if (axys_aspace_copy_from(&proc->space, frame, a0, len) != 0) {
+            return err(AXYS_EFAULT);
+        }
+        {
+            int sent = axys_net_send(frame, len);
+
+            return sent < 0 ? err(!axys_net_present() ? AXYS_ENODEV : AXYS_EIO) : sent;
+        }
+    }
+    case AXYS_SYS_NET_RECV: {
+        char frame[AXYS_NET_FRAME_MAX];
+        axys_size_t len = a1 < sizeof(frame) ? (axys_size_t)a1 : sizeof(frame);
+        int got;
+
+        if (a1 == 0) {
+            return err(AXYS_EINVAL);
+        }
+        /* Check the destination before dequeuing: a bad pointer must fail as
+         * EFAULT instead of consuming a frame the caller could never read. */
+        if (axys_aspace_check(&proc->space, a0, len, 1) != 0) {
+            return err(AXYS_EFAULT);
+        }
+        got = axys_net_recv(frame, len);
+        if (got < 0) {
+            return err(!axys_net_present() ? AXYS_ENODEV : AXYS_EAGAIN);
+        }
+        return axys_aspace_copy_to(&proc->space, a0, frame, (axys_size_t)got) == 0
+                   ? got
+                   : err(AXYS_EFAULT);
+    }
+    case AXYS_SYS_NET_STAT: {
+        struct axys_net_stat st;
+
+        if (!axys_net_present()) {
+            return err(AXYS_ENODEV);
+        }
+        axys_net_stat(&st);
+        return axys_aspace_copy_to(&proc->space, a0, &st, sizeof(st)) == 0 ? 0
+                                                                           : err(AXYS_EFAULT);
+    }
+    case AXYS_SYS_NET_SET_ADDR: {
+        axys_uint8_t ip[4];
+
+        if (proc->uid != 0) {
+            return err(AXYS_EPERM);
+        }
+        if (!axys_net_present()) {
+            return err(AXYS_ENODEV);
+        }
+        if (axys_aspace_copy_from(&proc->space, ip, a0, sizeof(ip)) != 0) {
+            return err(AXYS_EFAULT);
+        }
+        if ((ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) ||
+            (ip[0] == 255u && ip[1] == 255u && ip[2] == 255u && ip[3] == 255u) ||
+            ip[0] >= 224u || ip[0] == 127u) {
+            return err(AXYS_EINVAL); /* unspecified, broadcast, multi-, loopback */
+        }
+        axys_net_set_addr(ip);
+        return 0;
     }
     case AXYS_SYS_RENAME: {
         char to[MAX_PATH];

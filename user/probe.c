@@ -393,6 +393,46 @@ static void probe_create_emfile(void)
     check("table usable again", open("/tmp/probe.fd", 0) >= 0, 106);
 }
 
+static void probe_net(void)
+{
+    struct net_stat st;
+    struct net_stat before;
+    u8 bad_ip[4] = {0, 0, 0, 0};
+    char frame[64];
+
+    if (net_stat(&before) != 0) {
+        puts("probe: no NIC, skipping net checks\n");
+        return;
+    }
+    check("link is up", before.link != 0, 107);
+    check("mac is not zero",
+          before.mac[0] | before.mac[1] | before.mac[2] | before.mac[3] | before.mac[4] |
+                  before.mac[5],
+          108);
+    /* Hostile buffers and lengths fail closed. */
+    check("send to a kernel buffer is EFAULT",
+          net_send((const void *)0x100000UL, 64) == -14, 109);
+    check("recv to a kernel buffer is EFAULT",
+          net_recv((void *)0x100000UL, 64) == -14, 110);
+    check("stat to a kernel buffer is EFAULT",
+          net_stat((struct net_stat *)0x100000UL) == -14, 111);
+    check("send of zero bytes is EINVAL", net_send(frame, 0) == -22, 112);
+    check("send past the frame cap is EINVAL", net_send(frame, 3000) == -22, 113);
+    check("recv of zero bytes is EINVAL", net_recv(frame, 0) == -22, 114);
+    check("set-addr of 0.0.0.0 is EINVAL", net_set_addr(bad_ip) == -22, 115);
+    /* A valid set takes effect and is visible in stat; restore afterwards. */
+    {
+        u8 custom[4] = {10, 9, 9, 9};
+
+        check("set-addr accepts a unicast address", net_set_addr(custom) == 0, 116);
+        check("stat shows the new address",
+              net_stat(&st) == 0 && st.ip[0] == 10 && st.ip[1] == 9 && st.ip[2] == 9 &&
+                  st.ip[3] == 9,
+              117);
+        check("restore of the previous address", net_set_addr(before.ip) == 0, 118);
+    }
+}
+
 static void probe_rename_tree(void)
 {
     struct stat_info st;
@@ -450,6 +490,7 @@ int main(const char *args, size_t len)
     probe_exhaust();
     probe_rename_tree();
     probe_create_emfile();
+    probe_net();
     unlink("/tmp/probe.fd");
     unlink("/tmp/probe.seek");
     unlink("/tmp/probe.litter");
