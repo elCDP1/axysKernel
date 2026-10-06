@@ -38,10 +38,12 @@
 #define HCS1_SLOTS(h) ((axys_uint32_t)(h)&0xffu)
 #define HCS1_PORTS(h) ((axys_uint32_t)((h) >> 24) & 0xffu)
 
-#define HCS2_SCRATCH_HI(h) ((axys_uint32_t)((h) >> 27) & 0x1fu)
-#define HCC1_SCRATCH_LO(h) ((axys_uint32_t)((h) >> 28) & 0x0fu)
+/* xHCI 1.1+ splits the scratchpad-buffer count across HCSPARAMS2 only:
+ * bits 25:21 hold the high 5 bits, bits 31:27 the low 5 bits (the old
+ * HCCPARAMS1[31:28] field is gone and reading it yields unrelated bits). */
+#define HCS2_SCRATCH_HI(h) (((axys_uint32_t)(h) >> 21) & 0x1fu)
+#define HCS2_SCRATCH_LO(h) (((axys_uint32_t)(h) >> 27) & 0x1fu)
 #define HCC1_64BIT(h) (((h) & 1u) != 0u)
-#define HCC1_SCRATCH_LO(h) ((axys_uint32_t)((h) >> 28) & 0x0fu)
 
 /* Operational registers (OP = BAR0 + caplength). */
 #define OP_USBCMD 0x00u
@@ -64,6 +66,7 @@
 #define PORTSC_CCS 0x00000001u
 #define PORTSC_PED 0x00000002u
 #define PORTSC_PR 0x00000010u
+#define PORTSC_PP 0x00000200u /* Port Power: a write of 0 de-powers the port */
 #define PORTSC_SPEED_SHIFT 10u
 #define PORTSC_SPEED_MASK 0x00003c00u
 #define PORTSC_PRC 0x00200000u
@@ -91,6 +94,7 @@
 #define TRB_STATUS 4u
 #define TRB_LINK 6u
 #define TRB_ENABLE_SLOT 9u
+#define TRB_DISABLE_SLOT 10u
 #define TRB_ADDRESS_DEVICE 11u
 #define TRB_CONFIGURE_EP 12u
 #define TRB_RESET_EP 14u
@@ -160,6 +164,7 @@ struct xhci_dev {
     int used;
     int is_kbd;
     axys_uint8_t slot;
+    void *dcbaa_buf; /* 1 KiB Output Device Context for `slot`, 0 = none */
     axys_uint8_t speed;
     axys_uint8_t root_port;
     axys_uint32_t route;
@@ -208,6 +213,7 @@ static axys_uint32_t max_ports;
 static char summary[192];
 
 static axys_uint64_t *dcbaa;
+static axys_uint32_t dcbaa_count; /* highest slot id the array has room for */
 static struct ring cmd_ring;
 static struct erst_entry *erst;
 static axys_uint64_t erst_phys;
@@ -215,6 +221,7 @@ static struct trb *event_seg;
 static axys_uint64_t event_phys;
 static axys_uint32_t event_dequeue;
 static axys_uint32_t event_cycle;
+static int event_link_pending; /* the segment link needs the new cycle bit */
 
 static axys_uint32_t reg32(axys_uint64_t addr)
 {
@@ -283,11 +290,15 @@ static axys_uint64_t ring_next(struct ring *r, const struct trb *t)
 
     r->trbs[r->enqueue] = *t;
     if (++r->enqueue == RING_TRBS - 1) {
+        /* The link terminates *this* segment, so it must carry this
+         * segment's cycle bit: the controller only toggles its expected
+         * cycle after it has fetched a cycle-valid link (xHCI 1.2 4.11.5).
+         * Writing the upcoming segment's bit here left the controller
+         * waiting for a cycle that never arrives, wedging the ring forever
+         * at the first wrap with no error event. */
+        r->trbs[RING_TRBS - 1].control = (TRB_LINK << 10) | TRB_TC | r->cycle;
         r->enqueue = 0;
         r->cycle ^= 1u;
-        /* Retire the link with the new cycle so hardware follows the wrap. */
-        r->trbs[RING_TRBS - 1].control =
-            (r->trbs[RING_TRBS - 1].control & ~TRB_CYCLE) | r->cycle;
         __sync_synchronize();
     }
     return at;
@@ -313,9 +324,20 @@ static int event_next(struct trb *ev)
         return 0;
     }
     *ev = *slot;
-    if (++event_dequeue == EVENT_TRBS) {
+    if (event_link_pending != 0 && event_dequeue == 0) {
+        /* We have consumed an event of the *new* pass, so the controller has
+         * already followed the segment link. Only now - safely past the point
+         * where the controller reads it - switch the link to the cycle bit the
+         * next pass will be written with. */
+        event_seg[EVENT_TRBS - 1].control = (TRB_LINK << 10) | TRB_TC | event_cycle;
+        event_link_pending = 0;
+    }
+    if (++event_dequeue == EVENT_TRBS - 1u) {
+        /* Slot 255 is the link TRB, never an event: step over it, start the
+         * pass whose cycle bit the controller toggled to on the link. */
         event_dequeue = 0;
         event_cycle ^= 1u;
+        event_link_pending = 1;
     }
     /* Publish the dequeue pointer without EHB (SeaBIOS-compatible): EHB tells
      * the controller the handler is still busy, which is wrong when idle. */
@@ -368,6 +390,7 @@ static int service_kbd_event(const struct trb *ev)
 
         if (dev->used && dev->is_kbd && dev->pending != 0 && ev->param == dev->pending) {
             dev->pending = 0;
+            axys_printf("xhci-dbg: kbd evt cc=%u\n", (unsigned)event_cc(ev));
             if (event_cc(ev) == CC_SUCCESS || event_cc(ev) == CC_SHORT_PACKET) {
                 kbd_report(dev);
             }
@@ -375,6 +398,8 @@ static int service_kbd_event(const struct trb *ev)
             return 1;
         }
     }
+    axys_printf("xhci-dbg: xfer evt miss param=%lx pend=%lx\n",
+                (unsigned long)ev->param, (unsigned long)(devs[0].pending));
     return 0;
 }
 
@@ -453,11 +478,41 @@ static int enable_slot_cmd(axys_uint8_t *slot_out, axys_uint64_t deadline)
                 *slot_out = event_slot(&ev);
                 return *slot_out != 0 ? 0 : -1;
             }
+            /* Keyboard reports that land while we wait belong to another
+             * transfer: servicing them here is what wait_event() does, and
+             * skipping it made the keyboard drop keystrokes (or go silent)
+             * whenever an Enable Slot overlapped one. */
+            (void)service_kbd_event(&ev);
         }
         if (expired(deadline)) {
             return -1;
         }
         axys_cpu_relax();
+    }
+}
+
+/* Give a slot back after a failed enumeration. Without this every failed probe
+ * left an enabled slot (and its 1 KiB DCBAA context) behind, so a few bogus
+ * devices on the bus exhausted the controller's slot pool and USB died. */
+static void release_slot(struct xhci_dev *dev, axys_uint64_t deadline)
+{
+    axys_uint8_t slot = dev->slot;
+    void *ctx = dev->dcbaa_buf;
+
+    dev->slot = 0;
+    dev->dcbaa_buf = AXYS_NULL;
+    if (slot != 0) {
+        struct trb t;
+
+        axys_memset(&t, 0, sizeof(t));
+        t.control = (TRB_DISABLE_SLOT << 10) | cmd_ring.cycle;
+        (void)run_command(&t, deadline); /* best effort: the slot is abandoned either way */
+        if (dcbaa != AXYS_NULL && slot <= dcbaa_count) {
+            dcbaa[slot] = 0;
+        }
+    }
+    if (ctx != AXYS_NULL) {
+        axys_dma_free(ctx);
     }
 }
 
@@ -1045,6 +1100,7 @@ static void kbd_arm(struct xhci_dev *dev)
     struct trb t;
 
     if (dev->pending != 0) {
+        axys_printf("xhci-dbg: kbd_arm blocked pend=%lx\n", (unsigned long)dev->pending);
         return;
     }
     axys_memset(&t, 0, sizeof(t));
@@ -1053,6 +1109,7 @@ static void kbd_arm(struct xhci_dev *dev)
     t.control = (TRB_NORMAL << 10) | TRB_IOC | TRB_ISP;
     t.control = (t.control & ~TRB_CYCLE) | dev->intr.cycle;
     dev->pending = ring_next(&dev->intr, &t);
+    axys_printf("xhci-dbg: kbd_arm at=%lx\n", (unsigned long)dev->pending);
     __sync_synchronize();
     ring_doorbell(dev->slot, dev->intr_dci);
 }
@@ -1060,8 +1117,10 @@ static void kbd_arm(struct xhci_dev *dev)
 /* Decode a completed boot report into console input. */
 static void kbd_report(struct xhci_dev *dev)
 {
-    char out[16];
-    int n = axys_hid_kbd_report(&dev->decoder, dev->intr_buf, out);
+    /* Worst case: 6 keys x 4 bytes of VT100 sequence. The decoder is bounded
+     * by sizeof(out), so a hostile report can never write past it. */
+    char out[24];
+    int n = axys_hid_kbd_report(&dev->decoder, dev->intr_buf, out, (unsigned)sizeof(out));
 
     for (int i = 0; i < n; ++i) {
         axys_input_push_char(out[i]);
@@ -1175,11 +1234,16 @@ static axys_uint32_t hub_reset_port(struct xhci_dev *hub, axys_uint8_t port,
     if ((status_buf[0] & 0x02u) == 0u) {
         return 0;
     }
-    if ((status_buf[1] & 0x02u) != 0u) {
-        return SPEED_HS; /* HIGH_SPEED bit */
+    /* wPortStatus is little-endian: buf[0..1] = status, buf[2..3] = change.
+     * Port Speed is bits 10:11 of wPortStatus (USB2 hubs): 01b = low speed,
+     * 10b = high speed. The old masks read bit 9 (Port Power) as "high speed",
+     * which classified every powered full-speed device as high speed and
+     * broke the TT/ep0 assumptions behind it. */
+    if ((status_buf[1] & 0x04u) != 0u) {
+        return SPEED_HS; /* HIGH_SPEED bit (wPortStatus bit 10) */
     }
     if ((status_buf[1] & 0x01u) != 0u) {
-        return SPEED_LS; /* LOW_SPEED bit */
+        return SPEED_LS; /* LOW_SPEED bit (wPortStatus bit 8) */
     }
     return SPEED_FS;
 }
@@ -1223,9 +1287,11 @@ static int setup_hub(struct xhci_dev *dev, const axys_uint8_t *config, axys_size
         axys_dma_free(buf);
         return -1;
     }
-    /* Hub descriptor: bNbrPorts tells how many downstream ports exist. */
+    /* Hub descriptor: bNbrPorts tells how many downstream ports exist. wValue
+     * is (descriptor type << 8) | 0 = 0x2900; passing 0 asked for descriptor
+     * type 0, which spec-strict hubs reject. */
     axys_memset(buf, 0, 64);
-    if (axys_usb_control(dev->slot, 0xa0, HUB_GET_DESCRIPTOR, 0, 0, buf_phys, 8, 1,
+    if (axys_usb_control(dev->slot, 0xa0, HUB_GET_DESCRIPTOR, 0x2900u, 0, buf_phys, 8, 1,
                          deadline) != 0) {
         axys_dma_free(buf);
         return -1;
@@ -1296,9 +1362,11 @@ static axys_uint32_t reset_port(unsigned port)
     if ((sc & PORTSC_CCS) == 0u) {
         return 0;
     }
-    /* Clear stale change bits, then assert reset. */
-    reg32_write(addr, sc & PORTSC_CHANGES);
-    reg32_write(addr, PORTSC_PR);
+    /* Clear stale change bits, then assert reset. Port Power is a plain RW
+     * bit: writing a 0 across it de-powers the port (spec PORTSC), which left
+     * the device dead on hardware that honours it. Always carry it over. */
+    reg32_write(addr, (sc & PORTSC_CHANGES) | (sc & PORTSC_PP));
+    reg32_write(addr, PORTSC_PR | (sc & PORTSC_PP));
     deadline = deadline_ms(2000u);
     for (;;) {
         sc = reg32(addr);
@@ -1310,7 +1378,7 @@ static axys_uint32_t reset_port(unsigned port)
         }
         axys_cpu_relax();
     }
-    reg32_write(addr, sc & PORTSC_CHANGES); /* clear PRC (and friends) */
+    reg32_write(addr, (sc & PORTSC_CHANGES) | (sc & PORTSC_PP)); /* clear PRC (and friends) */
     sc = reg32(addr);
     if ((sc & PORTSC_PED) == 0u) {
         return 0;
@@ -1347,6 +1415,8 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
     }
     dev->used = 1;
     dev->is_kbd = 0;
+    dev->slot = 0;
+    dev->dcbaa_buf = AXYS_NULL;
     dev->speed = (axys_uint8_t)speed;
     dev->root_port = (axys_uint8_t)port;
     dev->route = route;
@@ -1375,29 +1445,35 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
         void *out = axys_dma_alloc(1024, 64, 0, AXYS_DMA_32BIT, &phys);
 
         if (out == AXYS_NULL) {
+            release_slot(dev, deadline);
             dev->used = 0;
             return -1;
         }
         dcbaa[slot] = phys;
+        dev->dcbaa_buf = out;
     }
     if (address_device(dev, deadline) != 0) {
+        release_slot(dev, deadline);
         dev->used = 0;
         return -1;
     }
     buf = axys_dma_alloc(CTRL_BUFFER, 16, 0, AXYS_DMA_32BIT, &buf_phys);
     if (buf == AXYS_NULL) {
+        release_slot(dev, deadline);
         dev->used = 0;
         return -1;
     }
     /* Device descriptor: only the class triple matters here. */
     if (get_descriptor(dev, 0x80, DESC_DEVICE, 0, buf_phys, 18, 0, deadline) != 0) {
         axys_dma_free(buf);
+        release_slot(dev, deadline);
         dev->used = 0;
         return -1;
     }
     /* Configuration header first (to learn the total length), then all of it. */
     if (get_descriptor(dev, 0x80, DESC_CONFIG, 0, buf_phys, 9, 0, deadline) != 0) {
         axys_dma_free(buf);
+        release_slot(dev, deadline);
         dev->used = 0;
         return -1;
     }
@@ -1406,11 +1482,13 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
 
         if (total < 9u || total > CTRL_BUFFER) {
             axys_dma_free(buf);
+            release_slot(dev, deadline);
             dev->used = 0;
             return -1;
         }
         if (get_descriptor(dev, 0x80, DESC_CONFIG, 0, buf_phys, total, 0, deadline) != 0) {
             axys_dma_free(buf);
+            release_slot(dev, deadline);
             dev->used = 0;
             return -1;
         }
@@ -1502,8 +1580,10 @@ static void poll_task(void *arg)
 {
     unsigned slow = 0;
     /* Retry deadline per (hub, downstream port). Hubs can report up to 16
-     * ports, so the second dimension covers all of them. */
-    static axys_uint64_t hub_retry[MAX_SLOTS][16];
+     * ports, so the second dimension covers all of them. The first dimension
+     * is indexed by the xHCI slot id, which is 1-based: sizing it MAX_SLOTS
+     * made slot MAX_SLOTS write 128 bytes past the array. */
+    static axys_uint64_t hub_retry[MAX_SLOTS + 1u][16];
 
     (void)arg;
     for (;;) {
@@ -1691,6 +1771,7 @@ int axys_xhci_init(void)
             axys_snprintf(summary, sizeof(summary), "xHCI has no memory for the DCBAA");
             return -1;
         }
+        dcbaa_count = slots;
         if (!HCC1_64BIT(reg32(mmio + CAP_HCC1))) {
             axys_snprintf(summary, sizeof(summary), "xHCI lacks 64-bit addressing");
             return -1;
@@ -1701,12 +1782,12 @@ int axys_xhci_init(void)
         /* Scratchpad buffers when the controller wants them. */
         {
             axys_uint32_t hcs2 = reg32(mmio + CAP_HCS2);
-            axys_uint32_t hcc1 = reg32(mmio + CAP_HCC1);
-            axys_uint32_t want =
-                (HCS2_SCRATCH_HI(hcs2) << 4) | HCC1_SCRATCH_LO(hcc1);
+            axys_uint32_t want = (HCS2_SCRATCH_HI(hcs2) << 5) | HCS2_SCRATCH_LO(hcs2);
 
-            if (want > 8u) {
-                want = 8u;
+            if (want > 64u) {
+                axys_snprintf(summary, sizeof(summary),
+                              "xHCI wants %u scratchpad buffers", want);
+                return -1;
             }
             if (want != 0) {
                 axys_uint64_t spa_phys;
@@ -1751,6 +1832,14 @@ int axys_xhci_init(void)
         erst[0].reserved = 0;
         event_dequeue = 0;
         event_cycle = 1;
+        event_link_pending = 0;
+        /* Last slot of the segment is a Link TRB back to the front. Without
+         * it the controller reaches the end of the event ring and simply
+         * stops delivering events (xHCI 4.9.5 requires the link), which killed
+         * the keyboard after the first few dozen keystrokes. */
+        event_seg[EVENT_TRBS - 1].param = event_phys;
+        event_seg[EVENT_TRBS - 1].status = 0;
+        event_seg[EVENT_TRBS - 1].control = (TRB_LINK << 10) | TRB_TC | 1u;
         reg32_write(rt_base + RT_IMOD, 0);
         reg32_write(rt_base + RT_ERSTSZ, 1);
         reg64_write(rt_base + RT_ERSTBA, erst_phys);

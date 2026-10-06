@@ -7,7 +7,7 @@
 # exercised too.
 # Usage: python3 tools/qemu-usb.py (env: ISO, MEM, TIMEOUT, TOPOLOGY).
 # Needs python3.
-import socket, time, subprocess, os, sys, json
+import socket, time, subprocess, os, sys, json, re
 
 ISO = os.environ.get('ISO', 'build/axys.iso')
 MEM = os.environ.get('MEM', '256M')
@@ -85,14 +85,26 @@ def cmd(o):
 
 
 cmd({'execute': 'qmp_capabilities'})
-for key in ('a', 'ret'):
+# Typing far more keys than one xHCI ring segment holds: the link TRB of a
+# full segment used to be written with the wrong cycle bit, so the keyboard
+# went dead after ~63 keystrokes. 100 keys cross at least one wrap; the shell
+# must echo (nearly) all of them as a single "unknown command: aaa...".
+KEYS = int(os.environ.get('KEYS', '100'))
+KEY_GAP = float(os.environ.get('KEY_GAP', '0.05'))
+for _ in range(KEYS):
     r = cmd({'execute': 'send-key',
-             'arguments': {'keys': [{'type': 'qcode', 'data': key}]}})
+             'arguments': {'keys': [{'type': 'qcode', 'data': 'a'}]}})
     if 'error' in r:
         print(r)
         q.kill()
         verdict('FAIL', 1)
-    time.sleep(1)
+    time.sleep(KEY_GAP)
+r = cmd({'execute': 'send-key',
+         'arguments': {'keys': [{'type': 'qcode', 'data': 'ret'}]}})
+if 'error' in r:
+    print(r)
+    q.kill()
+    verdict('FAIL', 1)
 time.sleep(2)
 s.close()
 # graceful poweroff through the shell is racy now that we typed into it;
@@ -102,8 +114,18 @@ try:
     q.wait(timeout=15)
 except subprocess.TimeoutExpired:
     q.kill()
-if ser_contains('unknown command: a'):
+with open(SERLOG, 'rb') as fh:
+    serial_text = fh.read().decode('utf-8', 'replace')
+# 90% of the keys must have survived: a dead ring stops at ~63, a couple of
+# genuinely lost keystrokes do not fail the run. The console echoes the typed
+# line back, so the run of 'a's in the serial log is the count that arrived
+# (the shell drops unknown commands longer than 58 chars, so it cannot be
+# read off "unknown command:").
+want_keys = max(1, int(KEYS * 0.9))
+if re.search(r'a{%d,}' % want_keys, serial_text):
     verdict('PASS', 0)
 print('--- tail ---')
 os.system('tail -c 800 %s' % SERLOG)
+runs = [len(m.group(0)) for m in re.finditer(r'a+', serial_text)]
+print('longest a-run: %d (wanted %d)' % (max(runs) if runs else 0, want_keys))
 verdict('FAIL', 1)

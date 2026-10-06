@@ -149,8 +149,14 @@ static void serialize_node(struct buffer *b, const char *path, axys_vfs_node_t n
     struct record rec;
     axys_size_t path_len = axys_strlen(path);
 
-    if (path_len == 0 || path_len > MAX_PATH_LEN || axys_vfs_getattr(node, &attr) != 0) {
+    if (path_len == 0 || path_len > MAX_PATH_LEN) {
+        /* Unreachable through the VFS path ceiling, but dropping a node here
+         * would write a snapshot that silently loses it: fail the sync. */
+        b->failed = 1;
         return;
+    }
+    if (axys_vfs_getattr(node, &attr) != 0) {
+        return; /* node vanished between lookup and save: nothing to record */
     }
     rec.path_len = (axys_uint16_t)path_len;
     rec.type = (axys_uint8_t)attr.type;
@@ -203,8 +209,10 @@ static void serialize_tree(struct buffer *b, const char *path, axys_vfs_node_t d
     axys_size_t top = 0;
 
     if (len >= sizeof(cur)) {
+        b->failed = 1; /* unreachable with fixed persist roots: fail loud */
         return;
-    }    axys_memcpy(cur, path, len + 1);
+    }
+    axys_memcpy(cur, path, len + 1);
     stack = axys_kmalloc(SER_STACK_CAP * sizeof(*stack));
     if (stack == AXYS_NULL) {
         b->failed = 1;
@@ -236,7 +244,10 @@ static void serialize_tree(struct buffer *b, const char *path, axys_vfs_node_t d
         }
         nl = axys_strlen(name_buf);
         if (pl + nl + 2 > sizeof(child_path)) {
-            continue; /* too long for the format: skip subtree, as before */
+            /* Unreachable (VFS paths are bounded the same way), but skipping
+             * would persist a tree that is missing this subtree: fail loud. */
+            b->failed = 1;
+            break;
         }
         axys_memcpy(child_path, cur, pl);
         cl = pl;

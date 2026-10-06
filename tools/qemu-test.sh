@@ -10,7 +10,7 @@ ISO="${ISO:-build/axys.iso}"
 # Stage 2 drives the shell for 7 s of settle plus one second per command (and
 # five for probe), which is already 30 s, so the default has to clear that or
 # the run is killed mid-script and the last answers are never checked.
-TIMEOUT="${TIMEOUT:-60}"
+TIMEOUT="${TIMEOUT:-90}"
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
 status=0
@@ -40,9 +40,17 @@ fi
 if [ "$status" -ne 0 ]; then echo "--- boot log ---"; cat "$LOG"; exit 1; fi
 
 # ---- stage 2: interactive shell ----------------------------------------
+# The rmtree block is the A8 regression: uid 1000 must not be able to wipe a
+# root-owned subtree living inside its own directory (it used to delete the
+# whole thing). The shell only ever goes root -> user (su 0 is refused with
+# -1), so the root half runs again after `exit`, which restarts init as root.
 LONG="echo $(printf 'a%.0s' $(seq 1 400))"
 (sleep 7
- for cmd in "$LONG" "su abc" "su 99999999999" "echo it-works > /tmp/t.txt" "cat /tmp/t.txt" "hello" "crash kexec" "crash spin" "heap" "fileio" "probe" "ls /sbin" "su 1000" "cat /etc/secret" "rm /etc/passwd" "poweroff" "id" "su 0" "exit" "id" "poweroff"; do
+ for cmd in "$LONG" "su abc" "su 99999999999" "echo it-works > /tmp/t.txt" "cat /tmp/t.txt" "hello" "crash kexec" "crash spin" "heap" "fileio" "probe" "ls /sbin" \
+     "mkdir /home/user/rt" "mkdir /home/user/rt/sub" "echo rootfile > /home/user/rt/sub/f" \
+     "su 1000" "rmtree /home/user/rt" "ls /home/user/rt" "cat /home/user/rt/sub/f" \
+     "exit" "rmtree /home/user/rt" "ls /home/user/rt" \
+     "su 1000" "cat /etc/secret" "rm /etc/passwd" "poweroff" "id" "su 0" "exit" "id" "poweroff"; do
      printf '%s\n' "$cmd"; sleep 1
      [ "$cmd" = "crash spin" ] && { sleep 1; printf '\003'; sleep 1; }
      [ "$cmd" = "probe" ] && sleep 5
@@ -56,7 +64,8 @@ fi
 
 for want in "^it-works" "hello from ring 3" "\[exit 42\]" "\[killed by exception 14\]" \
             "\[killed by exception 9\]" "rwxr-xr-x 0 0 [0-9]*.init" "cat: -13" "rm: -13" "poweroff: -1" "su: -1" "uid=1000 gid=1000" "uid=0 gid=0" "powering off" \
-            "probe: all checks passed" "line too long" "su: -22"; do
+            "probe: all checks passed" "line too long" "su: -22" \
+            "fileio: all checks passed" "rmtree: -13" "sub/$" "^rootfile" "rmtree: 3" "ls: -2"; do
     if ! grep -q "$want" "$LOG"; then echo "SHELL MISSING: $want"; status=1; fi
 done
 if [ "$status" -ne 0 ]; then echo "--- shell log ---"; cat "$LOG"; else echo "boot test: OK"; fi

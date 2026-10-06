@@ -73,6 +73,11 @@ axys_int32_t axys_vfs_mkdirs(const char *path);      /* mkdir -p: 0 or -1 */
 axys_int32_t axys_vfs_unlink(const char *path);      /* file or empty dir: 0 or -1 */
 axys_int32_t axys_vfs_rename(const char *from, const char *to); /* move/rename: 0 or -1 */
 axys_int32_t axys_vfs_remove_tree(const char *path); /* rm -rf: nodes removed, -1 bad path, -2 no memory */
+/* Same, but only if `uid/gid` would be allowed to do it: every directory below
+ * `path` needs W|X and a sticky directory only yields its entries to root, the
+ * entry's owner or the directory's owner (POSIX rm -rf). Extra codes: -3
+ * permission denied, -4 sticky-bit violation. */
+axys_int32_t axys_vfs_remove_tree_as(const char *path, axys_uint32_t uid, axys_uint32_t gid);
 axys_int32_t axys_vfs_size(axys_vfs_node_t node);    /* file size, -1 for dirs/invalid */
 
 /* Positional I/O. pwrite grows the file (zero-filling any gap) up to

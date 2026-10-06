@@ -196,6 +196,44 @@ static void test_name_copy_and_sticky(void)
     assert(axys_vfs_sticky_ok(axys_vfs_lookup("/var"), plain, 1000) == 0);
 }
 
+/* Regression: only the top directory's parent used to be permission-checked,
+ * so a user with a root-owned subtree nested inside their own directory could
+ * wipe it (and everything a sticky directory was protecting) with rm -rf. */
+static void test_remove_tree_enforces_descendant_permissions(void)
+{
+    axys_vfs_node_t nest;
+    axys_vfs_node_t sticky;
+    axys_vfs_node_t entry;
+
+    axys_vfs_init();
+    assert(axys_vfs_mkdirs("/tmp/nest") == 0);
+    nest = axys_vfs_lookup("/tmp/nest");
+    assert(axys_vfs_chown(nest, 1000, 1000) == 0);
+    assert(axys_vfs_chmod(nest, 0777) == 0);
+    assert(axys_vfs_create_as("/tmp/nest/rootdir", AXYS_VFS_DIR, 0755, 0, 0) >= 0);
+    assert(axys_vfs_create_as("/tmp/nest/rootdir/keep", AXYS_VFS_FILE, 0644, 0, 0) >= 0);
+
+    /* uid 1000 may write the top dir but not root's 0755 subdirectory. */
+    assert(axys_vfs_remove_tree_as("/tmp/nest", 1000, 1000) == -3);
+    assert(axys_vfs_lookup("/tmp/nest/rootdir/keep") >= 0);
+    assert(axys_vfs_lookup("/tmp/nest") >= 0);
+    /* root is unaffected by the checks. */
+    assert(axys_vfs_remove_tree_as("/tmp/nest", 0, 0) == 3);
+    assert(axys_vfs_lookup("/tmp/nest") == -1);
+
+    /* Sticky directory: uid 1000 may clear it only of entries they own. */
+    assert(axys_vfs_create("/tmp/sticky", AXYS_VFS_DIR) >= 0);
+    sticky = axys_vfs_lookup("/tmp/sticky");
+    assert(axys_vfs_chmod(sticky, 01777) == 0);
+    entry = axys_vfs_create_as("/tmp/sticky/rootfile", AXYS_VFS_FILE, 0644, 0, 0);
+    assert(entry >= 0);
+    assert(axys_vfs_remove_tree_as("/tmp/sticky", 1000, 1000) == -4);
+    assert(axys_vfs_lookup("/tmp/sticky/rootfile") >= 0);
+    assert(axys_vfs_chown(entry, 1000, 1000) == 0);
+    assert(axys_vfs_remove_tree_as("/tmp/sticky", 1000, 1000) == 2);
+    assert(axys_vfs_lookup("/tmp/sticky") == -1);
+}
+
 int main(void)
 {
     test_permissions();
@@ -206,6 +244,7 @@ int main(void)
     test_slot_reuse_changes_generation();
     test_failed_replace_keeps_contents();
     test_remove_tree_frees_all_children();
+    test_remove_tree_enforces_descendant_permissions();
     test_rename_rejects_dot_names();
     test_name_copy_and_sticky();
     return 0;

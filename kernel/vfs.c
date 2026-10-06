@@ -494,17 +494,52 @@ axys_int32_t axys_vfs_name_copy(axys_vfs_node_t node, char *out, axys_size_t cap
     return rc;
 }
 
+/* Permission bits `uid/gid` have on `node` (caller holds vfs_lock). */
+static axys_uint32_t access_bits_nl(axys_vfs_node_t node, axys_uint32_t uid, axys_uint32_t gid)
+{
+    if (!node_valid(node)) {
+        return 0;
+    }
+    {
+        axys_uint32_t mode = nodes[node].mode;
+
+        if (uid == 0) {
+            axys_uint32_t have = AXYS_PERM_R | AXYS_PERM_W;
+
+            if (nodes[node].type == AXYS_VFS_DIR || (mode & 0111u) != 0) {
+                have |= AXYS_PERM_X;
+            }
+            return have;
+        }
+        if (uid == nodes[node].uid) {
+            return (mode >> 6) & 7u;
+        }
+        if (gid == nodes[node].gid) {
+            return (mode >> 3) & 7u;
+        }
+        return mode & 7u;
+    }
+}
+
+/* Sticky-bit rule (caller holds vfs_lock): a sticky directory only lets root,
+ * the entry's owner, or the directory's owner drop an entry. */
+static int sticky_ok_nl(axys_vfs_node_t parent, axys_vfs_node_t target, axys_uint32_t uid)
+{
+    if (!node_valid(parent) || nodes[parent].type != AXYS_VFS_DIR || !node_valid(target)) {
+        return -1;
+    }
+    if ((nodes[parent].mode & 01000u) != 0u && uid != 0 &&
+        uid != nodes[target].uid && uid != nodes[parent].uid) {
+        return -1;
+    }
+    return 0;
+}
+
 int axys_vfs_sticky_ok(axys_vfs_node_t parent, axys_vfs_node_t target, axys_uint32_t uid)
 {
     axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
-    int rc = -1;
+    int rc = sticky_ok_nl(parent, target, uid);
 
-    if (node_valid(parent) && nodes[parent].type == AXYS_VFS_DIR && node_valid(target)) {
-        if ((nodes[parent].mode & 01000u) == 0u || uid == 0 ||
-            uid == nodes[target].uid || uid == nodes[parent].uid) {
-            rc = 0;
-        }
-    }
     axys_spin_unlock_irqrestore(&vfs_lock, flags);
     return rc;
 }
@@ -771,11 +806,10 @@ axys_int32_t axys_vfs_unlink(const char *path)
  * the kernel stack (hardware fault / triple state), so the traversal keeps
  * its bookkeeping in a bounded heap scratch array instead. Returns the
  * number of nodes released, -1 if the start node is invalid/root, or -2 when
- * the scratch array cannot be allocated (the tree is left untouched). */
-axys_int32_t axys_vfs_remove_tree(const char *path)
+ * the scratch array cannot be allocated (the tree is left untouched).
+ * Caller holds vfs_lock. */
+static axys_int32_t remove_tree_nl(axys_vfs_node_t node)
 {
-    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
-    axys_vfs_node_t node = walk(path, 0, AXYS_VFS_DIR);
     axys_int32_t result = -1;
 
     if (node > 0) {
@@ -844,8 +878,86 @@ axys_int32_t axys_vfs_remove_tree(const char *path)
             }
         }
     }
+    return result;
+}
+
+/* POSIX rm -rf semantics: removing anything inside a directory needs write and
+ * search permission on that directory itself, and a sticky directory only lets
+ * the caller drop entries they own (or their own directories). Only the top
+ * directory's parent used to be checked, so a user could delete a root-owned
+ * subtree nested inside their own directory. The walk runs under the same lock
+ * as the removal, so nothing can be chmod'ed or replaced in between. Returns 0,
+ * -1 (no write/search permission), -2 (sticky violation), -3 (no scratch). */
+static axys_int32_t tree_permitted_nl(axys_vfs_node_t start, axys_uint32_t uid, axys_uint32_t gid)
+{
+    axys_int32_t *stack = axys_kmalloc(AXYS_VFS_MAX_NODES * sizeof(*stack));
+    axys_size_t top = 0;
+    axys_int32_t rc = 0;
+
+    if (stack == AXYS_NULL) {
+        return -3;
+    }
+    stack[top++] = start;
+    while (top != 0 && rc == 0) {
+        axys_int32_t dir = stack[--top];
+
+        if (!node_valid(dir) || nodes[dir].type != AXYS_VFS_DIR) {
+            continue;
+        }
+        if ((access_bits_nl(dir, uid, gid) & (AXYS_PERM_W | AXYS_PERM_X)) !=
+            (AXYS_PERM_W | AXYS_PERM_X)) {
+            rc = -1;
+            break;
+        }
+        for (axys_uint32_t i = 0; i < nodes[dir].child_count && rc == 0; ++i) {
+            axys_vfs_node_t child = nodes[dir].children[i];
+
+            if (!node_valid(child)) {
+                continue;
+            }
+            if (sticky_ok_nl(dir, child, uid) != 0) {
+                rc = -2;
+                break;
+            }
+            if (nodes[child].type == AXYS_VFS_DIR) {
+                if (top == AXYS_VFS_MAX_NODES) {
+                    rc = -3; /* cannot happen: dirs <= nodes */
+                    break;
+                }
+                stack[top++] = child;
+            }
+        }
+    }
+    axys_kfree(stack);
+    return rc;
+}
+
+axys_int32_t axys_vfs_remove_tree_as(const char *path, axys_uint32_t uid, axys_uint32_t gid)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    axys_vfs_node_t node = walk(path, 0, AXYS_VFS_DIR);
+    axys_int32_t result = -1;
+
+    if (node > 0) {
+        axys_int32_t ok = tree_permitted_nl(node, uid, gid);
+
+        if (ok == -3) {
+            result = -2; /* ENOMEM: leave the tree alone */
+        } else if (ok == -1) {
+            result = -3; /* EACCES: no write/search on some directory below */
+        } else if (ok == -2) {
+            result = -4; /* EPERM: sticky directory would not allow it */
+        } else {
+            result = remove_tree_nl(node);
+        }
+    }
     axys_spin_unlock_irqrestore(&vfs_lock, flags);
     return result;
+}
+
+axys_int32_t axys_vfs_remove_tree(const char *path)
+{
+    return axys_vfs_remove_tree_as(path, 0, 0); /* kernel/root caller */
 }
 
 axys_int32_t axys_vfs_size(axys_vfs_node_t node)
@@ -990,22 +1102,7 @@ axys_int32_t axys_vfs_access(axys_vfs_node_t node, axys_uint32_t uid, axys_uint3
     axys_int32_t rc = -1;
 
     if (node_valid(node)) {
-        axys_uint32_t mode = nodes[node].mode;
-        axys_uint32_t have;
-
-        if (uid == 0) {
-            have = AXYS_PERM_R | AXYS_PERM_W;
-            if (nodes[node].type == AXYS_VFS_DIR || (mode & 0111u) != 0) {
-                have |= AXYS_PERM_X;
-            }
-        } else if (uid == nodes[node].uid) {
-            have = (mode >> 6) & 7u;
-        } else if (gid == nodes[node].gid) {
-            have = (mode >> 3) & 7u;
-        } else {
-            have = mode & 7u;
-        }
-        rc = (have & want) == want ? 0 : -1;
+        rc = (access_bits_nl(node, uid, gid) & want) == want ? 0 : -1;
     }
     axys_spin_unlock_irqrestore(&vfs_lock, flags);
     return rc;

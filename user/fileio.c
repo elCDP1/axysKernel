@@ -23,7 +23,15 @@ int main(const char *args, size_t len)
     close(fd);
     fd = open("/tmp/fileio.txt", 0);
     memset(buf, 0, sizeof(buf));
-    if (fd < 3 || read(fd, buf, sizeof(buf)) != 11 || memcmp(buf, "hello AXYS!", 11) != 0) {
+    if (fd < 3) {
+        return 4;
+    }
+    /* A zero-length read must return 0 without touching the buffer, so even
+     * an unmapped pointer is safe: the kernel returns before validating it. */
+    if (read(fd, buf, 0) != 0 || read(fd, (void *)(u64)0x10, 0) != 0) {
+        return 8;
+    }
+    if (read(fd, buf, sizeof(buf)) != 11 || memcmp(buf, "hello AXYS!", 11) != 0) {
         return 4;
     }
     close(fd);
@@ -40,5 +48,6 @@ int main(const char *args, size_t len)
     if (seen != 1 || unlink("/tmp/fileio.txt") != 0 || stat("/tmp/fileio.txt", &st) != -2) {
         return 7;
     }
+    puts("fileio: all checks passed\n");
     return 0;
 }

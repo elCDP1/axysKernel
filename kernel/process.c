@@ -250,7 +250,16 @@ static int load_elf(struct axys_process *proc, const axys_uint8_t *image, axys_s
         }
         start = align_down(load_address);
         end = align_up(raw_end);
-        if (start < AXYS_USER_BASE || end > AXYS_USER_TOP - 0x10000000ULL || end <= start) {
+        /* Segments must clear the whole randomized stack window: the stack is
+         * mapped after the image, anywhere from AXYS_USER_TOP downwards by the
+         * ASLR slide plus AXYS_USER_STACK_PAGES. The old fixed 256 MiB guard
+         * covered only a quarter of the 1 GiB slide, so a crafted ELF could
+         * land on the future stack and make the later mapping fail (spawn
+         * dying with ENOMEM instead of the loader rejecting the image). */
+        if (start < AXYS_USER_BASE ||
+            end > AXYS_USER_TOP - (axys_uint64_t)(ASLR_STACK_PAGES + AXYS_USER_STACK_PAGES + 16u) *
+                                      PAGE ||
+            end <= start) {
             return -AXYS_ENOEXEC;
         }
         if (ph.flags & AXYS_ELF_PF_W) {

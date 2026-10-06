@@ -209,7 +209,15 @@ static int take_completion(volatile struct nvme_completion *queue, axys_uint32_t
                 *phase ^= 1u;
             }
             ring_doorbell(queue_id, 1, *head);
-            if (cid != expected_cid || command_status != 0u) {
+            if (cid != expected_cid) {
+                /* A command that timed out earlier can still finish later: its
+                 * completion is the one sitting at the head, not ours. The
+                 * head has already been advanced past it, so keep waiting for
+                 * our own entry instead of failing every following command
+                 * with a CID mismatch forever (the queue never resynced). */
+                continue;
+            }
+            if (command_status != 0u) {
                 return -1;
             }
             return 0;

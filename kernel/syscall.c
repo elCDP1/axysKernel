@@ -233,12 +233,32 @@ static axys_int64_t sys_write(struct axys_process *proc, axys_uint64_t fdn, axys
         if (fd->console) {
             axys_console_write_len(chunk, n);
         } else {
-            axys_uint64_t at = (fd->flags & AXYS_O_APPEND) ? (axys_uint64_t)axys_vfs_size(fd->node) : fd->offset;
+            /* Re-validate the descriptor under interrupts-off: the file could
+             * be unlinked (and its VFS slot reissued) since fd_get checked. */
+            axys_uint64_t irq = axys_cpu_save_flags();
+            axys_uint64_t at;
+            int dead;
+            int wr;
 
-            if (axys_vfs_pwrite(fd->node, at, chunk, n) < 0) {
+            axys_cpu_disable_interrupts();
+            dead = axys_vfs_generation(fd->node) != fd->node_gen;
+            if (!dead) {
+                at = (fd->flags & AXYS_O_APPEND) ? (axys_uint64_t)axys_vfs_size(fd->node)
+                                                 : fd->offset;
+                wr = axys_vfs_pwrite(fd->node, at, chunk, n) < 0 ? -1 : 0;
+                if (wr == 0) {
+                    fd->offset = at + n;
+                }
+            } else {
+                wr = 0;
+            }
+            axys_cpu_restore_flags(irq);
+            if (dead) {
+                return done != 0 ? (axys_int64_t)done : err(AXYS_EBADF);
+            }
+            if (wr != 0) {
                 return done != 0 ? (axys_int64_t)done : err(AXYS_ENOSPC);
             }
-            fd->offset = at + n;
         }
         done += n;
     }
@@ -321,6 +341,9 @@ static axys_int64_t sys_read(struct axys_process *proc, axys_uint64_t fdn, axys_
     if (fd == AXYS_NULL || !fd->readable) {
         return err(AXYS_EBADF);
     }
+    if (len == 0) {
+        return 0; /* a zero-length read never blocks and never touches buf */
+    }
     if (axys_aspace_check(&proc->space, buf, len < (1u << 20) ? len : (1u << 20), 1) != 0) {
         return err(AXYS_EFAULT); /* before any blocking */
     }
@@ -333,8 +356,20 @@ static axys_int64_t sys_read(struct axys_process *proc, axys_uint64_t fdn, axys_
     while (done < len) {
         char chunk[IO_CHUNK];
         axys_size_t want = len - done < IO_CHUNK ? (axys_size_t)(len - done) : IO_CHUNK;
-        axys_int32_t got = axys_vfs_pread(fd->node, fd->offset, chunk, want);
+        axys_int32_t got;
+        int dead;
+        axys_uint64_t irq = axys_cpu_save_flags();
 
+        axys_cpu_disable_interrupts();
+        dead = axys_vfs_generation(fd->node) != fd->node_gen;
+        got = dead ? -1 : axys_vfs_pread(fd->node, fd->offset, chunk, want);
+        if (!dead && got > 0) {
+            fd->offset += (axys_uint64_t)got;
+        }
+        axys_cpu_restore_flags(irq);
+        if (dead) {
+            return err(AXYS_EBADF);
+        }
         if (got < 0) {
             return err(AXYS_EISDIR);
         }
@@ -344,7 +379,6 @@ static axys_int64_t sys_read(struct axys_process *proc, axys_uint64_t fdn, axys_
         if (axys_aspace_copy_to(&proc->space, buf + done, chunk, (axys_size_t)got) != 0) {
             return done != 0 ? (axys_int64_t)done : err(AXYS_EFAULT);
         }
-        fd->offset += (axys_uint64_t)got;
         done += (axys_uint64_t)got;
     }
     return (axys_int64_t)done;
@@ -357,6 +391,7 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     int writable = (flags & (AXYS_O_WRONLY | AXYS_O_RDWR)) != 0;
     int readable = (flags & AXYS_O_WRONLY) == 0;
     int slot = -1;
+    axys_uint64_t irq = 0;
     axys_int64_t rc = user_path(proc, path_ptr, path);
 
     if (rc != 0) {
@@ -387,26 +422,37 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     if (rc != 0) {
         return rc;
     }
+    /* Check and use must be atomic with respect to other tasks: between the
+     * permission check and the descriptor install the target could be unlinked
+     * and its VFS slot reissued, so O_TRUNC would wipe (or the fd would later
+     * write into) a different file than the one we authorised. VFS calls never
+     * block, so running this whole tail with interrupts off is safe. */
+    irq = axys_cpu_save_flags();
+    axys_cpu_disable_interrupts();
     node = axys_vfs_lookup(path);
     if (node < 0) {
         if (!(flags & AXYS_O_CREAT)) {
-            return err(AXYS_ENOENT);
+            rc = err(AXYS_ENOENT);
+            goto open_done;
         }
         rc = parent_check(proc, path, AXYS_PERM_W | AXYS_PERM_X);
         if (rc != 0) {
-            return rc;
+            goto open_done;
         }
         node = axys_vfs_create_as(path, AXYS_VFS_FILE, 0644u, proc->uid, proc->gid);
         if (node < 0) {
-            return err(path_errno(path)); /* name too long, bad component or table full */
+            rc = err(path_errno(path)); /* name too long, bad component or table full */
+            goto open_done;
         }
     } else if (axys_vfs_type(node) != AXYS_VFS_FILE) {
-        return err(AXYS_EISDIR);
+        rc = err(AXYS_EISDIR);
+        goto open_done;
     } else {
         axys_uint32_t want = (readable ? AXYS_PERM_R : 0u) | (writable ? AXYS_PERM_W : 0u);
 
         if (axys_vfs_access(node, proc->uid, proc->gid, want) != 0) {
-            return err(AXYS_EACCES);
+            rc = err(AXYS_EACCES);
+            goto open_done;
         }
         if (flags & AXYS_O_TRUNC) {
             (void)axys_vfs_write(node, "", 0);
@@ -420,7 +466,10 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     proc->fds[slot].node_gen = axys_vfs_generation(node);
     proc->fds[slot].offset = 0;
     proc->fds[slot].flags = (axys_uint32_t)flags;
-    return slot;
+    rc = slot;
+open_done:
+    axys_cpu_restore_flags(irq);
+    return rc;
 }
 
 static axys_int64_t sys_lseek(struct axys_process *proc, axys_uint64_t fdn, axys_int64_t off, axys_uint64_t whence)
@@ -428,8 +477,17 @@ static axys_int64_t sys_lseek(struct axys_process *proc, axys_uint64_t fdn, axys
     struct axys_fd *fd = fd_get(proc, fdn);
     axys_int64_t base;
     axys_int64_t target;
+    axys_uint64_t irq;
+    int dead;
 
     if (fd == AXYS_NULL || fd->console) {
+        return err(AXYS_EBADF);
+    }
+    irq = axys_cpu_save_flags();
+    axys_cpu_disable_interrupts();
+    dead = axys_vfs_generation(fd->node) != fd->node_gen;
+    if (dead) {
+        axys_cpu_restore_flags(irq);
         return err(AXYS_EBADF);
     }
     if (whence == 0) {
@@ -439,15 +497,18 @@ static axys_int64_t sys_lseek(struct axys_process *proc, axys_uint64_t fdn, axys
     } else if (whence == 2) {
         base = axys_vfs_size(fd->node);
     } else {
+        axys_cpu_restore_flags(irq);
         return err(AXYS_EINVAL);
     }
     /* Range-check before adding: a hostile `off` near INT64_MAX/MIN would make
      * base + off signed overflow, which is undefined behaviour. */
     if (off < -base || off > (axys_int64_t)AXYS_VFS_MAX_FILE_BYTES - base) {
+        axys_cpu_restore_flags(irq);
         return err(AXYS_EINVAL);
     }
     target = base + off;
     fd->offset = (axys_uint64_t)target;
+    axys_cpu_restore_flags(irq);
     return target;
 }
 
@@ -612,6 +673,12 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
     case AXYS_SYS_WAIT: {
         int status = 0;
 
+        /* Validate the out-parameter before blocking: otherwise a bad pointer
+         * would only fail after the wait returned, having slept for nothing
+         * (and possibly forever if no child ever exits). */
+        if (a1 != 0 && axys_aspace_check(&proc->space, a1, sizeof(status), 1) != 0) {
+            return err(AXYS_EFAULT);
+        }
         rc = axys_process_wait((int)a0, proc->pid, &status);
         if (rc < 0) {
             return rc;
@@ -784,6 +851,7 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
     case AXYS_SYS_CHMOD: {
         axys_vfs_node_t node;
         struct axys_vfs_attr attr;
+        axys_uint64_t irq;
 
         rc = user_path(proc, a0, path);
         if (rc != 0) {
@@ -793,17 +861,29 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (rc != 0) {
             return rc;
         }
+        /* Ownership check and chmod must see the same node: without this the
+         * target could be replaced between the two (another task unlinking and
+         * recreating the path), which would let a non-owner change the mode of
+         * an unrelated file. VFS calls never block, so IRQs-off is safe. */
+        irq = axys_cpu_save_flags();
+        axys_cpu_disable_interrupts();
         node = axys_vfs_lookup(path);
         if (node < 0 || axys_vfs_getattr(node, &attr) != 0) {
-            return err(AXYS_ENOENT);
+            rc = err(AXYS_ENOENT);
+        } else if (proc->uid != 0 && proc->uid != attr.uid) {
+            rc = err(AXYS_EPERM);
+        } else if (axys_vfs_chmod(node, (axys_uint32_t)a1) != 0) {
+            rc = err(AXYS_ENOENT);
+        } else {
+            rc = 0;
         }
-        if (proc->uid != 0 && proc->uid != attr.uid) {
-            return err(AXYS_EPERM);
-        }
-        return axys_vfs_chmod(node, (axys_uint32_t)a1) == 0 ? 0 : err(AXYS_ENOENT);
+        axys_cpu_restore_flags(irq);
+        return rc;
     }
     case AXYS_SYS_CHOWN: {
         axys_vfs_node_t node;
+        axys_uint64_t irq;
+        int ok;
 
         if (proc->uid != 0) {
             return err(AXYS_EPERM);
@@ -812,11 +892,12 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         if (rc != 0) {
             return rc;
         }
+        irq = axys_cpu_save_flags();
+        axys_cpu_disable_interrupts();
         node = axys_vfs_lookup(path);
-        if (node < 0) {
-            return err(AXYS_ENOENT);
-        }
-        return axys_vfs_chown(node, (axys_uint32_t)a1, (axys_uint32_t)a2) == 0 ? 0 : err(AXYS_ENOENT);
+        ok = node >= 0 && axys_vfs_chown(node, (axys_uint32_t)a1, (axys_uint32_t)a2) == 0;
+        axys_cpu_restore_flags(irq);
+        return ok ? 0 : err(AXYS_ENOENT);
     }
     case AXYS_SYS_SYNC:
         return axys_persist_sync() == 0 ? 0 : err(AXYS_ENODEV);
@@ -991,10 +1072,16 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
             return err(AXYS_EPERM);
         }
         {
-            axys_int32_t removed = axys_vfs_remove_tree(path);
+            /* Descendants get the same treatment as the top level: without it
+             * a user could wipe a root-owned subtree nested in their own
+             * directory, or entries of a sticky directory they do not own. */
+            axys_int32_t removed = axys_vfs_remove_tree_as(path, proc->uid, proc->gid);
 
             if (removed == -2) {
                 return err(AXYS_ENOMEM);
+            }
+            if (removed == -4) {
+                return err(AXYS_EPERM);
             }
             return removed >= 0 ? removed : err(AXYS_EACCES);
         }

@@ -414,6 +414,22 @@ int axys_pmm_extend(const struct axys_boot_info *info)
             (axys_uint64_t)info->framebuffer_pitch * info->framebuffer_height;
         reserve_range(info->framebuffer_address, framebuffer_bytes);
     }
+    /* The copied allocated bitmap only records what was reserved before the
+     * extension, and the freshly freed "available" ranges above old_limit may
+     * cover bootloader-owned memory. Re-assert the reservations axys_pmm_init
+     * made for the multiboot info block and the boot modules, or the initrd
+     * could be handed out as free frames. */
+    if (info->info_address != 0) {
+        axys_uint64_t info_bytes = info->info_total_bytes != 0 ? info->info_total_bytes
+                                                              : 65536ULL;
+
+        reserve_range((axys_uint64_t)info->info_address, info_bytes);
+    }
+    for (index = 0; index < info->module_count; ++index) {
+        const struct axys_mb2_module *module = &info->modules[index];
+
+        reserve_range(module->start, (axys_uint64_t)module->end - module->start);
+    }
 
     free_frames = count_free_frames();
     search_hint = old_limit / AXYS_PMM_FRAME_SIZE;

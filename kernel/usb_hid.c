@@ -86,12 +86,13 @@ static int was_down(const struct axys_hid_kbd *kbd, axys_uint8_t usage)
     return 0;
 }
 
-int axys_hid_kbd_report(struct axys_hid_kbd *kbd, const axys_uint8_t *report, char *out)
+int axys_hid_kbd_report(struct axys_hid_kbd *kbd, const axys_uint8_t *report, char *out,
+                        unsigned cap)
 {
     axys_uint8_t modifiers;
     int n = 0;
 
-    if (kbd == AXYS_NULL || report == AXYS_NULL || out == AXYS_NULL) {
+    if (kbd == AXYS_NULL || report == AXYS_NULL || out == AXYS_NULL || cap == 0) {
         return 0;
     }
     /* ErrorRollOver: more keys than fit; ignore the whole report. */
@@ -126,6 +127,10 @@ int axys_hid_kbd_report(struct axys_hid_kbd *kbd, const axys_uint8_t *report, ch
             int m = usage_to_escape(usage, esc);
 
             if (m != 0) {
+                /* Never emit half a control sequence: it needs to fit whole. */
+                if ((unsigned)(n + m) > cap) {
+                    break;
+                }
                 for (int k = 0; k < m; ++k) {
                     out[n++] = esc[k];
                 }
@@ -143,6 +148,9 @@ int axys_hid_kbd_report(struct axys_hid_kbd *kbd, const axys_uint8_t *report, ch
         if (ctrl_down(modifiers) &&
             ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
             c = (char)(c & 0x1f);
+        }
+        if ((unsigned)n >= cap) {
+            break;
         }
         out[n++] = c;
     }
