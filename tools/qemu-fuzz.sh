@@ -3,7 +3,9 @@
 # heartbeats (hang detection) and kernel-failure signatures, then reports one
 # verdict: PASS, FAIL, CRASH (panic/CPU exception), HANG (no heartbeat),
 # TIMEOUT or NOBOOT.
-# Usage: sh tools/qemu-fuzz.sh   (env: ISO, SEED, ITERS, TIMEOUT, MEM)
+# Usage: sh tools/qemu-fuzz.sh   (env: ISO, SEED, ITERS, TIMEOUT, MEM, QEMU_EXTRA)
+# QEMU_EXTRA adds devices, e.g. "-device qemu-xhci -device usb-kbd": the fuzzer then
+# runs while the USB poller and disk drivers are live.
 set -u
 ISO="${ISO:-build/axys.iso}"
 SEED="${SEED:-1}"
@@ -18,7 +20,7 @@ verdict() { echo "qemu-fuzz: $1 (seed=$SEED iters=$ITERS)"; exit "$2"; }
 mkfifo "$FIFO"
 # shellcheck disable=SC2094
 timeout "$TIMEOUT" qemu-system-x86_64 -cdrom "$ISO" -m "$MEM" -display none \
-    -serial stdio -no-reboot <"$FIFO" >"$LOG" 2>&1 &
+    -serial stdio -no-reboot ${QEMU_EXTRA:-} <"$FIFO" >"$LOG" 2>&1 &
 QEMU_PID=$!
 exec 3>"$FIFO"
 

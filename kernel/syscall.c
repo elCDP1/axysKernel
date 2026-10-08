@@ -915,6 +915,11 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         char frame[AXYS_NET_FRAME_MAX];
         axys_size_t len = a1 > sizeof(frame) ? sizeof(frame) : (axys_size_t)a1;
 
+        /* Raw frames bypass every check a protocol stack would make (source
+         * MAC/IP, ARP, DHCP): like CAP_NET_RAW on Linux, root only. */
+        if (proc->uid != 0) {
+            return err(AXYS_EPERM);
+        }
         if (a1 == 0 || a1 > sizeof(frame)) {
             return err(AXYS_EINVAL);
         }
@@ -932,6 +937,11 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         axys_size_t len = a1 < sizeof(frame) ? (axys_size_t)a1 : sizeof(frame);
         int got;
 
+        /* Receiving dequeues every frame on the wire, including other
+         * users' traffic: root only, same reasoning as NET_SEND. */
+        if (proc->uid != 0) {
+            return err(AXYS_EPERM);
+        }
         if (a1 == 0) {
             return err(AXYS_EINVAL);
         }

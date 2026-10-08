@@ -22,7 +22,12 @@ make check-usb
 make check-usb-hub
 make check-usb-storage
 make check-usb-storage-hub
+make check-usb-hotplug
+make check-pci
 make check-net
+make check-drivers   # every driver scenario above in one run
+make fuzz            # ASan/UBSan host fuzzing (FUZZ_SEED, FUZZ_ITERS)
+make check-fuzz      # in-guest syscall fuzzing under QEMU (SEED, ITERS, QEMU_EXTRA)
 ```
 
 `make check` runs the host regression tests and drives a headless QEMU boot,
@@ -39,8 +44,13 @@ the selected backend and reboot persistence.
 `make check-usb-hub` repeats it behind a USB hub, and `make check-usb-storage`
 and `make check-usb-storage-hub` use a USB mass-storage disk as the system
 disk on a root port and behind a hub, checking persistence across two boots.
+`make check-usb-hotplug` plugs and unplugs a USB keyboard through QMP, directly
+and behind a hub, and requires that every cycle delivers keys and that free
+frames, kernel heap and VFS nodes return to their starting values.
+`make check-pci` compares the kernel's `/proc/pci` (BAR kind, address and size
+of every function) with QEMU's own `info pci` on an i440FX and a q35 machine.
 `make check-net` obtains a DHCPv4 lease and pings the gateway over the
-controller.
+controller. `make check-highmem` needs a host able to give QEMU 5 GiB.
 
 ## Current platform
 
@@ -56,9 +66,13 @@ controller.
 - Console output is serial and VGA text. Keyboard input is serial, a PS/2
   set-1 keyboard through the i8042 controller, or a USB boot keyboard through
   xHCI, directly or behind a USB hub.
-- USB support is an polled xHCI host controller with hub traversal, boot
-  keyboards, and bulk-only mass storage usable as the system disk. Other USB
-  host controllers, HID classes, and audio are absent.
+- USB support is a polled xHCI host controller with hub traversal, boot
+  keyboards, and bulk-only mass storage usable as the system disk. Devices can
+  be hot-plugged and removed (root ports and hub ports): slots, rings and
+  contexts are released and a re-plugged device enumerates again. A mass-storage
+  disk that disappears makes I/O fail with `ENODEV`; a replacement disk is not
+  adopted at run time. Other USB host controllers, HID classes, and audio are
+  absent.
 - Storage support includes a polled PCI NVMe driver for a 512-byte-LBA
   namespace, PCI AHCI, primary-channel ATA PIO, and USB bulk-only mass storage.
   All four backends are tested in QEMU, including reboot persistence.
@@ -82,7 +96,8 @@ format and compiler constraints.
 - `include/axys/`: kernel interfaces and fixed-width types.
 - `user/`: small freestanding user programs and the current syscall wrapper.
 - `tests/`: host-side parser and subsystem regression tests.
-- `tools/`: QEMU integration test and interrupt-stub generators.
+- `tools/`: QEMU integration, fuzz, USB and PCI test drivers, and
+  interrupt-stub generators.
 
 This remains an early kernel, not a general-purpose operating system. The
 support matrix and audit report are the source of truth for tested behavior

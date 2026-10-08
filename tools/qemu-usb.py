@@ -22,6 +22,11 @@ if TOPOLOGY == 'hub':
     USB_DEVICES = ['-device', 'usb-hub,bus=xhci.0',
                    '-device', 'usb-kbd,port=1.1']
     EXPECT = ('axys shell ready', 'usb: hub on port', 'keyboard on port')
+elif TOPOLOGY == 'ps2':
+    # No USB devices: the keys travel the PS/2 path, which isolates the input
+    # layer and the shell from the xHCI driver.
+    USB_DEVICES = []
+    EXPECT = ('axys shell ready',)
 else:
     USB_DEVICES = ['-device', 'usb-kbd,bus=xhci.0']
     EXPECT = ('axys shell ready', 'keyboard on port')
@@ -85,30 +90,48 @@ def cmd(o):
 
 
 cmd({'execute': 'qmp_capabilities'})
-# Typing far more keys than one xHCI ring segment holds: the link TRB of a
-# full segment used to be written with the wrong cycle bit, so the keyboard
-# went dead after ~63 keystrokes. 100 keys cross at least one wrap; the shell
-# must echo (nearly) all of them as a single "unknown command: aaa...".
-KEYS = int(os.environ.get('KEYS', '100'))
-KEY_GAP = float(os.environ.get('KEY_GAP', '0.05'))
-for _ in range(KEYS):
+# Typing far more keys than one xHCI ring segment holds: every report is one
+# transfer TRB and one event TRB, and both rings are 256 entries, so 400 keys
+# (800 reports) wrap each of them several times. A wrong cycle bit on either
+# wrap makes the keyboard go silent at ~255 reports. The shell's line buffer is
+# 256 bytes, so the keys are typed as lines of LINE keys: each line is echoed
+# once as typed and once more in "unknown command: ...", i.e. twice.
+KEYS = int(os.environ.get('KEYS', '400'))
+KEY_GAP = float(os.environ.get('KEY_GAP', '0.04'))  # 25 keys/s: a real keyboard never exceeds one report per poll interval
+LINE = int(os.environ.get('LINE', '50'))
+
+
+def press(name):
     r = cmd({'execute': 'send-key',
-             'arguments': {'keys': [{'type': 'qcode', 'data': 'a'}]}})
+             'arguments': {'keys': [{'type': 'qcode', 'data': name}]}})
     if 'error' in r:
         print(r)
         q.kill()
         verdict('FAIL', 1)
     time.sleep(KEY_GAP)
-r = cmd({'execute': 'send-key',
-         'arguments': {'keys': [{'type': 'qcode', 'data': 'ret'}]}})
-if 'error' in r:
-    print(r)
-    q.kill()
-    verdict('FAIL', 1)
-time.sleep(2)
+
+
+sent = 0
+while sent < KEYS:
+    for _ in range(min(LINE, KEYS - sent)):
+        press('a')
+        sent += 1
+    press('ret')
+def received_keys():
+    with open(SERLOG, 'rb') as fh:
+        text = fh.read().decode('utf-8', 'replace')
+    runs = [len(m.group(0)) for m in re.finditer(r'a+', text)]
+    return sum(r for r in runs if r >= 10) // 2
+
+
+# The guest drains the keys at its own pace (the controller is polled every
+# few milliseconds): wait for them instead of guessing a fixed delay.
+deadline = time.time() + 30
+while time.time() < deadline and received_keys() < sent:
+    time.sleep(0.5)
 s.close()
 # graceful poweroff through the shell is racy now that we typed into it;
-# just stop the machine: survival this far with input delivered is the check.
+# just stop the machine: delivered input is the check.
 q.terminate()
 try:
     q.wait(timeout=15)
@@ -116,16 +139,13 @@ except subprocess.TimeoutExpired:
     q.kill()
 with open(SERLOG, 'rb') as fh:
     serial_text = fh.read().decode('utf-8', 'replace')
-# 90% of the keys must have survived: a dead ring stops at ~63, a couple of
-# genuinely lost keystrokes do not fail the run. The console echoes the typed
-# line back, so the run of 'a's in the serial log is the count that arrived
-# (the shell drops unknown commands longer than 58 chars, so it cannot be
-# read off "unknown command:").
-want_keys = max(1, int(KEYS * 0.9))
-if re.search(r'a{%d,}' % want_keys, serial_text):
+runs = [len(m.group(0)) for m in re.finditer(r'a+', serial_text)]
+# Runs shorter than 10 are prompts and words ("axys", "ready"); the rest are
+# echoes of typed lines, two per line.
+received = sum(r for r in runs if r >= 10) // 2
+print('keys sent: %d, received: %d' % (sent, received))
+if received >= int(sent * 0.98):
     verdict('PASS', 0)
 print('--- tail ---')
-os.system('tail -c 800 %s' % SERLOG)
-runs = [len(m.group(0)) for m in re.finditer(r'a+', serial_text)]
-print('longest a-run: %d (wanted %d)' % (max(runs) if runs else 0, want_keys))
+os.system('tail -c 600 %s' % SERLOG)
 verdict('FAIL', 1)

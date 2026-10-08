@@ -12,7 +12,7 @@ the kernel has a functional driver for it.
 | Firmware | Multiboot2 entry; ACPI RSDP/RSDT/XSDT/FADT parsing; conventional PM1 poweroff | No general AML interpreter, hardware-reduced ACPI sleep, UEFI runtime services, or broad firmware matrix |
 | RAM | Multiboot2 memory map; 4 KiB frame allocator; sparse identity map and runtime-sized metadata up to 512 GiB (also limited by CPU physical-address width); QEMU-tested across 4 GiB | No NUMA, hotplug, ECC reporting, general high ACPI-table mapping, or memory-controller driver |
 | Display | VGA text console; bootloader framebuffer metadata is parsed and reserved | No framebuffer console: GRUB's multiboot2 loader hands over an EGA-text framebuffer tag even with `gfxpayload=keep`, so a console would need a bootloader change or kernel-side VBE modesetting. No Intel/AMD/NVIDIA GPU driver |
-| USB | xHCI host controller (PCI 0c/03/0x30, polled command/event rings, port reset, full/low/high-speed address/configure); USB hubs with route-string routing up to 5 levels deep; boot keyboards (HID); bulk-only mass storage (512-byte sectors, READ/WRITE(10), TEST UNIT READY) usable as the system disk; /proc/pci inventory; `make check-usb`, `check-usb-hub`, `check-usb-storage`, `check-usb-storage-hub` | Polled only (no event-interrupt path), no isochronous/interrupt endpoints, no HID beyond boot keyboards, no SCSI pass-through or multiple LUNs, USB mass storage is used only at boot (no removal or hotplug), hub hotplug scan covers the 16 ports it reports but nothing above 5 levels deep, no UHCI/OHCI/EHCI |
+| USB | xHCI host controller (PCI 0c/03/0x30, polled command/event rings, port reset, full/low/high-speed address/configure); USB hubs with route-string routing up to 5 levels deep; boot keyboards (HID); bulk-only mass storage (512-byte sectors, READ/WRITE(10), TEST UNIT READY) usable as the system disk; /proc/pci inventory; `make check-usb`, `check-usb-hub`, `check-usb-storage`, `check-usb-storage-hub` | Polled only (no event-interrupt path), no isochronous endpoints, no HID beyond boot keyboards, no SCSI pass-through or multiple LUNs; devices are removed and re-enumerated at run time (root ports every 8 ms, hub ports on a ~2 s scan, nothing above 5 levels deep) but a mass-storage disk is adopted only at boot: if it is pulled, I/O fails with ENODEV and a replacement is not attached; no UHCI/OHCI/EHCI |
 | Keyboard | PS/2 set-1 through i8042; USB HID boot keyboards through xHCI polling, directly or behind hubs; serial input | Native USB host controllers other than xHCI are absent; USB HID mice and non-boot HID reports are not supported |
 | Storage | PCI NVMe polling (first controller, namespace 1, 512-byte LBAs, one outstanding command); primary-channel ATA PIO (LBA28); PCI AHCI polling; USB BOT mass storage; QEMU tests for NVMe/AHCI/IDE/USB persistence across two boots | No secondary ATA channel, DMA for ATA PIO, NCQ, interrupt-driven queues, USB device removal, other NVMe namespaces/controllers, or RAID |
 | Network | Intel 82540EM-compatible PCI Ethernet, polled (TX/RX rings, link detection, factory MAC); ARP + ICMP echo in /bin/ping and DHCPv4 (DISCOVER/OFFER/REQUEST/ACK, option 3 router) in /bin/dhcp over QEMU user-network defaults; `make check-net` leases 10.0.2.15 and pings the gateway | Raw Ethernet in user space only: no kernel socket layer, TCP/UDP, IPv6, DNS, Wi-Fi, VLANs, or other NIC models (virtio-net included) |
@@ -55,8 +55,9 @@ device DMA address handling; adding a “DDR driver” would not solve those lim
    interrupt-driven multi-queue devices (USB, NVMe, Ethernet all poll today).
 3. Complete PCI resource ownership and hotplug, then add a general IOMMU
    policy, MSI/MSI-X routing, and a device/driver lifecycle.
-4. USB: isochronous and interrupt endpoints, HID beyond boot keyboards,
-   UHCI/OHCI/EHCI alongside xHCI, and removal/hotplug for mass storage.
+4. USB: isochronous endpoints, HID beyond boot keyboards, UHCI/OHCI/EHCI
+   alongside xHCI, and run-time adoption of a hot-plugged mass-storage disk
+   (needs a block-device hot-plug policy in the disk layer).
 5. Networking: move the packet path into the kernel with a socket layer
    (UDP/TCP, IPv4 routing, DNS) before attempting Wi-Fi, whose driver, MAC
    layer, and power save need that base.
@@ -127,12 +128,71 @@ Intel 8254x, RFC 2131/2132) and the Linux equivalents (`xhci-hcd`,
 - Syscalls: `NET_RECV` dequeued a frame before validating the user pointer, so
   a bad destination returned `EAGAIN` and dropped the packet.
 
+## Audit notes: driver review (2026-10-07)
+
+A second review of the driver commit, driven by QEMU stress tests (400-1000 key
+bursts, 20 hot-plug cycles, fuzzing with live USB devices) found and fixed:
+
+- xHCI event ring: a Link TRB had been planted in the last slot and that slot
+  skipped. An event ring has no Link TRBs (xHCI 4.9.4): the controller walks
+  the segment table and, with one 256-entry segment, wraps on its own. The
+  skipped slot lost one event per wrap and desynchronised the cycle bit, so the
+  keyboard went silent after ~255 events (110 of 600 keys arrived; 600 of 600
+  now). The transfer-ring Link TRB fix in the same commit was correct and kept.
+- Endpoint context: Interval was written to bits 7:0 of dword 0 (the EP State
+  field) instead of bits 23:16, bInterval was not converted to the xHCI
+  exponent (a 10 ms full-speed keyboard would poll every 128 ms), and Average
+  TRB Length / Max ESIT Payload were left zero (real controllers reject
+  periodic endpoints that do). All three are fixed in `ep_interval_field()` and
+  `build_input_context()`.
+- Hubs: wPortStatus bit 8 is PORT_POWER, bit 9 LOW_SPEED, bit 10 HIGH_SPEED.
+  Treating bit 8 as low speed classified every full-speed device behind a hub
+  as low-speed. Children were also identified by their Transaction-Translator
+  parent fields, which are zero under a full-speed hub, so the same port was
+  reset and re-enumerated forever (killing the working device). Each device now
+  records the hub and port it hangs off in `hub_slot`/`hub_port`. Empty hub
+  ports are rescanned every pass; only a port whose device failed is throttled.
+- `release_slot()` issued Disable Slot without the Slot ID (bits 31:24), so the
+  controller rejected it and every slot ever opened stayed allocated; after a
+  handful of plug cycles no device could enumerate. Fixed, and every failure
+  path now goes through `abandon_device()`, which also frees the EP0, interrupt
+  and bulk rings, the report buffer and the Output Device Context.
+- Removal: nothing detected a disconnect, so an unplugged keyboard kept its
+  slot and rings forever and the port was never enumerated again. Root-port and
+  hub-port disconnects now remove the device and everything below it.
+- Concurrency: control, bulk and command transfers, enumeration and the 8 ms
+  poller all consumed the single event ring without a common lock, and an
+  event that is not the caller's own is dropped, so a disk write could time out
+  because the poller stole its completion. They now run under one transaction
+  mutex (`xhci_acquire()`), held across waits without masking interrupts, since
+  the deadlines read the PIT clock.
+- Descriptors: `kernel/usb_desc.c` now parses configuration descriptors. A
+  descriptor shorter than its type needs (an interface of length 2, a short
+  endpoint) ends the walk instead of having fixed offsets read past it, and an
+  endpoint is only accepted if it belongs to the interface being set up (the
+  first interrupt-IN endpoint of a *later* interface used to be taken).
+  A boot keyboard or mass-storage interface no longer has to be interface 0.
+  `tests/test_usb_desc.c` covers the malformed shapes and fuzzes 300k blobs in
+  exactly-sized buffers under AddressSanitizer.
+- Raw Ethernet (`NET_SEND`/`NET_RECV`) is now root-only, like CAP_NET_RAW:
+  receiving dequeues every frame on the wire and sending bypasses all source
+  address checks. `NET_SET_ADDR` already was.
+- `xhci-dbg` traces printed on every event were removed.
+
 ## Verification
 
-`make test` (host units incl. PCI and USB HID), `make fuzz` (ASan/UBSan host
-fuzzing), `make check` (boot, shell, `probe`, persistence), `check-highmem`,
-`check-ahci`, `check-nvme`, `check-fuzz`, `check-usb`, `check-usb-hub`,
-`check-usb-storage`, `check-usb-storage-hub`, and `check-net` all pass. Every
-added driver is covered by an automated QEMU scenario; `tools/qemu-usb.py`
-takes `TOPOLOGY=direct|hub` and the storage/net checks reuse the persistence
-and network stages of `tools/qemu-test.sh`.
+Run here, on this tree: `make test` (host units: PCI, USB HID, USB descriptors,
+heap, VFS, persistence, paths), `make fuzz` (ASan/UBSan; 7 seeds x 20000),
+`make check`, `check-ahci`, `check-nvme`, `check-fuzz` (7 seeds x 6000, also
+with an xHCI keyboard and USB disk attached), `check-usb` and `check-usb-hub`
+(400 keys at 25 keys/s each), `check-usb-hotplug`, `check-usb-storage`,
+`check-usb-storage-hub`, `check-pci` and `check-net`. `check-highmem` needs a
+host that can give QEMU 5 GiB and was not run in the 4 GiB environment used for
+this review.
+
+Test-rate note: a full-speed keyboard delivers at most one report per poll
+interval (8-10 ms), so `tools/qemu-usb.py` injects keys at 25 keys/s by
+default. Faster injection overflows QEMU's own 16-entry HID queue and loses
+keys regardless of the guest driver (the same burst over PS/2 is lossless).
+`tools/qemu-usb-hotplug.py` and `tools/qemu-pci-check.py` are the QMP and
+monitor drivers behind `check-usb-hotplug` and `check-pci`.

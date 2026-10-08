@@ -549,3 +549,14 @@ the checksum file itself and ignored build outputs.
   (`screendump` confirms the machine is back in 720x400 text mode once the
   payload starts). Without a framebuffer tag the console would be untestable
   here, so the code was removed rather than shipped unverified.
+
+### Driver review, second pass
+
+The xHCI event-ring Link TRB, the endpoint-context Interval/ESIT fields, the
+hub port-speed bits, hub-child identity, the Disable Slot Slot ID, missing
+device removal, the unsynchronised event-ring consumers, unvalidated USB
+descriptor lengths and the unprivileged raw network syscalls are described, with
+how each was found and verified, in `docs/PLATFORM_SUPPORT.md` ("Audit notes:
+driver review"). New regression coverage: `tests/test_usb_desc.c`,
+`make check-usb-hotplug`, `make check-pci`, and the 400-key USB bursts in
+`tools/qemu-usb.py`.

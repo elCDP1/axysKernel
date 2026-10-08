@@ -1,3 +1,4 @@
+#include "axys/usb_desc.h"
 #include "axys/xhci.h"
 #include "axys/cpu.h"
 #include "axys/dma.h"
@@ -168,8 +169,10 @@ struct xhci_dev {
     axys_uint8_t speed;
     axys_uint8_t root_port;
     axys_uint32_t route;
-    axys_uint8_t parent_slot;
+    axys_uint8_t parent_slot; /* Transaction Translator hub slot: only set under a high-speed hub */
     axys_uint8_t parent_port;
+    axys_uint8_t hub_slot;    /* the hub this device hangs off (0 = root port): its identity in the tree */
+    axys_uint8_t hub_port;
     unsigned depth;
     int is_hub;
     axys_uint8_t hub_ports;
@@ -205,6 +208,40 @@ static struct usb_stor_slot {
 } stor_slots[2];
 static struct axys_spinlock xhci_lock;
 
+/* Everything that submits TRBs and then waits for events -- control, bulk and
+ * command transfers, enumeration, and the poller that drains the event ring --
+ * runs under this transaction mutex. The event ring has a single consumer
+ * position: if two contexts read it at once, each one throws away the other's
+ * completion (it only recognises its own TRB), the owner times out, and a disk
+ * write is reported failed. The flag is guarded by a spinlock held only for the
+ * test-and-set: waits use the PIT clock, which stops under an irqsave lock, so
+ * the lock itself must never be held across a wait. Not recursive: only public
+ * entry points and the poller take it. */
+static int xhci_busy;
+
+static void xhci_acquire(void)
+{
+    for (;;) {
+        axys_uint64_t flags = axys_spin_lock_irqsave(&xhci_lock);
+
+        if (!xhci_busy) {
+            xhci_busy = 1;
+            axys_spin_unlock_irqrestore(&xhci_lock, flags);
+            return;
+        }
+        axys_spin_unlock_irqrestore(&xhci_lock, flags);
+        axys_yield();
+    }
+}
+
+static void xhci_release(void)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&xhci_lock);
+
+    xhci_busy = 0;
+    axys_spin_unlock_irqrestore(&xhci_lock, flags);
+}
+
 static axys_uint64_t mmio;
 static axys_uint64_t op_base;
 static axys_uint64_t db_base;
@@ -221,7 +258,6 @@ static struct trb *event_seg;
 static axys_uint64_t event_phys;
 static axys_uint32_t event_dequeue;
 static axys_uint32_t event_cycle;
-static int event_link_pending; /* the segment link needs the new cycle bit */
 
 static axys_uint32_t reg32(axys_uint64_t addr)
 {
@@ -324,20 +360,16 @@ static int event_next(struct trb *ev)
         return 0;
     }
     *ev = *slot;
-    if (event_link_pending != 0 && event_dequeue == 0) {
-        /* We have consumed an event of the *new* pass, so the controller has
-         * already followed the segment link. Only now - safely past the point
-         * where the controller reads it - switch the link to the cycle bit the
-         * next pass will be written with. */
-        event_seg[EVENT_TRBS - 1].control = (TRB_LINK << 10) | TRB_TC | event_cycle;
-        event_link_pending = 0;
-    }
-    if (++event_dequeue == EVENT_TRBS - 1u) {
-        /* Slot 255 is the link TRB, never an event: step over it, start the
-         * pass whose cycle bit the controller toggled to on the link. */
+    /* An event ring has no Link TRBs (xHCI 4.9.4): the controller walks the
+     * Event Ring Segment Table, and with a single 256-entry segment it wraps
+     * from the last entry to the first on its own, toggling its cycle bit. The
+     * consumer does exactly the same. (An earlier version planted a Link TRB in
+     * slot 255 and skipped that slot: the controller still writes events
+     * there, so one event per wrap was lost and every wrap after the first
+     * desynchronised the cycle bit -- the keyboard died after ~255 events.) */
+    if (++event_dequeue == EVENT_TRBS) {
         event_dequeue = 0;
         event_cycle ^= 1u;
-        event_link_pending = 1;
     }
     /* Publish the dequeue pointer without EHB (SeaBIOS-compatible): EHB tells
      * the controller the handler is still busy, which is wrong when idle. */
@@ -390,7 +422,6 @@ static int service_kbd_event(const struct trb *ev)
 
         if (dev->used && dev->is_kbd && dev->pending != 0 && ev->param == dev->pending) {
             dev->pending = 0;
-            axys_printf("xhci-dbg: kbd evt cc=%u\n", (unsigned)event_cc(ev));
             if (event_cc(ev) == CC_SUCCESS || event_cc(ev) == CC_SHORT_PACKET) {
                 kbd_report(dev);
             }
@@ -398,8 +429,6 @@ static int service_kbd_event(const struct trb *ev)
             return 1;
         }
     }
-    axys_printf("xhci-dbg: xfer evt miss param=%lx pend=%lx\n",
-                (unsigned long)ev->param, (unsigned long)(devs[0].pending));
     return 0;
 }
 
@@ -505,7 +534,10 @@ static void release_slot(struct xhci_dev *dev, axys_uint64_t deadline)
         struct trb t;
 
         axys_memset(&t, 0, sizeof(t));
-        t.control = (TRB_DISABLE_SLOT << 10) | cmd_ring.cycle;
+        /* The Slot ID lives in bits 31:24 of the command TRB. Without it the
+         * controller is asked to disable slot 0, rejects it, and every slot
+         * ever opened stays allocated until the pool runs dry. */
+        t.control = (TRB_DISABLE_SLOT << 10) | ((axys_uint32_t)slot << 24) | cmd_ring.cycle;
         (void)run_command(&t, deadline); /* best effort: the slot is abandoned either way */
         if (dcbaa != AXYS_NULL && slot <= dcbaa_count) {
             dcbaa[slot] = 0;
@@ -516,7 +548,68 @@ static void release_slot(struct xhci_dev *dev, axys_uint64_t deadline)
     }
 }
 
+static void ring_free(struct ring *r)
+{
+    if (r->trbs != AXYS_NULL) {
+        axys_dma_free(r->trbs);
+    }
+    r->trbs = AXYS_NULL;
+    r->phys = 0;
+    r->enqueue = 0;
+    r->cycle = 1;
+}
+
+/* Give back everything a device owns and mark its table entry free: the slot
+ * (Disable Slot also stops every endpoint, so freeing the rings afterwards is
+ * safe), its Output Device Context, all transfer rings and the report buffer.
+ * Every failure path of enumeration and every disconnect ends here, so a
+ * device that comes and goes (or never works) cannot leak. */
+static void abandon_device(struct xhci_dev *dev, axys_uint64_t deadline)
+{
+    release_slot(dev, deadline);
+    ring_free(&dev->ep0);
+    ring_free(&dev->intr);
+    ring_free(&dev->bulk_out);
+    ring_free(&dev->bulk_in);
+    if (dev->intr_buf != AXYS_NULL) {
+        axys_dma_free(dev->intr_buf);
+        dev->intr_buf = AXYS_NULL;
+    }
+    dev->pending = 0;
+    dev->is_kbd = 0;
+    dev->is_hub = 0;
+    dev->has_bulk = 0;
+    dev->hub_ports = 0;
+    dev->used = 0;
+}
+
 /* ---- contexts -------------------------------------------------------------- */
+
+/* Endpoint Context "Interval" for an interrupt endpoint (xHCI 6.2.3.6). The
+ * field is an exponent: the endpoint is serviced every 2^Interval microframes
+ * (125 us each). A high-speed bInterval is already 2^(bInterval-1) microframes;
+ * a full/low-speed bInterval counts 1 ms frames, i.e. 8 microframes each, and
+ * the xHCI wants floor(log2(bInterval * 8)) limited to 3..10. Passing bInterval
+ * through unchanged made a 10 ms keyboard poll every 128 ms. */
+static axys_uint32_t ep_interval_field(axys_uint8_t speed, axys_uint32_t binterval)
+{
+    axys_uint32_t field = 0;
+
+    if (binterval == 0u) {
+        binterval = 1u;
+    }
+    if (speed == SPEED_HS || speed == SPEED_SS) {
+        field = binterval - 1u;
+        return field > 15u ? 15u : field;
+    }
+    for (axys_uint32_t v = binterval * 8u; v > 1u; v >>= 1) {
+        ++field;
+    }
+    if (field < 3u) {
+        field = 3u;
+    }
+    return field > 10u ? 10u : field;
+}
 
 static void build_input_context(axys_uint8_t *ctx, axys_uint8_t speed, axys_uint8_t root_port,
                                 axys_uint32_t route, axys_uint8_t parent_slot,
@@ -550,6 +643,7 @@ static void build_input_context(axys_uint8_t *ctx, axys_uint8_t speed, axys_uint
     }
     /* EP0 context at DCI 1 (offset 2*32), with its current TR dequeue. */
     put32(ctx, 2u * 32u + 4, EP_CERR_3 | (EP_TYPE_CONTROL << 3) | (ep0_mps << 16));
+    put32(ctx, 2u * 32u + 16, 8u); /* EP0 Average TRB Length: setup stages are 8 bytes */
     put32(ctx, 2u * 32u + 8, (axys_uint32_t)ep0_dequeue);
     put32(ctx, 2u * 32u + 12, (axys_uint32_t)(ep0_dequeue >> 32));
     if (extra_dci != 0) {
@@ -561,6 +655,17 @@ static void build_input_context(axys_uint8_t *ctx, axys_uint8_t speed, axys_uint
          * cycle 1). Rings sit below 4 GiB, so the high dword is zero. */
         put32(ctx, off + 8, ((axys_uint32_t)extra_tr_phys & ~0xfu) | 1u);
         put32(ctx, off + 12, (axys_uint32_t)(extra_tr_phys >> 32));
+        {
+            /* dword 4: Average TRB Length (15:0) and Max ESIT Payload Lo
+             * (31:16). Real controllers reject periodic endpoints that leave
+             * them zero; an interrupt endpoint moves at most one packet per
+             * service interval, a bulk one is sized for typical transfers. */
+            axys_uint32_t ep_type = (extra_dw1 >> 3) & 7u;
+            axys_uint32_t mps = extra_dw1 >> 16;
+            axys_uint32_t periodic = (ep_type == 3u || ep_type == 7u);
+
+            put32(ctx, off + 16, (periodic ? mps : 1024u) | (periodic ? mps << 16 : 0u));
+        }
     }
 }
 
@@ -626,25 +731,11 @@ static axys_uint16_t desc_u16(const axys_uint8_t *p)
     return (axys_uint16_t)((axys_uint16_t)p[0] | ((axys_uint16_t)p[1] << 8));
 }
 
-/* Find a descriptor of `type` in a configuration blob. Returns its offset or -1. */
+/* Find a descriptor of `type` in a configuration blob (see usb_desc.h: every
+ * length is validated, so the fixed offsets read afterwards stay in bounds). */
 static int find_descriptor(const axys_uint8_t *blob, axys_size_t len, axys_uint8_t type, int instance)
 {
-    axys_size_t off = 0;
-    int seen = 0;
-
-    while (off + 2u <= len) {
-        axys_uint8_t dlen = blob[off];
-        axys_uint8_t dtype = blob[off + 1];
-
-        if (dlen < 2u || off + dlen > len) {
-            return -1;
-        }
-        if (dtype == type && seen++ == instance) {
-            return (int)off;
-        }
-        off += dlen;
-    }
-    return -1;
+    return axys_usb_desc_find(blob, len, type, instance);
 }
 
 /* ---- device bring-up -------------------------------------------------------------- */
@@ -737,19 +828,23 @@ int axys_usb_control(axys_uint8_t slot, axys_uint8_t request_type, axys_uint8_t 
                      axys_uint16_t value, axys_uint16_t index, axys_uint64_t data_phys,
                      axys_uint32_t length, int data_in, axys_uint32_t timeout_ms)
 {
-    struct xhci_dev *dev = dev_by_slot(slot);
+    struct xhci_dev *dev;
+    int rc = -1;
 
-    if (dev == AXYS_NULL) {
-        return -1;
+    xhci_acquire();
+    dev = dev_by_slot(slot);
+    if (dev != AXYS_NULL) {
+        rc = control_transfer(dev, request_type, request, value, index, data_phys, length, data_in,
+                              deadline_ms(timeout_ms));
     }
-    return control_transfer(dev, request_type, request, value, index, data_phys, length, data_in,
-                            deadline_ms(timeout_ms));
+    xhci_release();
+    return rc;
 }
 
 /* One ≤4096-byte bulk transfer: a single TD so every completion matches
  * exactly one request (no chained-TD ambiguity on short packets). */
-int axys_usb_bulk_transfer(axys_uint8_t slot, axys_uint8_t dci, axys_uint64_t data_phys,
-                           axys_uint32_t length, int data_in, axys_uint32_t timeout_ms)
+static int bulk_transfer_locked(axys_uint8_t slot, axys_uint8_t dci, axys_uint64_t data_phys,
+                                axys_uint32_t length, int data_in, axys_uint32_t timeout_ms)
 {
     struct xhci_dev *dev = dev_by_slot(slot);
     struct ring *ring;
@@ -779,7 +874,18 @@ int axys_usb_bulk_transfer(axys_uint8_t slot, axys_uint8_t dci, axys_uint64_t da
     return wait_event(at, &code, &resid, deadline_ms(timeout_ms));
 }
 
-void axys_usb_reset_endpoint(axys_uint8_t slot, axys_uint8_t dci)
+int axys_usb_bulk_transfer(axys_uint8_t slot, axys_uint8_t dci, axys_uint64_t data_phys,
+                           axys_uint32_t length, int data_in, axys_uint32_t timeout_ms)
+{
+    int rc;
+
+    xhci_acquire();
+    rc = bulk_transfer_locked(slot, dci, data_phys, length, data_in, timeout_ms);
+    xhci_release();
+    return rc;
+}
+
+static void reset_endpoint_locked(axys_uint8_t slot, axys_uint8_t dci)
 {
     struct trb cmd;
     axys_uint64_t at;
@@ -797,6 +903,13 @@ void axys_usb_reset_endpoint(axys_uint8_t slot, axys_uint8_t dci)
     __sync_synchronize();
     ring_doorbell(0, 0);
     (void)wait_event(at, &code, &resid, deadline_ms(2000u));
+}
+
+void axys_usb_reset_endpoint(axys_uint8_t slot, axys_uint8_t dci)
+{
+    xhci_acquire();
+    reset_endpoint_locked(slot, dci);
+    xhci_release();
 }
 
 int axys_usb_storage_slot(void)
@@ -842,58 +955,23 @@ static int get_descriptor(struct xhci_dev *dev, axys_uint8_t reqtype, axys_uint8
 static int setup_keyboard(struct xhci_dev *dev, const axys_uint8_t *config, axys_size_t config_len,
                           axys_uint64_t deadline)
 {
-    int iface_off = -1;
-    int ep_off = -1;
-    axys_uint8_t iface_no = 0;
-    axys_uint8_t ep_addr = 0;
-    axys_uint32_t ep_mps = 8;
-    axys_uint32_t ep_interval = 10;
+    struct axys_usb_kbd_desc kd;
+    axys_uint8_t iface_no;
+    axys_uint8_t ep_addr;
+    axys_uint32_t ep_mps;
+    axys_uint32_t ep_interval;
     axys_uint8_t *rep_buf;
     axys_uint64_t rep_phys;
 
-    /* First interface that is boot-protocol keyboard (03/01/01). */
-    for (int inst = 0;; ++inst) {
-        int off = find_descriptor(config, config_len, 4, inst);
-
-        if (off < 0) {
-            break;
-        }
-        if (config[off + 5] == 3 && config[off + 6] == 1 && config[off + 7] == 1) {
-            iface_off = off;
-            iface_no = config[off + 2];
-            break;
-        }
-    }
-    if (iface_off < 0) {
+    /* First boot-protocol keyboard interface (3/1/1) and the interrupt-IN
+     * endpoint that belongs to it. */
+    if (axys_usb_desc_keyboard(config, config_len, &kd) != 0) {
         return -1; /* not a boot keyboard */
     }
-    /* Its interrupt-IN endpoint. */
-    for (int inst = 0;; ++inst) {
-        int off = find_descriptor(config, config_len, 5, inst);
-
-        if (off < 0 || off < iface_off) {
-            if (off >= 0) {
-                continue;
-            }
-            break;
-        }
-        if ((config[off + 2] & 0x80u) != 0 && (config[off + 3] & 3u) == 3u) {
-            ep_off = off;
-            ep_addr = config[off + 2];
-            ep_mps = desc_u16(config + off + 4);
-            if (ep_mps == 0 || ep_mps > 64) {
-                ep_mps = 8;
-            }
-            ep_interval = config[off + 6];
-            if (ep_interval == 0) {
-                ep_interval = 10;
-            }
-            break;
-        }
-    }
-    if (ep_off < 0) {
-        return -1;
-    }
+    iface_no = kd.iface;
+    ep_addr = kd.ep_addr;
+    ep_mps = kd.mps;
+    ep_interval = kd.interval;
     /* Set Configuration (value from the config descriptor). */
     {
         struct trb t;
@@ -903,7 +981,7 @@ static int setup_keyboard(struct xhci_dev *dev, const axys_uint8_t *config, axys
 
         axys_memset(&t, 0, sizeof(t));
         {
-            axys_uint8_t setup_bytes[8] = {0x00, 0x09, config[5], 0x00, 0x00, 0x00, 0x00, 0x00};
+            axys_uint8_t setup_bytes[8] = {0x00, 0x09, kd.config_value, 0x00, 0x00, 0x00, 0x00, 0x00};
 
             for (unsigned i = 0; i < 8; ++i) {
                 ((axys_uint8_t *)&t.param)[i] = setup_bytes[i];
@@ -935,7 +1013,7 @@ static int setup_keyboard(struct xhci_dev *dev, const axys_uint8_t *config, axys
     /* Interrupt ring + endpoint. DCI for EP1 IN is 3. */
     {
         axys_uint32_t dci = ((axys_uint32_t)(ep_addr & 0x0fu)) * 2u + 1u;
-        axys_uint32_t dw0 = ep_interval & 0xffu;
+        axys_uint32_t dw0 = ep_interval_field(dev->speed, ep_interval) << 16;
         axys_uint32_t dw1 = EP_CERR_3 | (EP_TYPE_INTR_IN << 3) | (ep_mps << 16);
 
         if (ring_init(&dev->intr) != 0) {
@@ -958,67 +1036,27 @@ static int setup_keyboard(struct xhci_dev *dev, const axys_uint8_t *config, axys
 static int setup_storage(struct xhci_dev *dev, const axys_uint8_t *config, axys_size_t config_len,
                          axys_uint8_t iface_no, axys_uint64_t deadline)
 {
-    axys_uint8_t out_ep = 0;
-    axys_uint8_t in_ep = 0;
-    axys_uint32_t out_mps = 0;
-    axys_uint32_t in_mps = 0;
+    struct axys_usb_msc_desc md;
+    axys_uint8_t out_ep;
+    axys_uint8_t in_ep;
+    axys_uint32_t out_mps;
+    axys_uint32_t in_mps;
     axys_uint32_t out_dci;
     axys_uint32_t in_dci;
     axys_uint8_t *setup_buf;
     axys_uint64_t setup_phys;
 
+    (void)iface_no;
+    /* The Bulk-Only interface and its own pair of bulk endpoints. */
+    if (axys_usb_desc_storage(config, config_len, &md) != 0) {
+        return -1;
+    }
+    out_ep = md.out_ep;
+    in_ep = md.in_ep;
+    out_mps = md.out_mps;
+    in_mps = md.in_mps;
     /* Set Configuration first: endpoints do not exist before it. */
-    {
-        int cfg_value = -1;
-
-        for (int inst = 0;; ++inst) {
-            int off = find_descriptor(config, config_len, 2, inst);
-
-            if (off < 0) {
-                break;
-            }
-            cfg_value = config[off + 5];
-            break;
-        }
-        if (cfg_value < 0) {
-            return -1;
-        }
-        if (control_transfer(dev, 0x00, 0x09, (axys_uint16_t)cfg_value, 0, 0, 0, 0,
-                             deadline) != 0) {
-            return -1;
-        }
-    }
-    for (int inst = 0;; ++inst) {
-        int off = find_descriptor(config, config_len, 5, inst);
-        axys_uint8_t addr;
-        axys_uint32_t mps;
-
-        if (off < 0) {
-            break;
-        }
-        if ((config[off + 3] & 3u) != 2u) {
-            continue; /* not bulk */
-        }
-        addr = config[off + 2];
-        mps = desc_u16(config + off + 4);
-        if (mps < 8u || mps > 1024u || (addr & 0x0fu) == 0 || (addr & 0x0fu) > 15u) {
-            return -1;
-        }
-        if ((addr & 0x80u) != 0) {
-            if (in_ep != 0) {
-                return -1; /* second IN endpoint: out of scope */
-            }
-            in_ep = addr;
-            in_mps = mps;
-        } else {
-            if (out_ep != 0) {
-                return -1;
-            }
-            out_ep = addr;
-            out_mps = mps;
-        }
-    }
-    if (out_ep == 0 || in_ep == 0) {
+    if (control_transfer(dev, 0x00, 0x09, (axys_uint16_t)md.config_value, 0, 0, 0, 0, deadline) != 0) {
         return -1;
     }
     out_dci = ((axys_uint32_t)(out_ep & 0x0fu)) * 2u;
@@ -1100,7 +1138,6 @@ static void kbd_arm(struct xhci_dev *dev)
     struct trb t;
 
     if (dev->pending != 0) {
-        axys_printf("xhci-dbg: kbd_arm blocked pend=%lx\n", (unsigned long)dev->pending);
         return;
     }
     axys_memset(&t, 0, sizeof(t));
@@ -1109,7 +1146,6 @@ static void kbd_arm(struct xhci_dev *dev)
     t.control = (TRB_NORMAL << 10) | TRB_IOC | TRB_ISP;
     t.control = (t.control & ~TRB_CYCLE) | dev->intr.cycle;
     dev->pending = ring_next(&dev->intr, &t);
-    axys_printf("xhci-dbg: kbd_arm at=%lx\n", (unsigned long)dev->pending);
     __sync_synchronize();
     ring_doorbell(dev->slot, dev->intr_dci);
 }
@@ -1130,7 +1166,8 @@ static void kbd_report(struct xhci_dev *dev)
 /* ---- hubs ------------------------------------------------------------------------ */
 
 static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t parent_slot,
-                            axys_uint8_t parent_port, unsigned depth, axys_uint32_t speed);
+                            axys_uint8_t parent_port, axys_uint8_t hub_slot, axys_uint8_t hub_port,
+                            unsigned depth, axys_uint32_t speed);
 
 /* Hub class requests (recipient device / port). */
 #define HUB_GET_DESCRIPTOR 0x06u
@@ -1235,15 +1272,16 @@ static axys_uint32_t hub_reset_port(struct xhci_dev *hub, axys_uint8_t port,
         return 0;
     }
     /* wPortStatus is little-endian: buf[0..1] = status, buf[2..3] = change.
-     * Port Speed is bits 10:11 of wPortStatus (USB2 hubs): 01b = low speed,
-     * 10b = high speed. The old masks read bit 9 (Port Power) as "high speed",
-     * which classified every powered full-speed device as high speed and
-     * broke the TT/ep0 assumptions behind it. */
+     * USB 2.0 table 11-21: bit 8 = PORT_POWER, bit 9 = PORT_LOW_SPEED,
+     * bit 10 = PORT_HIGH_SPEED (both clear = full speed). In byte 1 those are
+     * 0x01 (power: set on every powered port, so it says nothing about speed),
+     * 0x02 (low speed) and 0x04 (high speed). Reading 0x01 as "low speed" made
+     * every full-speed device behind a hub look low-speed. */
     if ((status_buf[1] & 0x04u) != 0u) {
-        return SPEED_HS; /* HIGH_SPEED bit (wPortStatus bit 10) */
+        return SPEED_HS;
     }
-    if ((status_buf[1] & 0x01u) != 0u) {
-        return SPEED_LS; /* LOW_SPEED bit (wPortStatus bit 8) */
+    if ((status_buf[1] & 0x02u) != 0u) {
+        return SPEED_LS;
     }
     return SPEED_FS;
 }
@@ -1251,7 +1289,7 @@ static axys_uint32_t hub_reset_port(struct xhci_dev *hub, axys_uint8_t port,
 static int hub_port_has_dev(axys_uint8_t hub_slot, axys_uint8_t hub_port)
 {
     for (unsigned i = 0; i < MAX_SLOTS; ++i) {
-        if (devs[i].used && devs[i].parent_slot == hub_slot && devs[i].parent_port == hub_port) {
+        if (devs[i].used && devs[i].hub_slot == hub_slot && devs[i].hub_port == hub_port) {
             return 1;
         }
     }
@@ -1335,7 +1373,7 @@ static int setup_hub(struct xhci_dev *dev, const axys_uint8_t *config, axys_size
             axys_uint8_t ps = dev->speed == SPEED_HS ? dev->slot : 0;
             axys_uint8_t pp = dev->speed == SPEED_HS ? p : 0;
 
-            (void)enumerate_device(dev->root_port, route, ps, pp, dev->depth + 1u,
+            (void)enumerate_device(dev->root_port, route, ps, pp, dev->slot, p, dev->depth + 1u,
                                    speed);
         }
     }
@@ -1390,7 +1428,8 @@ static axys_uint32_t reset_port(unsigned port)
  * port. `route` is the 20-bit route string, `depth` the hub depth (0 for
  * directly attached, max 5). Parent slot/port identify the hub above. */
 static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t parent_slot,
-                            axys_uint8_t parent_port, unsigned depth, axys_uint32_t speed)
+                            axys_uint8_t parent_port, axys_uint8_t hub_slot, axys_uint8_t hub_port,
+                            unsigned depth, axys_uint32_t speed)
 {
     struct xhci_dev *dev = AXYS_NULL;
     axys_uint8_t slot = 0;
@@ -1422,6 +1461,8 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
     dev->route = route;
     dev->parent_slot = parent_slot;
     dev->parent_port = parent_port;
+    dev->hub_slot = hub_slot;
+    dev->hub_port = hub_port;
     dev->depth = depth;
     dev->is_hub = 0;
     dev->hub_ports = 0;
@@ -1445,36 +1486,31 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
         void *out = axys_dma_alloc(1024, 64, 0, AXYS_DMA_32BIT, &phys);
 
         if (out == AXYS_NULL) {
-            release_slot(dev, deadline);
-            dev->used = 0;
+            abandon_device(dev, deadline);
             return -1;
         }
         dcbaa[slot] = phys;
         dev->dcbaa_buf = out;
     }
     if (address_device(dev, deadline) != 0) {
-        release_slot(dev, deadline);
-        dev->used = 0;
+        abandon_device(dev, deadline);
         return -1;
     }
     buf = axys_dma_alloc(CTRL_BUFFER, 16, 0, AXYS_DMA_32BIT, &buf_phys);
     if (buf == AXYS_NULL) {
-        release_slot(dev, deadline);
-        dev->used = 0;
+        abandon_device(dev, deadline);
         return -1;
     }
     /* Device descriptor: only the class triple matters here. */
     if (get_descriptor(dev, 0x80, DESC_DEVICE, 0, buf_phys, 18, 0, deadline) != 0) {
         axys_dma_free(buf);
-        release_slot(dev, deadline);
-        dev->used = 0;
+        abandon_device(dev, deadline);
         return -1;
     }
     /* Configuration header first (to learn the total length), then all of it. */
     if (get_descriptor(dev, 0x80, DESC_CONFIG, 0, buf_phys, 9, 0, deadline) != 0) {
         axys_dma_free(buf);
-        release_slot(dev, deadline);
-        dev->used = 0;
+        abandon_device(dev, deadline);
         return -1;
     }
     {
@@ -1482,14 +1518,12 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
 
         if (total < 9u || total > CTRL_BUFFER) {
             axys_dma_free(buf);
-            release_slot(dev, deadline);
-            dev->used = 0;
+            abandon_device(dev, deadline);
             return -1;
         }
         if (get_descriptor(dev, 0x80, DESC_CONFIG, 0, buf_phys, total, 0, deadline) != 0) {
             axys_dma_free(buf);
-            release_slot(dev, deadline);
-            dev->used = 0;
+            abandon_device(dev, deadline);
             return -1;
         }
         {
@@ -1499,29 +1533,34 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
                 axys_dma_free(buf);
                 return 1; /* no interfaces: addressed, unconfigured */
             }
-            if (buf[ifoff + 5] == 3 && buf[ifoff + 6] == 1 && buf[ifoff + 7] == 1) {
-                if (setup_keyboard(dev, buf, total, deadline) != 0) {
-                    axys_dma_free(buf);
-                    return 1;
-                }
-                axys_dma_free(buf);
-                dev->is_kbd = 1;
-                if ((unsigned)kbd_count < MAX_KBDS) {
-                    ++kbd_count;
-                }
-                kbd_arm(dev);
-                axys_printf("usb: keyboard on port %u (%d total)\n", port, kbd_count);
-                return 0;
-            }
-            if (buf[ifoff + 5] == 8 && buf[ifoff + 6] == 6 && buf[ifoff + 7] == 0x50u) {
-                int rc = setup_storage(dev, buf, total, buf[ifoff + 2], deadline);
+            {
+                struct axys_usb_kbd_desc kd;
+                struct axys_usb_msc_desc md;
 
-                axys_dma_free(buf);
-                if (rc != 0) {
-                    return 1;
+                if (axys_usb_desc_keyboard(buf, total, &kd) == 0) {
+                    if (setup_keyboard(dev, buf, total, deadline) != 0) {
+                        axys_dma_free(buf);
+                        return 1;
+                    }
+                    axys_dma_free(buf);
+                    dev->is_kbd = 1;
+                    if ((unsigned)kbd_count < MAX_KBDS) {
+                        ++kbd_count;
+                    }
+                    kbd_arm(dev);
+                    axys_printf("usb: keyboard on port %u (%d total)\n", port, kbd_count);
+                    return 0;
                 }
-                axys_printf("usb: storage on port %u (slot %u)\n", port, dev->slot);
-                return 0;
+                if (axys_usb_desc_storage(buf, total, &md) == 0) {
+                    int rc = setup_storage(dev, buf, total, md.iface, deadline);
+
+                    axys_dma_free(buf);
+                    if (rc != 0) {
+                        return 1;
+                    }
+                    axys_printf("usb: storage on port %u (slot %u)\n", port, dev->slot);
+                    return 0;
+                }
             }
             if (buf[ifoff + 5] == 9 && buf[ifoff + 6] == 0 && buf[ifoff + 7] == 0) {
                 int rc = setup_hub(dev, buf, total, buf[ifoff + 2], port, deadline);
@@ -1548,7 +1587,7 @@ static int enumerate_port(unsigned port, axys_uint32_t speed)
         if (negotiated == 0u) {
             return -1;
         }
-        return enumerate_device(port, 0, 0, 0, 0, negotiated);
+        return enumerate_device(port, 0, 0, 0, 0, 0, 0, negotiated);
     }
 }
 
@@ -1576,29 +1615,86 @@ static void poll_once(void)
     }
 }
 
+/* Retry deadline per (hub, downstream port). Hubs can report up to 16 ports, so
+ * the second dimension covers all of them. The first dimension is indexed by the
+ * xHCI slot id, which is 1-based: sizing it MAX_SLOTS made slot MAX_SLOTS write
+ * 128 bytes past the array. */
+static axys_uint64_t hub_retry[MAX_SLOTS + 1u][16];
+
+static struct xhci_dev *hub_child(axys_uint8_t hub_slot, axys_uint8_t hub_port)
+{
+    for (unsigned i = 0; i < MAX_SLOTS; ++i) {
+        if (devs[i].used && devs[i].hub_slot == hub_slot && devs[i].hub_port == hub_port) {
+            return &devs[i];
+        }
+    }
+    return AXYS_NULL;
+}
+
+/* A device went away (or its hub did): remove it and everything below it. The
+ * transaction mutex is held, so no transfer to it is in flight. The event ring
+ * may still hold completions for the old slot; they match no live device and
+ * are dropped. A storage device that was registered with the disk layer stops
+ * answering (its transfers fail), but the disk layer does not re-attach a
+ * replacement: that needs a block-device hot-plug policy of its own. */
+static void remove_device(struct xhci_dev *dev)
+{
+    axys_uint8_t slot = dev->slot;
+
+    if (slot != 0u) {
+        for (unsigned i = 0; i < MAX_SLOTS; ++i) {
+            if (devs[i].used && &devs[i] != dev && devs[i].hub_slot == slot) {
+                remove_device(&devs[i]);
+            }
+        }
+    }
+    if (dev->is_kbd && kbd_count > 0) {
+        --kbd_count;
+    }
+    for (unsigned i = 0; i < sizeof(stor_slots) / sizeof(stor_slots[0]); ++i) {
+        if (stor_slots[i].used && stor_slots[i].slot == slot) {
+            stor_slots[i].used = 0;
+        }
+    }
+    axys_printf("usb: device removed (slot %u, port %u)\n", (unsigned)slot, (unsigned)dev->root_port);
+    if (slot <= MAX_SLOTS) {
+        for (unsigned k = 0; k < 16u; ++k) {
+            hub_retry[slot][k] = 0;
+        }
+    }
+    abandon_device(dev, deadline_ms(1000u));
+}
+
 static void poll_task(void *arg)
 {
     unsigned slow = 0;
-    /* Retry deadline per (hub, downstream port). Hubs can report up to 16
-     * ports, so the second dimension covers all of them. The first dimension
-     * is indexed by the xHCI slot id, which is 1-based: sizing it MAX_SLOTS
-     * made slot MAX_SLOTS write 128 bytes past the array. */
-    static axys_uint64_t hub_retry[MAX_SLOTS + 1u][16];
 
     (void)arg;
     for (;;) {
-        axys_uint64_t flags;
-
         axys_task_sleep_ms(8u);
-        flags = axys_spin_lock_irqsave(&xhci_lock);
+        xhci_acquire();
         poll_once();
-        axys_spin_unlock_irqrestore(&xhci_lock, flags);
+        xhci_release();
         /* Hotplug: a newly connected device (CCS set, port not enabled,
          * nothing assigned) gets enumerated. The waits inside need timer
          * interrupts, so this runs outside the lock above. */
         for (unsigned port = 0; port < max_ports && port < 32u; ++port) {
             axys_uint32_t sc = reg32(port_addr(port));
 
+            if ((sc & PORTSC_CCS) == 0u && port_has_dev(port)) {
+                /* Unplugged: free the device and anything behind it. */
+                xhci_acquire();
+                for (unsigned i = 0; i < MAX_SLOTS; ++i) {
+                    if (devs[i].used && devs[i].root_port == port && devs[i].hub_slot == 0u) {
+                        remove_device(&devs[i]);
+                    }
+                }
+                sc = reg32(port_addr(port));
+                reg32_write(port_addr(port), (sc & PORTSC_CHANGES) | (sc & PORTSC_PP));
+                port_retry_at[port] = 0; /* a new device may be plugged in right away */
+                xhci_release();
+                continue;
+            }
             if ((sc & PORTSC_CCS) == 0u || (sc & PORTSC_PED) != 0u || port_has_dev(port)) {
                 continue;
             }
@@ -1607,11 +1703,14 @@ static void poll_task(void *arg)
             }
             port_retry_at[port] = axys_pit_millis() + 10000u;
             {
-                axys_uint32_t speed = reset_port(port);
+                axys_uint32_t speed;
 
+                xhci_acquire();
+                speed = reset_port(port);
                 if (speed != 0u) {
                     (void)enumerate_port(port, speed);
                 }
+                xhci_release();
             }
         }
         /* Hub downstream ports, at a slower cadence (a full scan is several
@@ -1631,24 +1730,39 @@ static void poll_task(void *arg)
                 if (buf == AXYS_NULL) {
                     continue;
                 }
+                xhci_acquire();
                 for (axys_uint8_t p = 1; p <= hub->hub_ports; ++p) {
                     axys_uint32_t speed;
 
                     if (hub_port_has_dev(hub->slot, p)) {
+                        /* Still there? A port whose connection bit dropped has
+                         * lost its device (and anything below it). */
+                        axys_memset(buf, 0, 4);
+                        if (hub_port_status(hub, p, buf_phys, deadline_ms(1000u)) == 0 &&
+                            (buf[0] & 0x01u) == 0u) {
+                            struct xhci_dev *gone = hub_child(hub->slot, p);
+
+                            if (gone != AXYS_NULL) {
+                                remove_device(gone);
+                            }
+                            hub_retry[hub->slot][p - 1u] = 0;
+                        }
                         continue;
                     }
                     if ((axys_int64_t)(axys_pit_millis() - hub_retry[hub->slot][p - 1u]) <
                         0) {
                         continue;
                     }
-                    hub_retry[hub->slot][p - 1u] = axys_pit_millis() + 10000u;
                     axys_memset(buf, 0, 4);
                     if (hub_port_status(hub, p, buf_phys, deadline_ms(1000u)) != 0) {
                         continue;
                     }
                     if ((buf[0] & 0x01u) == 0u) {
-                        continue; /* nothing connected */
+                        continue; /* nothing connected: look again on the next scan */
                     }
+                    /* Something is plugged in: throttle retries only for a
+                     * device that then fails to enumerate. */
+                    hub_retry[hub->slot][p - 1u] = axys_pit_millis() + 10000u;
                     speed = hub_reset_port(hub, p, buf, buf_phys, deadline_ms(2000u));
                     if (speed == 0u || hub->depth + 1u > 5u) {
                         continue;
@@ -1659,10 +1773,11 @@ static void poll_task(void *arg)
                         axys_uint8_t ps = hub->speed == SPEED_HS ? hub->slot : 0;
                         axys_uint8_t pp = hub->speed == SPEED_HS ? p : 0;
 
-                        (void)enumerate_device(hub->root_port, route, ps, pp,
+                        (void)enumerate_device(hub->root_port, route, ps, pp, hub->slot, p,
                                                hub->depth + 1u, speed);
                     }
                 }
+                xhci_release();
                 axys_dma_free(buf);
             }
         }
@@ -1832,14 +1947,6 @@ int axys_xhci_init(void)
         erst[0].reserved = 0;
         event_dequeue = 0;
         event_cycle = 1;
-        event_link_pending = 0;
-        /* Last slot of the segment is a Link TRB back to the front. Without
-         * it the controller reaches the end of the event ring and simply
-         * stops delivering events (xHCI 4.9.5 requires the link), which killed
-         * the keyboard after the first few dozen keystrokes. */
-        event_seg[EVENT_TRBS - 1].param = event_phys;
-        event_seg[EVENT_TRBS - 1].status = 0;
-        event_seg[EVENT_TRBS - 1].control = (TRB_LINK << 10) | TRB_TC | 1u;
         reg32_write(rt_base + RT_IMOD, 0);
         reg32_write(rt_base + RT_ERSTSZ, 1);
         reg64_write(rt_base + RT_ERSTBA, erst_phys);

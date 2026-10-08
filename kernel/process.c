@@ -665,7 +665,8 @@ void axys_process_selftest(void)
             axys_pit_sleep_ms(30); /* let the previous pass's last task be reaped */
             frames_before = axys_pmm_free_frames();
             switches_before = axys_sched_switches();
-        }        for (axys_size_t i = 0; i < AXYS_ARRAY_SIZE(tests); ++i) {
+        }
+        for (axys_size_t i = 0; i < AXYS_ARRAY_SIZE(tests); ++i) {
             int got = run_and_wait(tests[i].path, tests[i].args);
             int ok = tests[i].expect < 0 ? got >= AXYS_EXIT_FAULT_BASE : got == tests[i].expect;
 

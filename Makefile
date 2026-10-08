@@ -61,7 +61,7 @@ HOST_ACPI_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ACPI_TEST_SOURCES
 HOST_ELF_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ELF_TEST_SOURCES))
 HOST_PATH_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PATH_TEST_SOURCES))
 
-.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-net
+.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-usb-hotplug check-pci check-drivers check-net
 
 all: kernel
 
@@ -114,7 +114,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -125,6 +125,7 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_elf.exe
 	./build/test_path.exe
 	./build/test_heap.exe
+	./build/test_usb_desc.exe
 	./build/test_pci.exe
 	./build/test_usb.exe
 
@@ -159,6 +160,10 @@ build/test_elf.exe: $(HOST_ELF_TEST_OBJECTS)
 build/test_vfs.exe: $(HOST_VFS_TEST_OBJECTS)
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_VFS_TEST_OBJECTS)
+
+build/test_usb_desc.exe: tests/test_usb_desc.c kernel/usb_desc.c
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_usb_desc.c kernel/usb_desc.c
 
 build/test_heap.exe: tests/test_heap.c kernel/heap.c lib/string.c
 	@$(MKDIR)
@@ -198,6 +203,13 @@ check-usb: iso
 	@python3 tools/qemu-usb.py
 
 # Same keyboard behind a USB hub, which also exercises route-string handling.
+# Plug and unplug a USB keyboard many times through QMP (directly and behind a
+# hub): every cycle must be detected, deliver keys and be noticed on removal,
+# and physical frames, kernel heap and VFS nodes must return to the baseline.
+check-usb-hotplug: iso
+	@python3 tools/qemu-usb-hotplug.py --cycles 12
+	@python3 tools/qemu-usb-hotplug.py --cycles 6 --topology hub
+
 check-usb-hub: iso
 	@TOPOLOGY=hub python3 tools/qemu-usb.py
 
@@ -251,3 +263,15 @@ check-nvme: test iso
 # Exercise PCI BAR decoding and AHCI persistence on the highest ICH9 port.
 check-ahci: test iso
 	@EXPECT_AHCI=1 DISK_IF=if=none DISK_DEV='-device ich9-ahci,id=s0 -device ide-hd,drive=d0,bus=s0.5' sh tools/qemu-test.sh
+
+# Compare the kernel's /proc/pci with QEMU's own `info pci` on an i440FX board
+# and on a q35 board with xHCI, NVMe, virtio devices and a PCIe root port.
+check-pci: iso
+	python3 tools/qemu-pci-check.py
+	python3 tools/qemu-pci-check.py -- -machine q35 -device qemu-xhci \
+		-device nvme,drive=nv,serial=axys -drive id=nv,if=none,file=@DISK2@,format=raw \
+		-device virtio-net-pci -device virtio-rng-pci \
+		-device pcie-root-port,id=rp1,chassis=1,slot=1 -device qemu-xhci,bus=rp1 -device usb-ehci
+
+# Every driver scenario in one go (several minutes: each boot test also reboots).
+check-drivers: check-pci check-usb check-usb-hub check-usb-hotplug check-usb-storage check-usb-storage-hub check-ahci check-nvme check-net
