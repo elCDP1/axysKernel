@@ -44,6 +44,8 @@ enum axys_syscall_number {
     AXYS_SYS_NET_RECV = 31, /* net_recv(buf, cap) - oldest RX frame or -EAGAIN */
     AXYS_SYS_NET_STAT = 32, /* net_stat(&struct axys_net_stat) - link/MAC/counters */
     AXYS_SYS_NET_SET_ADDR = 33, /* net_set_addr(&ip[4]) - our IPv4, root only */
+    AXYS_SYS_PS = 34,         /* ps(buf, cap) - process snapshot, returns entries */
+    AXYS_SYS_DMESG = 35,       /* dmesg(buf, cap) - oldest bytes of the console log */
     AXYS_SYS_COUNT
 };
 
@@ -60,6 +62,15 @@ struct axys_stat {
     axys_uint32_t mode; /* permission bits */
     axys_uint32_t uid;
     axys_uint32_t gid;
+};
+
+/* One process-list entry: fixed 32 bytes, no pointers, safe to copy out. */
+struct axys_ps_entry {
+    axys_int32_t pid;
+    axys_int32_t parent; /* pid, -1 when spawned from kernel code */
+    axys_uint32_t uid;
+    axys_int32_t state; /* 0 = running, 1 = zombie (exited, awaiting wait) */
+    char name[16];      /* NUL-terminated program name */
 };
 
 /* Program the SYSCALL MSRs. Call once, after the GDT is loaded. */

@@ -988,6 +988,64 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         axys_net_set_addr(ip);
         return 0;
     }
+    case AXYS_SYS_PS: {
+        /* Process snapshot for `ps`: up to 32 fixed-size entries. A NULL
+         * buffer only queries how many entries exist right now. */
+        struct axys_ps_entry entries[AXYS_MAX_PROCS];
+        int total = axys_process_snapshot(entries, AXYS_MAX_PROCS);
+        axys_size_t n = (axys_size_t)total;
+
+        if (a0 == 0) {
+            return total;
+        }
+        if (a1 < n) {
+            n = (axys_size_t)a1;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (axys_aspace_check(&proc->space, a0, n * sizeof(entries[0]), 1) != 0) {
+            return err(AXYS_EFAULT);
+        }
+        return axys_aspace_copy_to(&proc->space, a0, entries,
+                                   n * sizeof(entries[0])) == 0
+                   ? (axys_int64_t)n
+                   : err(AXYS_EFAULT);
+    }
+    case AXYS_SYS_DMESG: {
+        /* Oldest retained console bytes for `dmesg`, in 512-byte bites off
+         * the kernel stack. a2 skips that many retained bytes so the caller
+         * can page through the log. Bounded at 64 KiB per call however large
+         * the request, so one call can neither loop forever nor pin the caller
+         * in the kernel. */
+        char chunk[512];
+        axys_size_t want = a1 > 65536u ? 65536u : (axys_size_t)a1;
+        axys_size_t done = 0;
+        axys_size_t skip = (axys_size_t)a2;
+
+        if (a1 == 0) {
+            return err(AXYS_EINVAL);
+        }
+        if (axys_aspace_check(&proc->space, a0, want, 1) != 0) {
+            return err(AXYS_EFAULT);
+        }
+        while (done < want) {
+            axys_size_t step = want - done > sizeof(chunk) ? sizeof(chunk) : want - done;
+            axys_size_t got = axys_console_log_copy(chunk, step, skip + done);
+
+            if (got == 0) {
+                break;
+            }
+            if (axys_aspace_copy_to(&proc->space, a0 + done, chunk, got) != 0) {
+                return err(AXYS_EFAULT);
+            }
+            done += got;
+            if (got < step) {
+                break;
+            }
+        }
+        return (axys_int64_t)done;
+    }
     case AXYS_SYS_RENAME: {
         char to[MAX_PATH];
         axys_vfs_node_t src;

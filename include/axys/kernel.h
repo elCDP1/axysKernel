@@ -5,4 +5,7 @@
 
 void axys_kmain(axys_uint32_t multiboot_magic, axys_uint32_t multiboot_information);
 
+/* Kernel release shown by `uname` (via /proc/version). Bump on releases. */
+#define AXYS_VERSION "1.0"
+
 #endif

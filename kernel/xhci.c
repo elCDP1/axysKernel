@@ -1844,6 +1844,50 @@ int axys_xhci_init(void)
     db_base = mmio + dboff;
     rt_base = mmio + rtsoff;
 
+    /* BIOS handoff (xHCI 1.2 section 7): a firmware-owned controller raises
+     * a system-management interrupt on every doorbell until the OS takes
+     * ownership. QEMU publishes no extended capabilities, so this whole
+     * block is a no-op there; on real hardware skipping it wedges USB under
+     * an SMI storm the moment enumeration rings the first doorbell. Walk the
+     * extended-capability list (offsets in dwords from the MMIO base) to
+     * capability ID 1 (USB Legacy Support), set the OS-owned semaphore, wait
+     * out the BIOS, then silence every legacy SMI source. */
+    {
+        axys_uint32_t offset = ((reg32(mmio + CAP_HCC1) >> 16) & 0xffffu) << 2;
+
+        while (offset != 0u && offset + 8u <= (axys_uint32_t)bar_size) {
+            axys_uint32_t header = reg32(mmio + offset);
+            axys_uint32_t next;
+
+            if ((header & 0xffu) == 1u) {
+                if ((reg32(mmio + offset) & (1u << 16)) != 0u) {
+                    /* BIOS owns it: ask for it and give the firmware 5 s to
+                     * let go. On timeout proceed anyway: the SMI sources go
+                     * quiet below regardless. */
+                    axys_uint64_t give_up = deadline_ms(5000u);
+
+                    reg32_write(mmio + offset, reg32(mmio + offset) | (1u << 24));
+                    while ((reg32(mmio + offset) & (1u << 16)) != 0u) {
+                        if (expired(give_up)) {
+                            break;
+                        }
+                        axys_cpu_relax();
+                    }
+                }
+                /* USBLEGSUP: writing 0 disables every SMI enable and clears
+                 * no status (status bits are write-1-to-clear), so this is
+                 * safe on any revision. */
+                reg32_write(mmio + offset + 4u, 0u);
+                break;
+            }
+            next = ((header >> 8) & 0xffu) << 2;
+            if (next <= offset) {
+                break; /* malformed list: never walk backwards or stall */
+            }
+            offset = next;
+        }
+    }
+
     /* Stop a running controller, then reset it. */
     reg32_write(op_base + OP_USBCMD, reg32(op_base + OP_USBCMD) & ~CMD_RS);
     deadline = deadline_ms(2000u);

@@ -88,6 +88,38 @@ See [the platform support matrix](docs/PLATFORM_SUPPORT.md) for details and
 [the executable ABI](docs/EXECUTABLE_ABI.md) for the supported user binary
 format and compiler constraints.
 
+## Shell
+
+`/sbin/init` is an interactive shell with embedded-linux builtins plus
+`/bin` programs; `help <cmd>` prints usage inside the guest. Paths may be
+absolute or relative to the working directory (`cd`, `pwd`).
+
+```text
+files & dirs:  ls cat echo mkdir rm mv rmtree touch cp head tail wc grep
+               stat du find cut uniq tr strings hexdump cmp basename dirname
+               pwd cd tee clear
+system & users: meminfo free uptime date random pid id su chmod chown sync
+               sleep kill hostname uname whoami which seq time run poweroff
+               halt shutdown reboot exit
+processes & drivers: ps dmesg lscpu lsblk lspci lsusb sysinfo df ip ifconfig
+               (/bin has ping, dhcp)
+/bin programs: hello crash heap fileio perms probe fuzz ping dhcp
+```
+
+Commands accept several paths (`cat`, `rm`, `touch`, `mkdir`, `ls`), `cp`
+/`chmod`/`chown` take `-r`/`-R`, `cat`/`head`/`tail`/`grep`/`cut` stream
+without loading whole files, and `;` chains commands on one line (no
+quoting, no pipes yet).
+
+Driver commands read live state, not canned text: `ip` uses the `NET_STAT`
+syscall (e1000 link/MAC/counters), `free` uses `MEMINFO`, `ps` uses the new
+`PS` syscall (pid, ppid, uid, state, name), `dmesg` streams the retained
+console log via `DMESG`, and `lscpu`, `lspci`, `lsusb`, `lsblk`, `sysinfo`,
+`df`, `uname` read the `/proc/cpu`, `/proc/pci`, `/proc/usb`, `/proc/disk`,
+`/proc/net`, `/proc/acpi` and `/proc/version` snapshots the kernel publishes
+at boot (RAM-only, never persisted). Deliberately absent (no kernel support
+yet): `mount`, `ln`, `tar`, `vi`, `top`, pipes.
+
 ## Source layout
 
 - `arch/x86_64/`: early boot, interrupt entry, context switching, and syscall

@@ -433,6 +433,34 @@ static void probe_net(void)
     }
 }
 
+static void probe_ps_dmesg(void)
+{
+    struct ps_entry list[32];
+    char log[256];
+    int n;
+    int self_seen = 0;
+    int me = getpid();
+
+    n = ps_list(list, 32);
+    check("ps lists at least ourselves", n >= 1, 120);
+    for (int i = 0; i < n && i < 32; ++i) {
+        if (list[i].pid == me) {
+            self_seen = 1;
+            check("our entry has our uid", list[i].uid == (u32)getuid(), 121);
+            check("our entry is running", list[i].state == 0, 122);
+            check("our entry is named", list[i].name[0] != '\0', 123);
+        }
+        check("entry name fits in 16 bytes", strlen(list[i].name) < 16, 124);
+    }
+    check("we appear in our own snapshot", self_seen, 125);
+    check("ps with NULL queries the count", ps_list(0, 0) >= n, 126);
+
+    check("dmesg of zero bytes is EINVAL", dmesg(log, 0, 0) == -22, 127);
+    check("dmesg returns boot text", dmesg(log, sizeof(log), 0) > 0, 128);
+    /* Paging past the end is an empty read, not an error. */
+    check("dmesg past the end is empty", dmesg(log, sizeof(log), 1u << 30) == 0, 129);
+}
+
 static void probe_rename_tree(void)
 {
     struct stat_info st;
@@ -490,6 +518,7 @@ int main(const char *args, size_t len)
     probe_exhaust();
     probe_rename_tree();
     probe_create_emfile();
+    probe_ps_dmesg();
     probe_net();
     unlink("/tmp/probe.fd");
     unlink("/tmp/probe.seek");

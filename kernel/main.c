@@ -218,6 +218,103 @@ void axys_kmain(axys_uint32_t multiboot_magic, axys_uint32_t multiboot_informati
         }
     }
 
+    /* Driver inventory for user space, next to /proc/pci above: read-only
+     * snapshots in RAM (persist only covers its allow-listed roots, so /proc
+     * never reaches the disk). The shell's uname/sysinfo/lsusb/df builtins
+     * read these, so every command shows live driver data instead of canned
+     * text. Anything here must stay short: one static 1 KiB buffer is reused
+     * for all of them. */
+    {
+        static char text[1024];
+        axys_vfs_node_t node;
+
+        axys_snprintf(text, sizeof(text), "axysOS %s x86_64\n", AXYS_VERSION);
+        node = axys_vfs_create_as("/proc/version", AXYS_VFS_FILE, 0444u, 0, 0);
+        if (node >= 0) {
+            (void)axys_vfs_write(node, text, axys_strlen(text));
+        }
+        axys_snprintf(text, sizeof(text), "acpi: %s\n", axys_acpi_summary());
+        node = axys_vfs_create_as("/proc/acpi", AXYS_VFS_FILE, 0444u, 0, 0);
+        if (node >= 0) {
+            (void)axys_vfs_write(node, text, axys_strlen(text));
+        }
+        {
+            int slot = axys_usb_storage_slot();
+
+            if (slot != 0) {
+                axys_uint8_t s = 0, out = 0, in = 0;
+
+                (void)axys_usb_storage_info(&s, &out, &in);
+                axys_snprintf(text, sizeof(text), "usb: %s\nkeyboards: %d\nstorage: slot %u dci-out %u dci-in %u\n",
+                              axys_xhci_summary(), axys_xhci_keyboard_count(), s, out, in);
+            } else {
+                axys_snprintf(text, sizeof(text), "usb: %s\nkeyboards: %d\nstorage: none\n",
+                              axys_xhci_summary(), axys_xhci_keyboard_count());
+            }
+        }
+        node = axys_vfs_create_as("/proc/usb", AXYS_VFS_FILE, 0444u, 0, 0);
+        if (node >= 0) {
+            (void)axys_vfs_write(node, text, axys_strlen(text));
+        }
+        axys_snprintf(text, sizeof(text), "disk: %s\nsectors: %u\ncapacity_bytes: %llu\n",
+                      axys_disk_backend_note(), axys_disk_sectors(),
+                      (unsigned long long)axys_disk_capacity() * 512u);
+        node = axys_vfs_create_as("/proc/disk", AXYS_VFS_FILE, 0444u, 0, 0);
+        if (node >= 0) {
+            (void)axys_vfs_write(node, text, axys_strlen(text));
+        }
+        axys_snprintf(text, sizeof(text), "net: %s\n", axys_e1000_summary());
+        node = axys_vfs_create_as("/proc/net", AXYS_VFS_FILE, 0444u, 0, 0);
+        if (node >= 0) {
+            (void)axys_vfs_write(node, text, axys_strlen(text));
+        }
+        {
+            /* /proc/cpu: vendor, brand and feature flags, all from CPUID.
+             * The brand leaves are only read when the CPU reports them;
+             * above-maximum leaves return stale contents on some CPUs. */
+            axys_uint32_t eax, ebx, ecx, edx;
+            char vendor[13];
+            char brand[49];
+            axys_size_t blen;
+
+            axys_cpu_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+            axys_memcpy(vendor, &ebx, 4);
+            axys_memcpy(vendor + 4, &edx, 4);
+            axys_memcpy(vendor + 8, &ecx, 4);
+            vendor[12] = '\0';
+            brand[0] = '\0';
+            if (axys_cpu_extended_leaf_max() >= 0x80000004u) {
+                for (axys_uint32_t leaf = 0; leaf < 3; ++leaf) {
+                    axys_cpu_cpuid(0x80000002u + leaf, 0, &eax, &ebx, &ecx, &edx);
+                    axys_memcpy(brand + leaf * 16, &eax, 4);
+                    axys_memcpy(brand + leaf * 16 + 4, &ebx, 4);
+                    axys_memcpy(brand + leaf * 16 + 8, &ecx, 4);
+                    axys_memcpy(brand + leaf * 16 + 12, &edx, 4);
+                }
+                brand[48] = '\0';
+                blen = axys_strlen(brand);
+                while (blen > 0 && brand[blen - 1] == ' ') {
+                    brand[--blen] = '\0';
+                }
+            }
+            axys_snprintf(text, sizeof(text),
+                          "vendor: %s\nbrand: %s\nlogical: %u\nfeatures:%s%s%s%s%s%s%s%s\n",
+                          vendor, brand, axys_cpu_count(),
+                          axys_cpu_has_rdrand() ? " rdrand" : "",
+                          axys_cpu_has_rdseed() ? " rdseed" : "",
+                          axys_cpu_has_smep() ? " smep" : "",
+                          axys_cpu_has_smap() ? " smap" : "",
+                          axys_cpu_has_nx() ? " nx" : "",
+                          axys_cpu_has_invariant_tsc() ? " invariant-tsc" : "",
+                          axys_cpu_has_apic() ? " apic" : "",
+                          axys_cpu_has_x2apic() ? " x2apic" : "");
+            node = axys_vfs_create_as("/proc/cpu", AXYS_VFS_FILE, 0444u, 0, 0);
+            if (node >= 0) {
+                (void)axys_vfs_write(node, text, axys_strlen(text));
+            }
+        }
+    }
+
     /*
      * Prove the exception path works before entering the idle loop. Nothing in
      * normal startup faults, so a broken IDT or frame layout would otherwise go

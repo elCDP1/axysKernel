@@ -94,6 +94,37 @@ axys_uint32_t axys_process_count(void)
     return n;
 }
 
+int axys_process_snapshot(struct axys_ps_entry *out, int cap)
+{
+    axys_uint64_t flags;
+    int n = 0;
+
+    if (out == AXYS_NULL || cap <= 0) {
+        return 0;
+    }
+    if (cap > AXYS_MAX_PROCS) {
+        cap = AXYS_MAX_PROCS;
+    }
+    /* One uninterruptible pass: spawn/exit mutate these slots, and a torn
+     * read would hand user space a pid with another process's name. */
+    flags = axys_cpu_save_flags();
+    axys_cpu_disable_interrupts();
+    for (int i = 0; i < AXYS_MAX_PROCS && n < cap; ++i) {
+        if (!procs[i].used) {
+            continue;
+        }
+        out[n].pid = procs[i].pid;
+        out[n].parent = procs[i].parent;
+        out[n].uid = procs[i].uid;
+        out[n].state = procs[i].zombie ? 1 : 0;
+        axys_memcpy(out[n].name, procs[i].name, sizeof(out[n].name));
+        out[n].name[sizeof(out[n].name) - 1] = '\0';
+        ++n;
+    }
+    axys_cpu_restore_flags(flags);
+    return n;
+}
+
 struct axys_process *axys_process_current(void)
 {
     struct axys_task *task = axys_task_current();

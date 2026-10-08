@@ -560,3 +560,53 @@ how each was found and verified, in `docs/PLATFORM_SUPPORT.md` ("Audit notes:
 driver review"). New regression coverage: `tests/test_usb_desc.c`,
 `make check-usb-hotplug`, `make check-pci`, and the 400-key USB bursts in
 `tools/qemu-usb.py`.
+
+### Driver review, third pass (shell expansion round)
+
+Re-read end to end: `e1000.c` (TCTL/TIPG/RCTL/RDT conventions match the
+Linux driver), `ahci.c` (FIS layout, PxCI/PxIS completion, COMRESET settle),
+`nvme.c` (CID resync, queue validation, locking), `ata.c`, `dma.c`,
+`disk.c`, `input.c`, `pit.c`. No defects found; no changes made to those
+files. One genuine gap fixed:
+
+- xHCI had no BIOS handoff: a firmware-owned controller raises an SMI on
+  every doorbell until the OS takes ownership, which wedges USB on real
+  hardware (QEMU publishes no extended capabilities, so it never noticed).
+  `axys_xhci_init()` now walks the extended-capability list to ID 1 (USB
+  Legacy Support), sets the OS-owned semaphore with a 5 s bound, and writes
+  USBLEGSUP to 0 (disables every SMI enable, clears no write-1-to-clear
+  status). Malformed lists cannot stall it (BAR-size bound, no backward
+  walk). Verified by the unchanged QEMU USB battery.
+
+New kernel surface, all covered by QEMU stage 2 and `/bin/probe`:
+
+- `SYS_PS` (34): fixed 32-byte process entries (pid, ppid, uid, state,
+  NUL-terminated name), snapshot under disabled interrupts, NULL queries the
+  count. Backs the `ps` builtin.
+- `SYS_DMESG` (35): last 4 KiB of console output kept in a power-of-two ring
+  in `console.c` (IRQ-safe push), paged by a skip argument, 64 KiB per-call
+  cap, pre-validated user buffer like `NET_RECV`. Backs `dmesg`.
+- `/proc/cpu` (vendor, brand, logical count, CPUID feature flags via the
+  range-checked helpers) backing `lscpu`; `/proc` also feeds `lsblk`.
+- Shell: `ps dmesg lscpu lsblk hexdump cmp basename dirname seq which time
+  halt whoami`, `cat -n`, `echo -n`, `-h` for `free`/`df`/`du`, grouped
+  `help` plus `help <cmd>`. Every driver command reads live kernel state.
+
+### Shell round two (multi-arg, `;` chaining, text tools)
+
+- Fixed a silent-ignore bug: command names of 58+ characters fell through
+  the `/bin/<cmd>` length guard without any message. Long names now print
+  `unknown command:` like every other miss (covered in stage 2).
+- `;` chains commands on one line (no quoting exists, so `;` always
+  separates; `exit` in any segment leaves the shell). The dispatch moved
+  into `run_line()` unchanged otherwise.
+- Multi-path `ls` (with `-R` and per-path headers), `cat`, `rm`, `touch`,
+  `mkdir`; `cp -r` and `chmod/chown -R` via bounded tree walkers;
+  `grep -r` (labelled hits) sharing the streaming matcher; `find -name`
+  with `*` glob; `cut` (`-d`, `-f N,N-M,N-,-M`, stdin default); `uniq -c`,
+  `tr` with real `a-z` ranges, `strings`, all streaming; `df [PATH]`;
+  `shutdown` alias. `tr` initially translated literally (`a-c` meant three
+  chars) and failed its own stage-2 check; ranges implemented instead.
+- One `make check-net` run failed with a gutted stage 2 (many MISSINGs);
+  immediate rerun passed clean. Root cause not isolated (no log kept);
+  treated as timing flake, stage-2 TIMEOUT raised 120 to 150 s.

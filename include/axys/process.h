@@ -4,6 +4,7 @@
 #include "axys/aspace.h"
 #include "axys/interrupts.h"
 #include "axys/sched.h"
+#include "axys/syscall.h"
 #include "axys/types.h"
 
 /*
@@ -96,6 +97,12 @@ AXYS_NORETURN void axys_process_exit(int code);
 AXYS_NORETURN void axys_process_fault(const struct axys_interrupt_frame *frame);
 
 axys_uint32_t axys_process_count(void);
+
+/* Copy up to `cap` live process entries into `out` (caller-provided array).
+ * Returns the entries written. Interrupts are masked across the copy so a
+ * concurrent spawn/exit cannot tear a half-initialised slot into the
+ * snapshot. */
+int axys_process_snapshot(struct axys_ps_entry *out, int cap);
 
 /* Ask a process to die (SIGKILL-like: cannot be caught). It exits at its next
  * timer interrupt or system-call boundary. Returns 0, or -ESRCH. */

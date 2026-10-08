@@ -21,7 +21,8 @@ enum {
     SYS_GETRANDOM, SYS_YIELD, SYS_UPTIME_MS, SYS_SBRK, SYS_SPAWN, SYS_WAIT, SYS_MKDIR,
     SYS_UNLINK, SYS_READDIR, SYS_STAT, SYS_POWER, SYS_KILL, SYS_GETUID, SYS_GETGID, SYS_SETUID,
     SYS_SETGID, SYS_CHMOD, SYS_CHOWN, SYS_SYNC, SYS_RENAME, SYS_RMDIR_TREE, SYS_MEMINFO,
-    SYS_NET_SEND, SYS_NET_RECV, SYS_NET_STAT, SYS_NET_SET_ADDR
+    SYS_NET_SEND, SYS_NET_RECV, SYS_NET_STAT, SYS_NET_SET_ADDR,
+    SYS_PS, SYS_DMESG
 };
 
 struct meminfo {
@@ -49,6 +50,15 @@ struct stat_info {
     u32 mode;
     u32 uid;
     u32 gid;
+};
+
+/* Mirrors struct axys_ps_entry in the kernel ABI: 32 bytes, no pointers. */
+struct ps_entry {
+    int pid;
+    int parent;
+    u32 uid;
+    int state; /* 0 running, 1 zombie */
+    char name[16];
 };
 
 static inline long sys4(long n, long a, long b, long c, long d)
@@ -104,6 +114,8 @@ static inline long net_send(const void *buf, size_t len) { return sys3(SYS_NET_S
 static inline long net_recv(void *buf, size_t cap) { return sys3(SYS_NET_RECV, buf, cap, 0); }
 static inline int net_stat(struct net_stat *out) { return (int)sys3(SYS_NET_STAT, out, 0, 0); }
 static inline int net_set_addr(const u8 ip[4]) { return (int)sys3(SYS_NET_SET_ADDR, ip, 0, 0); }
+static inline int ps_list(struct ps_entry *buf, int cap) { return (int)sys3(SYS_PS, buf, cap, 0); }
+static inline long dmesg(void *buf, size_t cap, u64 skip) { return sys4(SYS_DMESG, (long)buf, (long)cap, (long)skip, 0); }
 
 void *memcpy(void *dst, const void *src, size_t n);
 void *memset(void *dst, int c, size_t n);
