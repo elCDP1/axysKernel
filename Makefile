@@ -61,7 +61,7 @@ HOST_ACPI_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ACPI_TEST_SOURCES
 HOST_ELF_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ELF_TEST_SOURCES))
 HOST_PATH_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PATH_TEST_SOURCES))
 
-.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-usb-hotplug check-pci check-drivers check-net
+.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-usb-hotplug check-pci check-drivers check-shell check-net
 
 all: kernel
 
@@ -85,6 +85,17 @@ build/user/crt0.o: user/crt0.S
 
 build/user/%.elf: build/user/%.o build/user/lib.o build/user/crt0.o
 	$(LD) $(USER_LDFLAGS) -o $@ build/user/crt0.o $< build/user/lib.o
+
+# The shell shares the calendar code with the kernel (lib/timeconv.c, unit-tested
+# on the host), so `date` and the RTC driver cannot disagree.
+build/user/timeconv.o: lib/timeconv.c
+	@$(MKDIR)
+	$(CC) $(USER_CFLAGS) -Iinclude -c $< -o $@
+
+build/user/init.o: USER_CFLAGS += -Iinclude
+
+build/user/init.elf: build/user/init.o build/user/lib.o build/user/crt0.o build/user/timeconv.o
+	$(LD) $(USER_LDFLAGS) -o $@ build/user/crt0.o build/user/init.o build/user/lib.o build/user/timeconv.o
 
 # The initrd is a generated assembly file that .incbin's every program ELF and
 # exports a table of (path, start, end) triples for kernel/initrd.c.
@@ -114,7 +125,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe build/test_time.exe build/test_shparse.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -124,6 +135,8 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_acpi.exe
 	./build/test_elf.exe
 	./build/test_path.exe
+	./build/test_time.exe
+	./build/test_shparse.exe
 	./build/test_heap.exe
 	./build/test_usb_desc.exe
 	./build/test_pci.exe
@@ -161,6 +174,10 @@ build/test_vfs.exe: $(HOST_VFS_TEST_OBJECTS)
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_VFS_TEST_OBJECTS)
 
+build/test_time.exe: tests/test_time.c lib/timeconv.c
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_time.c lib/timeconv.c
+
 build/test_usb_desc.exe: tests/test_usb_desc.c kernel/usb_desc.c
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_usb_desc.c kernel/usb_desc.c
@@ -176,6 +193,10 @@ build/test_pci.exe: tests/test_pci.c kernel/pci.c kernel/dma.c lib/string.c lib/
 build/test_usb.exe: tests/test_usb.c kernel/usb_hid.c
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_usb.c kernel/usb_hid.c
+
+build/test_shparse.exe: tests/test_shparse.c user/shparse.h
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_shparse.c
 
 build/test_path.exe: $(HOST_PATH_TEST_OBJECTS)
 	@$(MKDIR)
@@ -274,4 +295,10 @@ check-pci: iso
 		-device pcie-root-port,id=rp1,chassis=1,slot=1 -device qemu-xhci,bus=rp1 -device usb-ehci
 
 # Every driver scenario in one go (several minutes: each boot test also reboots).
-check-drivers: check-pci check-usb check-usb-hub check-usb-hotplug check-usb-storage check-usb-storage-hub check-ahci check-nvme check-net
+check-drivers: check-shell check-pci check-usb check-usb-hub check-usb-hotplug check-usb-storage check-usb-storage-hub check-ahci check-nvme check-net
+
+# Drive the shell over the serial port: ~80 commands covering quoting, pipes,
+# redirection, the text filters, the RTC, the kernel log, live /proc files (with
+# USB hot-plug through QMP), errors and permissions.
+check-shell: iso
+	python3 tools/qemu-shell-test.py

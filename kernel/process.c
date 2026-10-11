@@ -454,6 +454,19 @@ int axys_process_spawn_as(const char *path, const char *args, int parent,
     }
     rsp -= 8; /* SysV: rsp+8 is 16-byte aligned at function entry */
     install_std_fds(proc);
+    if (parent > 0) {
+        /* A shell that redirected its own stdin/stdout (cmd > file, a | b)
+         * hands that to the program it starts. */
+        struct axys_process *parent_proc = find_pid(parent);
+
+        if (parent_proc != AXYS_NULL) {
+            for (int i = 0; i < 3; ++i) {
+                if (parent_proc->fds[i].used && !parent_proc->fds[i].console) {
+                    proc->fds[i] = parent_proc->fds[i];
+                }
+            }
+        }
+    }
 
     info = axys_kmalloc(sizeof(*info));
     if (info == AXYS_NULL) {

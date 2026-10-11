@@ -3,12 +3,13 @@
 #include "axys/serial.h"
 #include "axys/vga.h"
 
-/* Last bytes ever printed, for `dmesg`. A monotonic counter plus a power-
- * of-two ring: readers derive (start, length) from the counter alone, so no
- * head/tail pair can disagree. Pushes bracket with save/disable/restore
- * because putc runs in IRQ handlers too (a serial RX interrupt landing
- * mid-print must not tear the indices). */
-#define CONSOLE_LOG_BYTES 4096u
+/* Kernel log for `dmesg`: what the *kernel* printed (axys_printf), not what
+ * user programs wrote to the console. Retaining both made the boot messages
+ * vanish after the first few shell commands. A monotonic counter plus a
+ * power-of-two ring: readers derive (start, length) from the counter alone, so
+ * no head/tail pair can disagree. Pushes bracket with save/disable/restore
+ * because the kernel prints from IRQ handlers too. 32 KiB holds a full boot. */
+#define CONSOLE_LOG_BYTES 32768u
 
 static char log_ring[CONSOLE_LOG_BYTES];
 static axys_uint64_t log_count;
@@ -25,12 +26,6 @@ void axys_console_init(void)
 
 void axys_console_putc(char character)
 {
-    axys_uint64_t flags = axys_cpu_save_flags();
-
-    axys_cpu_disable_interrupts();
-    log_ring[log_count & (CONSOLE_LOG_BYTES - 1u)] = character;
-    ++log_count;
-    axys_cpu_restore_flags(flags);
 #if CONFIG_AXYS_CONSOLE_SERIAL
     axys_serial_putc(character);
 #endif
@@ -60,6 +55,28 @@ void axys_console_write_len(const char *string, axys_size_t length)
     for (axys_size_t index = 0; index < length; ++index) {
         axys_console_putc(string[index]);
     }
+}
+
+void axys_console_clear(void)
+{
+#if CONFIG_AXYS_CONSOLE_VGA
+    axys_vga_clear();
+#endif
+#if CONFIG_AXYS_CONSOLE_SERIAL
+    axys_serial_write("\x1b[2J\x1b[H", 7);
+#endif
+}
+
+void axys_klog_append(const char *text, axys_size_t length)
+{
+    axys_uint64_t flags = axys_cpu_save_flags();
+
+    axys_cpu_disable_interrupts();
+    for (axys_size_t i = 0; i < length; ++i) {
+        log_ring[log_count & (CONSOLE_LOG_BYTES - 1u)] = text[i];
+        ++log_count;
+    }
+    axys_cpu_restore_flags(flags);
 }
 
 /* Copy up to `cap` bytes of the retained log into `out`, oldest first,

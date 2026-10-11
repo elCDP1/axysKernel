@@ -1,4 +1,6 @@
 #include "axys.h"
+#include "axys/timeconv.h"
+#include "shparse.h"
 
 /* /sbin/init: a small interactive shell in the spirit of busybox.
  *
@@ -18,20 +20,36 @@
 /* Errno values the shell compares against (mirrors include/axys/process.h;
  * user space has no errno header, same as the other /bin programs). */
 #define E_NOENT 2
+#define E_ISDIR 21
+#define E_NOSPC 28
 #define E_NODEV 19
 #define E_INVAL 22
 
+/* Diagnostics go to fd 2 so that `cmd > file` and pipes carry only data. */
+static void eputs(const char *s)
+{
+    write(2, s, strlen(s));
+}
+
 static void print_status(const char *what, long value)
 {
-    puts(what);
-    puts(": ");
+    char num[24];
+    int n = 0;
+    u64 v = value < 0 ? (u64)-value : (u64)value;
+
+    eputs(what);
+    eputs(": ");
     if (value < 0) {
-        puts("-");
-        put_u64((u64)-value);
-    } else {
-        put_u64((u64)value);
+        eputs("-");
     }
-    puts("\n");
+    do {
+        num[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+    while (n > 0) {
+        write(2, &num[--n], 1);
+    }
+    eputs("\n");
 }
 
 static int run(const char *path, const char *args)
@@ -241,86 +259,97 @@ static void resolve(const char *in, char *out)
 
 /* Carve the next whitespace-separated token off *p (NUL-terminates it).
  * Returns 0 when nothing is left. */
-static char *next_arg(char **p)
-{
-    char *s = *p;
-    char *tok;
-
-    while (*s == ' ') {
-        ++s;
-    }
-    if (*s == '\0') {
-        *p = s;
-        return 0;
-    }
-    tok = s;
-    while (*s && *s != ' ') {
-        ++s;
-    }
-    if (*s) {
-        *s++ = '\0';
-    }
-    *p = s;
-    return tok;
-}
-
 static void cmd_cat_proc(const char *name, const char *path);
 
 static void ls_one(const char *path);
 static void ls_recursive(const char *path);
 
+static int ls_long; /* -l */
+
+static void ls_print(const char *name, const struct stat_info *st)
+{
+    if (ls_long) {
+        put_mode(st->type, st->mode);
+        puts(" ");
+        put_u64(st->uid);
+        puts(" ");
+        put_u64(st->gid);
+        puts(" ");
+        put_u64(st->size);
+        puts("\t");
+    }
+    puts(name);
+    puts(st->type == 2 ? "/\n" : "\n");
+}
+
+/* List one path: the entries of a directory, or the file itself. */
 static void ls_one(const char *path)
 {
     char name[64];
-    char child[128];
+    char child[PATH_MAX];
     struct stat_info st;
 
+    if (stat(path, &st) == 0 && st.type != 2) {
+        ls_print(path, &st);
+        return;
+    }
     for (u64 i = 0;; ++i) {
         int r = readdir(path, i, name, sizeof(name));
         size_t pl = strlen(path);
 
         if (r < 0) {
-            print_status("ls", r);
+            print_status(path, r); /* name the path: `ls a b` must say which one failed */
             return;
         }
         if (r == 0) {
             return;
         }
+        st.type = (u32)r;
+        st.mode = st.uid = st.gid = st.size = 0;
         if (pl + strlen(name) + 2 < sizeof(child)) {
             memcpy(child, path, pl);
             if (pl == 0 || child[pl - 1] != '/') {
                 child[pl++] = '/';
             }
             memcpy(child + pl, name, strlen(name) + 1);
-            if (stat(child, &st) == 0) {
-                put_mode(st.type, st.mode);
-                puts(" ");
-                put_u64(st.uid);
-                puts(" ");
-                put_u64(st.gid);
-                puts(" ");
-                put_u64(st.size);
-                puts("\t");
+            if (stat(child, &st) != 0) {
+                st.type = (u32)r;
             }
         }
-        puts(name);
-        puts(r == 2 ? "/\n" : "\n");
+        ls_print(name, &st);
     }
 }
 
-/* ls [-R] [PATH...]: headers only when listing several paths. */
+/* ls [-l] [-R] [PATH...]: a header per path only when listing several. */
 static void cmd_ls(char *rest)
 {
-    char *arg = next_arg(&rest);
-    char path[PATH_MAX];
-    int recursive = 0;
+    char *paths[16];
     int count = 0;
+    int recursive = 0;
+    char *arg;
 
-    if (arg && strcmp(arg, "-R") == 0) {
-        recursive = 1;
-        arg = next_arg(&rest);
+    ls_long = 0;
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            for (const char *f = arg + 1; *f; ++f) {
+                if (*f == 'l') ls_long = 1;
+                else if (*f == 'R') recursive = 1;
+                else if (*f == 'a') { /* no hidden files here: accepted for habit */ }
+                else {
+                    print_status("ls", -E_INVAL);
+                    return;
+                }
+            }
+        } else if (count < 16) {
+            paths[count++] = arg;
+        } else {
+            print_status("ls", -E_INVAL);
+            return;
+        }
     }
-    if (!arg) {
+    if (count == 0) {
+        char path[PATH_MAX];
+
         memcpy(path, cwd, strlen(cwd) + 1);
         if (recursive) {
             ls_recursive(path);
@@ -329,15 +358,15 @@ static void cmd_ls(char *rest)
         }
         return;
     }
-    for (char *a = arg; a; a = next_arg(&rest)) {
-        if (++count > 1) {
-            break;
-        }
-    }
-    for (char *a = arg; a; a = next_arg(&rest)) {
-        resolve(a, path);
-        if (count > 1) {
-            puts(path);
+    for (int i = 0; i < count; ++i) {
+        char path[PATH_MAX];
+
+        resolve(paths[i], path);
+        if (count > 1 && !recursive) {
+            if (i > 0) {
+                puts("\n");
+            }
+            puts(paths[i]);
             puts(":\n");
         }
         if (recursive) {
@@ -348,7 +377,7 @@ static void cmd_ls(char *rest)
     }
 }
 
-/* ls -R: this directory long, then each subdirectory in turn. */
+/* ls -R: this directory, then each subdirectory in turn. */
 static void ls_recursive(const char *path)
 {
     char name[64];
@@ -459,7 +488,7 @@ static void cmd_cat(char *rest)
     }
     file = next_arg(&rest);
     if (!file) {
-        print_status("cat", -E_INVAL);
+        cat_stream(0, numbered, &lineno, &bol); /* no FILE: copy stdin */
         return;
     }
     for (; file; file = next_arg(&rest)) {
@@ -477,57 +506,30 @@ static void cmd_cat(char *rest)
 /* echo [-n] TEXT [> FILE | >> FILE] */
 static void cmd_echo(char *rest)
 {
-    char *redirect = 0;
-    int append = 0;
     int nonl = 0;
+    int first = 1;
+    int printed = 0;
+    char *arg;
 
-    if (rest[0] == '-' && rest[1] == 'n' && (rest[2] == ' ' || rest[2] == '\0')) {
-        nonl = 1;
-        rest += 2;
-        while (*rest == ' ') {
-            ++rest;
+    /* Redirection (`echo hi > file`) is handled for every command by the
+     * pipeline layer; echo just prints its (unquoted) words. */
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (first && strcmp(arg, "-n") == 0) {
+            nonl = 1;
+            first = 0;
+            continue;
         }
+        first = 0;
+        if (printed) {
+            puts(" ");
+        }
+        puts(arg);
+        printed = 1;
     }
-    for (char *c = rest; *c; ++c) {
-        if (*c == '>') {
-            *c = '\0';
-            append = c[1] == '>';
-            redirect = c + (append ? 2 : 1);
-            while (*redirect == ' ') {
-                ++redirect;
-            }
-            break;
-        }
-    }
-    size_t n = strlen(rest);
-    while (n > 0 && rest[n - 1] == ' ') {
-        rest[--n] = '\0';
-    }
-    if (redirect == 0) {
-        puts(rest);
-        if (!nonl) {
-            puts("\n");
-        }
-        return;
-    }
-    {
-        char path[PATH_MAX];
-        int fd;
-
-        resolve(redirect, path);
-        fd = open(path, O_CREAT | O_WRONLY | (append ? O_APPEND : O_TRUNC));
-        if (fd < 0) {
-            print_status("echo", fd);
-            return;
-        }
-        write(fd, rest, n);
-        if (!nonl) {
-            write(fd, "\n", 1);
-        }
-        close(fd);
+    if (!nonl) {
+        puts("\n");
     }
 }
-
 static void cmd_touch(char *rest)
 {
     char *arg = next_arg(&rest);
@@ -700,15 +702,19 @@ static void cmd_head_tail(char *rest, int is_tail)
         }
         file = next_arg(&rest);
     }
-    if (!file || next_arg(&rest)) {
+    if (file && next_arg(&rest)) {
         print_status(name, -E_INVAL);
         return;
     }
-    resolve(file, path);
-    fd = open(path, 0);
-    if (fd < 0) {
-        print_status(name, fd);
-        return;
+    if (file) {
+        resolve(file, path);
+        fd = open(path, 0);
+        if (fd < 0) {
+            print_status(name, fd);
+            return;
+        }
+    } else {
+        fd = 0; /* no FILE: read stdin */
     }
     if (!is_tail) {
         u32 lines = 0;
@@ -778,135 +784,232 @@ static void cmd_head_tail(char *rest, int is_tail)
     }
 }
 
-static void cmd_wc(const char *rest)
+static void put_u64_pad(u64 v, int width)
 {
-    char path[PATH_MAX];
+    char num[24];
+    int n = 0;
+
+    do {
+        num[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+    for (int pad = width - n; pad > 0; --pad) {
+        puts(" ");
+    }
+    while (n > 0) {
+        write(1, &num[--n], 1);
+    }
+}
+
+/* Count lines, words and bytes of one stream. Returns 0 or a negative errno. */
+static int wc_count(int fd, u64 *lines, u64 *words, u64 *bytes)
+{
     char buf[IO_BUF];
-    int fd;
     ssize_t r;
-    u64 lines = 0, words = 0, bytes = 0;
     int in_word = 0;
 
-    if (rest[0] == '\0') {
-        print_status("wc", -E_INVAL);
-        return;
-    }
-    resolve(rest, path);
-    fd = open(path, 0);
-    if (fd < 0) {
-        print_status("wc", fd);
-        return;
-    }
+    *lines = *words = *bytes = 0;
     while ((r = read(fd, buf, sizeof(buf))) > 0) {
-        bytes += (u64)r;
+        *bytes += (u64)r;
         for (ssize_t i = 0; i < r; ++i) {
-            int space = buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n';
+            int space = buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r';
 
             if (buf[i] == '\n') {
-                ++lines;
+                ++*lines;
             }
             if (!space && !in_word) {
                 in_word = 1;
-                ++words;
+                ++*words;
             } else if (space) {
                 in_word = 0;
             }
         }
     }
-    close(fd);
-    if (r < 0) {
-        print_status("wc", (int)r);
-        return;
+    return r < 0 ? (int)r : 0;
+}
+
+/* wc [-l] [-w] [-c] [FILE...]: no FILE reads stdin; several files add a total. */
+static void cmd_wc(char *rest)
+{
+    int want_l = 0, want_w = 0, want_c = 0;
+    char *arg;
+    char *files[16];
+    int nfiles = 0;
+    u64 tl = 0, tw = 0, tc = 0;
+    int fields;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            for (const char *f = arg + 1; *f; ++f) {
+                if (*f == 'l') want_l = 1;
+                else if (*f == 'w') want_w = 1;
+                else if (*f == 'c') want_c = 1;
+                else {
+                    print_status("wc", -E_INVAL);
+                    return;
+                }
+            }
+        } else if (nfiles < 16) {
+            files[nfiles++] = arg;
+        } else {
+            print_status("wc", -E_INVAL);
+            return;
+        }
     }
-    put_u64(lines);
-    puts(" ");
-    put_u64(words);
-    puts(" ");
-    put_u64(bytes);
-    puts(" ");
-    puts(path);
+    if (!want_l && !want_w && !want_c) {
+        want_l = want_w = want_c = 1;
+    }
+    fields = want_l + want_w + want_c;
+    for (int i = 0; i < (nfiles ? nfiles : 1); ++i) {
+        u64 l, w, c;
+        int fd = 0;
+        int r;
+        char path[PATH_MAX];
+
+        if (nfiles) {
+            resolve(files[i], path);
+            fd = open(path, 0);
+            if (fd < 0) {
+                print_status(files[i], fd);
+                continue;
+            }
+        }
+        r = wc_count(fd, &l, &w, &c);
+        if (nfiles) {
+            close(fd);
+        }
+        if (r < 0) {
+            print_status(nfiles ? files[i] : "wc", r);
+            continue;
+        }
+        tl += l;
+        tw += w;
+        tc += c;
+        if (want_l) put_u64_pad(l, fields > 1 ? 7 : 0);
+        if (want_w) { if (want_l) puts(" "); put_u64_pad(w, fields > 1 ? 7 : 0); }
+        if (want_c) { if (want_l || want_w) puts(" "); put_u64_pad(c, fields > 1 ? 7 : 0); }
+        if (nfiles) {
+            puts(" ");
+            puts(files[i]);
+        }
+        puts("\n");
+    }
+    if (nfiles > 1) {
+        if (want_l) put_u64_pad(tl, fields > 1 ? 7 : 0);
+        if (want_w) { if (want_l) puts(" "); put_u64_pad(tw, fields > 1 ? 7 : 0); }
+        if (want_c) { if (want_l || want_w) puts(" "); put_u64_pad(tc, fields > 1 ? 7 : 0); }
+        puts(" total\n");
+    }
+}
+
+/* grep: substring match (no regex). Options -i -n -v -c -r; with no FILE the
+ * input is stdin, so `cmd | grep text` works. Lines longer than LINE_MAX-1 are
+ * matched on their first LINE_MAX-1 bytes. */
+struct grep_opts {
+    int icase, number, invert, count, show_name;
+};
+
+static char lower_c(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
+
+static int line_matches(const char *line, size_t len, const char *pat, size_t plen, int icase)
+{
+    if (plen == 0) {
+        return 1;
+    }
+    for (size_t i = 0; i + plen <= len; ++i) {
+        size_t k = 0;
+
+        for (; k < plen; ++k) {
+            char x = line[i + k];
+            char y = pat[k];
+
+            if (icase) {
+                x = lower_c(x);
+                y = lower_c(y);
+            }
+            if (x != y) {
+                break;
+            }
+        }
+        if (k == plen) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void grep_emit(const struct grep_opts *o, const char *name, u64 lineno, const char *line, size_t len)
+{
+    if (o->show_name) {
+        puts(name);
+        puts(":");
+    }
+    if (o->number) {
+        put_u64(lineno);
+        puts(":");
+    }
+    write(1, line, len);
     puts("\n");
 }
 
-/* grep PATTERN FILE: substring search (not regex), streamed line by line.
- * Matching is exact over the whole line even past the 255 bytes kept for
- * display; over-long lines print truncated. Patterns are capped at 64
- * bytes (the tail ring below); longer ones are refused, not mis-searched.
- * `label` prefixes matches for grep -r, 0 for plain grep. */
-static int grep_stream(int fd, const char *pat, size_t plen, const char *label)
+static int grep_stream(int fd, const char *name, const char *pat, size_t plen, const struct grep_opts *o)
 {
     char buf[IO_BUF];
     char line[LINE_MAX];
-    char tail[64];
-    size_t llen = 0, tlen = 0;
-    int matched = 0, saw_data = 0, hits = 0;
+    size_t llen = 0;
+    u64 lineno = 0;
+    int hits = 0;
+    int partial = 0;
     ssize_t r;
 
     while ((r = read(fd, buf, sizeof(buf))) > 0) {
         for (ssize_t i = 0; i < r; ++i) {
-            char c = buf[i];
-
-            saw_data = 1;
-            if (c == '\n') {
-                if (matched) {
-                    line[llen] = '\0';
-                    if (label) {
-                        puts(label);
-                        puts(":");
-                    }
-                    puts(line);
-                    puts("\n");
-                    ++hits;
-                }
-                llen = 0;
-                tlen = 0;
-                matched = 0;
-            } else {
-                /* The tail ring holds the last bytes of the current line;
-                 * an alignment ending at this byte either matches or not. */
-                if (tlen < sizeof(tail)) {
-                    tail[tlen++] = c;
-                } else {
-                    memmove(tail, tail + 1, sizeof(tail) - 1);
-                    tail[sizeof(tail) - 1] = c;
-                }
-                if (tlen >= plen && memcmp(tail + tlen - plen, pat, plen) == 0) {
-                    matched = 1;
-                }
+            if (buf[i] != '\n') {
                 if (llen + 1 < sizeof(line)) {
-                    line[llen++] = c;
+                    line[llen++] = buf[i];
                 }
+                partial = 1;
+                continue;
+            }
+            ++lineno;
+            if (line_matches(line, llen, pat, plen, o->icase) != o->invert) {
+                ++hits;
+                if (!o->count) {
+                    grep_emit(o, name, lineno, line, llen);
+                }
+            }
+            llen = 0;
+            partial = 0;
+        }
+    }
+    if (r == 0 && partial) { /* last line without a newline */
+        ++lineno;
+        if (line_matches(line, llen, pat, plen, o->icase) != o->invert) {
+            ++hits;
+            if (!o->count) {
+                grep_emit(o, name, lineno, line, llen);
             }
         }
     }
-    if (saw_data && llen > 0 && matched) {
-        line[llen] = '\0';
-        if (label) {
-            puts(label);
+    if (r < 0) {
+        return (int)r;
+    }
+    if (o->count) {
+        if (o->show_name) {
+            puts(name);
             puts(":");
         }
-        puts(line);
+        put_u64((u64)hits);
         puts("\n");
-        ++hits;
     }
-    return r < 0 ? (int)r : hits;
+    return hits;
 }
 
-static int grep_file(const char *path, const char *pat, size_t plen, const char *label)
-{
-    int fd = open(path, 0);
-    int r;
-
-    if (fd < 0) {
-        return fd;
-    }
-    r = grep_stream(fd, pat, plen, label);
-    close(fd);
-    return r;
-}
-
-/* Recursive grep over a tree, labelling every hit with its path. */
-static int grep_tree(const char *path, const char *pat, size_t plen, int depth)
+static int grep_path(const char *path, const char *pat, size_t plen, const struct grep_opts *o, int recursive,
+                     int depth)
 {
     struct stat_info st;
     int total = 0;
@@ -915,9 +1018,18 @@ static int grep_tree(const char *path, const char *pat, size_t plen, int depth)
         return -E_NOENT;
     }
     if (st.type != 2) {
-        int r = grep_file(path, pat, plen, path);
+        int fd = open(path, 0);
+        int r;
 
-        return r < 0 ? r : r;
+        if (fd < 0) {
+            return fd;
+        }
+        r = grep_stream(fd, path, pat, plen, o);
+        close(fd);
+        return r;
+    }
+    if (!recursive) {
+        return -E_ISDIR;
     }
     if (depth > 16) {
         return 0;
@@ -928,10 +1040,7 @@ static int grep_tree(const char *path, const char *pat, size_t plen, int depth)
         size_t pl = strlen(path);
         int e = readdir(path, i, name, sizeof(name));
 
-        if (e < 0) {
-            return total;
-        }
-        if (e == 0) {
+        if (e <= 0) {
             return total;
         }
         if (pl + strlen(name) + 2 >= PATH_MAX) {
@@ -943,53 +1052,71 @@ static int grep_tree(const char *path, const char *pat, size_t plen, int depth)
         }
         memcpy(child + pl, name, strlen(name) + 1);
         {
-            int r = grep_tree(child, pat, plen, depth + 1);
+            int r = grep_path(child, pat, plen, o, recursive, depth + 1);
 
-            if (r < 0) {
-                return r;
+            if (r > 0) {
+                total += r;
             }
-            total += r;
         }
     }
 }
 
 static void cmd_grep(char *rest)
 {
-    char *pat;
-    char *file;
-    char path[PATH_MAX];
-    size_t plen;
+    struct grep_opts o = {0, 0, 0, 0, 0};
     int recursive = 0;
-    int r;
+    char *arg;
+    char *pat = 0;
+    int nfiles = 0;
+    char *files[16];
 
-    if (rest[0] == '-' && rest[1] == 'r' && (rest[2] == ' ' || rest[2] == '\0')) {
-        recursive = 1;
-        rest += 2;
-        while (*rest == ' ') {
-            ++rest;
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (!pat && arg[0] == '-' && arg[1] != '\0') {
+            for (const char *f = arg + 1; *f; ++f) {
+                if (*f == 'i') o.icase = 1;
+                else if (*f == 'n') o.number = 1;
+                else if (*f == 'v') o.invert = 1;
+                else if (*f == 'c') o.count = 1;
+                else if (*f == 'r') recursive = 1;
+                else {
+                    print_status("grep", -E_INVAL);
+                    return;
+                }
+            }
+        } else if (!pat) {
+            pat = arg;
+        } else if (nfiles < 16) {
+            files[nfiles++] = arg;
+        } else {
+            print_status("grep", -E_INVAL);
+            return;
         }
     }
-    pat = next_arg(&rest);
-    file = next_arg(&rest);
-    if (!pat || !file || next_arg(&rest)) {
+    if (!pat) {
         print_status("grep", -E_INVAL);
         return;
     }
-    plen = strlen(pat);
-    if (plen == 0 || plen > 64) {
-        print_status("grep", -E_INVAL);
+    o.show_name = nfiles > 1 || recursive;
+    if (nfiles == 0) {
+        int r = grep_stream(0, "(standard input)", pat, strlen(pat), &o);
+
+        if (r < 0) {
+            print_status("grep", r);
+        }
         return;
     }
-    resolve(file, path);
-    if (recursive) {
-        r = grep_tree(path, pat, plen, 0);
-    } else {
-        r = grep_file(path, pat, plen, 0);
-    }
-    if (r < 0) {
-        print_status("grep", r);
+    for (int i = 0; i < nfiles; ++i) {
+        char path[PATH_MAX];
+        int r;
+
+        resolve(files[i], path);
+        r = grep_path(path, pat, strlen(pat), &o, recursive, 0);
+        if (r < 0) {
+            print_status(files[i], r);
+        }
     }
 }
+
 
 static void cmd_stat(const char *rest)
 {
@@ -1339,8 +1466,8 @@ static void cmd_cut(char *rest)
                 return;
             }
             delim = darg[0];
-        } else if (tok[1] == 'f' && tok[2] == '\0') {
-            char *list = next_arg(&rest);
+        } else if (tok[1] == 'f') {
+            char *list = tok[2] != '\0' ? tok + 2 : next_arg(&rest);
 
             if (!list) {
                 print_status("cut", -E_INVAL);
@@ -1765,9 +1892,8 @@ static void cmd_tee(char *rest)
 
 static void cmd_clear(void)
 {
-    /* No ANSI parser in the VGA console: scroll with newlines, which works
-     * on serial and VGA alike. */
-    for (int i = 0; i < 30; ++i) {
+    /* The kernel clears VGA and sends the ANSI sequence to the serial terminal. */
+    if (console_clear() < 0) {
         puts("\n");
     }
 }
@@ -1930,6 +2056,239 @@ static void cmd_lsblk(void)
 }
 
 /* ps: live process snapshot (SYS_PS). Zombies show as Z: reaped by wait. */
+/* ---- text filters that need the whole input: sort, tac, nl ---------------- */
+
+#define SLURP_MAX 65536u
+#define MAX_LINES 4096u
+
+static char slurp_buf[SLURP_MAX + 1u];
+static char *line_ptr[MAX_LINES];
+
+/* Read every FILE (or stdin when there are none) into slurp_buf, split it into
+ * lines in place and return the line count. Returns a negative errno when an
+ * input cannot be read or does not fit (64 KiB / 4096 lines). */
+static int slurp_lines(char **files, int nfiles)
+{
+    size_t len = 0;
+    int lines = 0;
+    int truncated = 0;
+
+    for (int i = 0; i < (nfiles ? nfiles : 1); ++i) {
+        int fd = 0;
+        ssize_t r;
+
+        if (nfiles) {
+            char path[PATH_MAX];
+
+            resolve(files[i], path);
+            fd = open(path, 0);
+            if (fd < 0) {
+                print_status(files[i], fd);
+                return fd;
+            }
+        }
+        while ((r = read(fd, slurp_buf + len, SLURP_MAX - len)) > 0) {
+            len += (size_t)r;
+            if (len == SLURP_MAX) {
+                char probe;
+
+                if (read(fd, &probe, 1) > 0) {
+                    truncated = 1;
+                }
+                break;
+            }
+        }
+        if (nfiles) {
+            close(fd);
+        }
+        if (r < 0) {
+            return (int)r;
+        }
+        if (truncated) {
+            return -E_NOSPC;
+        }
+        if (len > 0 && slurp_buf[len - 1] != '\n' && len < SLURP_MAX) {
+            slurp_buf[len++] = '\n'; /* a file's last line may lack its newline */
+        }
+    }
+    slurp_buf[len] = '\0';
+    for (size_t i = 0; i < len;) {
+        size_t start = i;
+
+        while (i < len && slurp_buf[i] != '\n') {
+            ++i;
+        }
+        slurp_buf[i] = '\0';
+        if (lines >= (int)MAX_LINES) {
+            return -E_NOSPC;
+        }
+        line_ptr[lines++] = slurp_buf + start;
+        ++i;
+    }
+    return lines;
+}
+
+/* Leading integer of a line for `sort -n` (blanks skipped; no digits sorts as 0). */
+static long leading_number(const char *t)
+{
+    long v = 0;
+    int neg = 0;
+
+    while (*t == ' ' || *t == '\t') {
+        ++t;
+    }
+    if (*t == '-') {
+        neg = 1;
+        ++t;
+    }
+    while (*t >= '0' && *t <= '9') {
+        v = v * 10 + (*t - '0');
+        ++t;
+        if (v > 1000000000000000L) {
+            break;
+        }
+    }
+    return neg ? -v : v;
+}
+
+static int sort_less(const char *a, const char *b, int numeric)
+{
+    if (numeric) {
+        long x = leading_number(a);
+        long y = leading_number(b);
+
+        if (x != y) {
+            return x < y;
+        }
+    }
+    return strcmp(a, b) < 0;
+}
+
+static void cmd_sort(char *rest)
+{
+    int reverse = 0, numeric = 0, unique = 0;
+    char *files[16];
+    int nfiles = 0;
+    int n;
+    char *arg;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            for (const char *f = arg + 1; *f; ++f) {
+                if (*f == 'r') reverse = 1;
+                else if (*f == 'n') numeric = 1;
+                else if (*f == 'u') unique = 1;
+                else {
+                    print_status("sort", -E_INVAL);
+                    return;
+                }
+            }
+        } else if (nfiles < 16) {
+            files[nfiles++] = arg;
+        } else {
+            print_status("sort", -E_INVAL);
+            return;
+        }
+    }
+    n = slurp_lines(files, nfiles);
+    if (n < 0) {
+        print_status("sort", n);
+        return;
+    }
+    /* Shell sort: simple, in place, and O(n^1.3) is plenty for 4096 lines. */
+    for (int gap = n / 2; gap > 0; gap /= 2) {
+        for (int i = gap; i < n; ++i) {
+            char *tmp = line_ptr[i];
+            int j = i;
+
+            while (j >= gap && sort_less(tmp, line_ptr[j - gap], numeric)) {
+                line_ptr[j] = line_ptr[j - gap];
+                j -= gap;
+            }
+            line_ptr[j] = tmp;
+        }
+    }
+    for (int k = 0; k < n; ++k) {
+        int i = reverse ? n - 1 - k : k;
+        int prev = reverse ? i + 1 : i - 1;
+
+        if (unique && k > 0 && strcmp(line_ptr[i], line_ptr[prev]) == 0) {
+            continue;
+        }
+        puts(line_ptr[i]);
+        puts("\n");
+    }
+}
+
+static void cmd_tac(char *rest)
+{
+    char *files[16];
+    int nfiles = 0;
+    int n;
+    char *arg;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (nfiles < 16) {
+            files[nfiles++] = arg;
+        }
+    }
+    n = slurp_lines(files, nfiles);
+    if (n < 0) {
+        print_status("tac", n);
+        return;
+    }
+    for (int i = n - 1; i >= 0; --i) {
+        puts(line_ptr[i]);
+        puts("\n");
+    }
+}
+
+static void cmd_nl(char *rest)
+{
+    char *files[16];
+    int nfiles = 0;
+    int n;
+    char *arg;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (nfiles < 16) {
+            files[nfiles++] = arg;
+        }
+    }
+    n = slurp_lines(files, nfiles);
+    if (n < 0) {
+        print_status("nl", n);
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        put_u64_pad((u64)i + 1u, 6);
+        puts("\t");
+        puts(line_ptr[i]);
+        puts("\n");
+    }
+}
+
+static void put_int_pad(long v, int width)
+{
+    char num[24];
+    int n = 0;
+    u64 m = v < 0 ? (u64)-v : (u64)v;
+
+    do {
+        num[n++] = (char)('0' + m % 10);
+        m /= 10;
+    } while (m != 0);
+    if (v < 0) {
+        num[n++] = '-';
+    }
+    for (int pad = width - n; pad > 0; --pad) {
+        puts(" ");
+    }
+    while (n > 0) {
+        write(1, &num[--n], 1);
+    }
+}
+
 static void cmd_ps(void)
 {
     struct ps_entry list[32];
@@ -1940,16 +2299,14 @@ static void cmd_ps(void)
         print_status("ps", n);
         return;
     }
-    puts("  PID  PPID UID S NAME\n");
+    puts("  PID  PPID   UID S NAME\n");
     for (i = 0; i < n; ++i) {
+        put_int_pad(list[i].pid, 5);
         puts(" ");
-        put_int(list[i].pid);
+        put_int_pad(list[i].parent, 5);
         puts(" ");
-        put_int(list[i].parent);
-        puts(" ");
-        put_u64(list[i].uid);
-        puts(" ");
-        puts(list[i].state ? "Z " : "R ");
+        put_int_pad((long)list[i].uid, 5);
+        puts(list[i].state ? " Z " : " R ");
         puts(list[i].name);
         puts("\n");
     }
@@ -2501,13 +2858,133 @@ static void cmd_hostname(char *rest)
     }
 }
 
-static void cmd_date(void)
-{
-    u64 s = uptime_ms() / 1000;
+static const char *const weekday_names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+static const char *const month_names[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-    puts("up ");
-    put_u64(s);
-    puts(" seconds since boot (no RTC)\n");
+static void put_2digits(u32 v)
+{
+    char d[2] = {(char)('0' + (v / 10) % 10), (char)('0' + v % 10)};
+
+    write(1, d, 2);
+}
+
+/* Parse "YYYY-MM-DD HH:MM:SS" (or with 'T'). Returns 0 and fills `c`, or -1. */
+static int parse_datetime(const char *t, struct axys_civil *c)
+{
+    u32 v[6];
+    int idx = 0;
+
+    for (int field = 0; field < 6; ++field) {
+        u32 n = 0;
+        int digits = 0;
+
+        while (*t >= '0' && *t <= '9' && digits < 5) {
+            n = n * 10 + (u32)(*t - '0');
+            ++t;
+            ++digits;
+        }
+        if (digits == 0) {
+            return -1;
+        }
+        v[idx++] = n;
+        if (field < 5) {
+            char sep = field == 0 || field == 1 ? '-' : (field == 2 ? ' ' : ':');
+
+            if (*t == sep || (field == 2 && *t == 'T')) {
+                ++t;
+            } else {
+                return -1;
+            }
+        }
+    }
+    if (*t != '\0') {
+        return -1;
+    }
+    c->year = v[0];
+    c->month = v[1];
+    c->day = v[2];
+    c->hour = v[3];
+    c->minute = v[4];
+    c->second = v[5];
+    c->weekday = 0;
+    return 0;
+}
+
+/* date [+FORMAT | -s "YYYY-MM-DD HH:MM:SS"]. UTC. FORMAT understands
+ * %Y %m %d %H %M %S %s %a %b %F %T %% (anything else is printed as is). */
+static void cmd_date(char *rest)
+{
+    char *arg = next_arg(&rest);
+    long now;
+    struct axys_civil c;
+
+    if (arg && strcmp(arg, "-s") == 0) {
+        char *when = next_arg(&rest);
+        struct axys_civil want;
+        long secs;
+        int r;
+
+        if (!when || parse_datetime(when, &want) != 0 || (secs = (long)axys_unix_from_civil(&want)) < 0) {
+            print_status("date", -E_INVAL);
+            return;
+        }
+        r = settime((u64)secs);
+        if (r < 0) {
+            print_status("date", r);
+        }
+        return;
+    }
+    now = time_unix();
+    if (now < 0) {
+        print_status("date", (int)now);
+        return;
+    }
+    axys_civil_from_unix(now, &c);
+    if (arg && arg[0] == '+') {
+        for (const char *f = arg + 1; *f; ++f) {
+            if (*f != '%' || f[1] == '\0') {
+                write(1, f, 1);
+                continue;
+            }
+            ++f;
+            switch (*f) {
+            case 'Y': put_u64(c.year); break;
+            case 'm': put_2digits(c.month); break;
+            case 'd': put_2digits(c.day); break;
+            case 'H': put_2digits(c.hour); break;
+            case 'M': put_2digits(c.minute); break;
+            case 'S': put_2digits(c.second); break;
+            case 's': put_u64((u64)now); break;
+            case 'a': puts(weekday_names[c.weekday % 7]); break;
+            case 'b': puts(month_names[(c.month - 1) % 12]); break;
+            case 'F': put_u64(c.year); puts("-"); put_2digits(c.month); puts("-"); put_2digits(c.day); break;
+            case 'T': put_2digits(c.hour); puts(":"); put_2digits(c.minute); puts(":"); put_2digits(c.second); break;
+            case '%': puts("%"); break;
+            default: write(1, f - 1, 2); break;
+            }
+        }
+        puts("\n");
+        return;
+    }
+    if (arg) {
+        print_status("date", -E_INVAL);
+        return;
+    }
+    puts(weekday_names[c.weekday % 7]);
+    puts(" ");
+    puts(month_names[(c.month - 1) % 12]);
+    puts(" ");
+    put_2digits(c.day);
+    puts(" ");
+    put_2digits(c.hour);
+    puts(":");
+    put_2digits(c.minute);
+    puts(":");
+    put_2digits(c.second);
+    puts(" UTC ");
+    put_u64(c.year);
+    puts("\n");
 }
 
 static void cmd_kill(char *rest)
@@ -2536,11 +3013,13 @@ static void cmd_kill(char *rest)
 static void help_cmd(const char *c)
 {
     if (strcmp(c, "ls") == 0) {
-        puts("ls [-R] [PATH...]: list directories\n");
+        puts("ls [-l] [-R] [PATH...]: names of a directory (-l: mode, uid, gid, size; -R: recurse);\n"
+             "  a file argument lists that file; several paths get a header each\n");
     } else if (strcmp(c, "cat") == 0) {
-        puts("cat [-n] FILE...: print files\n");
+        puts("cat [-n] [FILE...]: print files (-n numbers lines); no FILE copies standard input\n");
     } else if (strcmp(c, "echo") == 0) {
-        puts("echo [-n] TEXT [> FILE | >> FILE]: print or write text\n");
+        puts("echo [-n] [WORD...]: print the words separated by spaces (-n: no newline).\n"
+             "  Redirect with > or >> like any command; quote to keep spaces: echo \"a  b\"\n");
     } else if (strcmp(c, "mkdir") == 0) {
         puts("mkdir PATH...: create directories, parents as needed\n");
     } else if (strcmp(c, "rm") == 0) {
@@ -2554,14 +3033,16 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "cp") == 0) {
         puts("cp [-r] SRC DST: copy a file, or a tree with -r\n");
     } else if (strcmp(c, "head") == 0) {
-        puts("head [-N | -n N] FILE: first N lines (default 10)\n");
+        puts("head [-N | -n N] [FILE]: first N lines (default 10); no FILE reads standard input\n");
     } else if (strcmp(c, "tail") == 0) {
-        puts("tail [-N | -n N] FILE: last N lines (default 10)\n");
+        puts("tail [-N | -n N] [FILE]: last N lines (default 10); no FILE reads standard input\n");
     } else if (strcmp(c, "wc") == 0) {
-        puts("wc FILE: lines, words and bytes\n");
+        puts("wc [-l] [-w] [-c] [FILE...]: lines, words and bytes; no FILE reads standard input;\n"
+             "  several files add a total line\n");
     } else if (strcmp(c, "grep") == 0) {
-        puts("grep [-r] PATTERN FILE: lines containing PATTERN (substring,\n"
-             "  not regex; patterns up to 64 bytes; -r walks a tree)\n");
+        puts("grep [-i] [-n] [-v] [-c] [-r] PATTERN [FILE...]: lines containing PATTERN (a plain\n"
+             "  substring, not a regex). -i ignore case, -n line numbers, -v invert, -c count,\n"
+             "  -r walk directories. No FILE reads standard input.\n");
     } else if (strcmp(c, "stat") == 0) {
         puts("stat PATH: type, size, mode, owner\n");
     } else if (strcmp(c, "du") == 0) {
@@ -2599,7 +3080,7 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "tee") == 0) {
         puts("tee [-a] FILE: stdin to file and stdout (-a appends)\n");
     } else if (strcmp(c, "clear") == 0) {
-        puts("clear: scroll the screen (no ANSI parser in VGA)\n");
+        puts("clear: clear the screen (VGA and serial terminal)\n");
     } else if (strcmp(c, "meminfo") == 0) {
         puts("meminfo: raw kernel allocator counters\n");
     } else if (strcmp(c, "free") == 0) {
@@ -2615,7 +3096,9 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "uptime") == 0) {
         puts("uptime: seconds since boot\n");
     } else if (strcmp(c, "date") == 0) {
-        puts("date: uptime (there is no real-time clock yet)\n");
+        puts("date [+FORMAT | -s \"YYYY-MM-DD HH:MM:SS\"]: current UTC date and time from the RTC.\n"
+             "  FORMAT: %Y %m %d %H %M %S %s %a %b %F %T %%. -s (root) sets a software offset\n"
+             "  that lasts until reboot; the hardware clock is not written.\n");
     } else if (strcmp(c, "random") == 0) {
         puts("random: 64 bits from the kernel RNG\n");
     } else if (strcmp(c, "pid") == 0) {
@@ -2657,6 +3140,12 @@ static void help_cmd(const char *c)
         puts("df [-h] [PATH]: system disk backend and capacity (/proc/disk)\n");
     } else if (strcmp(c, "ip") == 0 || strcmp(c, "ifconfig") == 0) {
         puts("ip [addr|link]: live NIC state from the e1000 driver\n");
+    } else if (strcmp(c, "sort") == 0) {
+        puts("usage: sort [-r] [-n] [-u] [FILE...]   (no FILE: standard input; up to 64 KiB / 4096 lines)\n");
+    } else if (strcmp(c, "tac") == 0) {
+        puts("usage: tac [FILE...]   (lines in reverse order)\n");
+    } else if (strcmp(c, "nl") == 0) {
+        puts("usage: nl [FILE...]   (numbers every line)\n");
     } else if (strcmp(c, "help") == 0) {
         puts("help [CMD]: this list, or usage for CMD\n");
     } else {
@@ -2666,24 +3155,136 @@ static void help_cmd(const char *c)
     }
 }
 
+static void help_cmd(const char *c);
+
+struct help_entry {
+    const char *name;
+    const char *summary;
+    int category;
+};
+
+static const char *const help_categories[] = {"Files and directories", "Text and data", "System and users",
+                                              "Processes and hardware", "Programs in /bin"};
+
+static const struct help_entry help_table[] = {
+    {"ls", "list a directory (-l long format, -R recursive)", 0},
+    {"cd", "change the working directory", 0},
+    {"pwd", "print the working directory", 0},
+    {"mkdir", "create a directory", 0},
+    {"touch", "create an empty file", 0},
+    {"cp", "copy a file", 0},
+    {"mv", "move or rename", 0},
+    {"rm", "remove a file or an empty directory", 0},
+    {"rmtree", "remove a directory and everything in it", 0},
+    {"stat", "show type, mode, owner and size", 0},
+    {"du", "disk usage of a tree", 0},
+    {"find", "search a tree for names", 0},
+    {"basename", "strip the directory from a path", 0},
+    {"dirname", "strip the last path component", 0},
+    {"tee", "copy input to a file and to the screen", 0},
+    {"cat", "print files, or standard input (-n numbers lines)", 1},
+    {"echo", "print arguments (-n: no newline)", 1},
+    {"head", "first lines of a file or input", 1},
+    {"tail", "last lines of a file or input", 1},
+    {"wc", "count lines, words and bytes (-l -w -c)", 1},
+    {"grep", "lines containing text (-i -n -v -c -r)", 1},
+    {"cut", "select fields or characters from lines", 1},
+    {"sort", "sort lines (-r reverse, -n numeric, -u unique)", 1},
+    {"uniq", "collapse repeated adjacent lines", 1},
+    {"tac", "print lines in reverse order", 1},
+    {"nl", "number lines", 1},
+    {"tr", "translate or delete characters", 1},
+    {"strings", "printable strings found in a file", 1},
+    {"hexdump", "bytes of a file in hex", 1},
+    {"cmp", "compare two files byte by byte", 1},
+    {"seq", "print a sequence of numbers", 1},
+    {"clear", "clear the screen", 2},
+    {"date", "show or set the date and time (UTC)", 2},
+    {"uptime", "time since boot", 2},
+    {"uname", "kernel name and version", 2},
+    {"hostname", "show the host name", 2},
+    {"whoami", "current user name", 2},
+    {"id", "user and group ids", 2},
+    {"su", "switch to another user id (root only)", 2},
+    {"chmod", "change file permissions", 2},
+    {"chown", "change file owner (root only)", 2},
+    {"sync", "write the file system to disk", 2},
+    {"sleep", "wait for some seconds", 2},
+    {"time", "run a command and report how long it took", 2},
+    {"which", "locate a command", 2},
+    {"random", "random numbers from the kernel generator", 2},
+    {"run", "run a program by path", 2},
+    {"poweroff", "power the machine off", 2},
+    {"halt", "stop the machine", 2},
+    {"reboot", "restart the machine", 2},
+    {"exit", "leave the shell", 2},
+    {"help", "this list; `help CMD` for details", 2},
+    {"ps", "list processes", 3},
+    {"kill", "terminate a process by pid", 3},
+    {"pid", "pid of this shell", 3},
+    {"meminfo", "physical memory, kernel heap and file-system nodes", 3},
+    {"free", "memory in use and free", 3},
+    {"df", "file-system and disk usage", 3},
+    {"dmesg", "kernel messages since boot", 3},
+    {"lscpu", "processor information", 3},
+    {"lsblk", "block devices", 3},
+    {"lspci", "PCI devices", 3},
+    {"lsusb", "USB controller and devices", 3},
+    {"sysinfo", "summary of the whole system", 3},
+    {"ip", "network address, link and counters", 3},
+    {"ifconfig", "same as ip", 3},
+    {"hello", "demo program in ring 3", 4},
+    {"crash", "deliberate faults (tests exception handling)", 4},
+    {"heap", "user heap test", 4},
+    {"fileio", "file API self-test", 4},
+    {"perms", "permission checks self-test", 4},
+    {"probe", "system call self-test", 4},
+    {"fuzz", "in-guest syscall fuzzer", 4},
+    {"ping", "ICMP echo to an IPv4 address (root)", 4},
+    {"dhcp", "obtain an IPv4 lease (root)", 4},
+};
+
+#define HELP_COUNT ((int)(sizeof(help_table) / sizeof(help_table[0])))
+
 static void help(void)
 {
-    puts("axys shell: embedded-linux builtins plus /bin programs.\n"
-         "`help <cmd>` prints usage. Paths may be absolute or relative;\n"
-         "separate commands with ';' (no quoting, no pipes yet).\n"
-         "files & dirs:\n"
-         "  ls cat echo mkdir rm mv rmtree touch cp head tail wc grep\n"
-         "  stat du find cut uniq tr strings hexdump cmp basename dirname\n"
-         "  pwd cd tee clear\n"
-         "system & users:\n"
-         "  meminfo free uptime date random pid id su chmod chown sync\n"
-         "  sleep kill hostname uname whoami which seq time run poweroff\n"
-         "  halt reboot exit\n"
-         "processes & drivers (live kernel data; /bin has ping, dhcp):\n"
-         "  ps dmesg lscpu lsblk lspci lsusb sysinfo df ip ifconfig\n"
-         "/bin programs run by name: hello crash heap fileio perms probe\n"
-         "  fuzz ping dhcp\n"
-         "not here yet (no kernel support): mount ln tar vi top\n");
+    puts("axys shell. Type `help CMD` for the usage of one command.\n"
+         "Quote words with '...' or \"...\"; join commands with ';' or '|' (a pipe);\n"
+         "redirect with '<', '>' and '>>'. Output of any command can be redirected.\n");
+    for (int cat = 0; cat < 5; ++cat) {
+        puts("\n");
+        puts(help_categories[cat]);
+        puts("\n");
+        for (int i = 0; i < HELP_COUNT; ++i) {
+            size_t n;
+
+            if (help_table[i].category != cat) {
+                continue;
+            }
+            puts("  ");
+            puts(help_table[i].name);
+            for (n = strlen(help_table[i].name); n < 10; ++n) {
+                puts(" ");
+            }
+            puts(help_table[i].summary);
+            puts("\n");
+        }
+    }
+}
+
+/* One command: its summary line, then the detailed usage. */
+static void help_one(const char *name)
+{
+    for (int i = 0; i < HELP_COUNT; ++i) {
+        if (strcmp(help_table[i].name, name) == 0) {
+            puts(name);
+            puts(" - ");
+            puts(help_table[i].summary);
+            puts("\n");
+            break;
+        }
+    }
+    help_cmd(name);
 }
 
 /* Run one command line; several may ride separated by ';' (there is no
@@ -2718,10 +3319,16 @@ static int run_line(char *line)
             } else {
                 char *what = next_arg(&rest);
 
-                help_cmd(what ? what : "");
+                help_one(what ? what : "");
             }
         } else if (strcmp(cmd, "ls") == 0) {
             cmd_ls(rest);
+        } else if (strcmp(cmd, "sort") == 0) {
+            cmd_sort(rest);
+        } else if (strcmp(cmd, "tac") == 0) {
+            cmd_tac(rest);
+        } else if (strcmp(cmd, "nl") == 0) {
+            cmd_nl(rest);
         } else if (strcmp(cmd, "cat") == 0) {
             cmd_cat(rest);
         } else if (strcmp(cmd, "echo") == 0) {
@@ -2846,7 +3453,7 @@ static int run_line(char *line)
             put_u64((ms % 1000) / 100);
             puts(" s\n");
         } else if (strcmp(cmd, "date") == 0) {
-            cmd_date();
+            cmd_date(rest);
         } else if (strcmp(cmd, "random") == 0) {
             u8 r[8];
             u64 v = 0;
@@ -3061,6 +3668,143 @@ static int run_line(char *line)
     return 0;
 }
 
+/* ---- command lines: quoting, `;`, `|`, `<`, `>`, `>>` ---------------------- */
+
+#define MAX_STAGES 8
+
+/* One command line without `;`: stages joined by `|`. A pipe is a temporary
+ * file in /tmp: stage i writes it, stage i+1 reads it, stages run one after
+ * another. Redirection is dup2() on this shell's own fd 0/1, so builtins and
+ * the programs they spawn (which inherit fd 0-2) behave the same. */
+static int run_pipeline(char *seg)
+{
+    char *stage[MAX_STAGES];
+    char pipe_path[2][40];
+    int pipe_used[2] = {0, 0};
+    int count = 0;
+    int exit_shell = 0;
+    char *cur = seg;
+    int pid = getpid();
+
+    while (cur != 0 && count < MAX_STAGES) {
+        stage[count++] = cur;
+        cur = split_at(cur, '|');
+    }
+    if (cur != 0) {
+        eputs("syntax error: too many pipeline stages\n");
+        return 0;
+    }
+    for (int i = 0; i < 2; ++i) {
+        char *w = pipe_path[i];
+        const char *base = "/tmp/.pipe";
+        u64 v = (u64)pid;
+        char digits[20];
+        int nd = 0;
+
+        while (*base) {
+            *w++ = *base++;
+        }
+        do {
+            digits[nd++] = (char)('0' + v % 10);
+            v /= 10;
+        } while (v != 0);
+        while (nd > 0) {
+            *w++ = digits[--nd];
+        }
+        *w++ = '_';
+        *w++ = (char)('0' + i);
+        *w = '\0';
+    }
+    for (int i = 0; i < count && !exit_shell; ++i) {
+        char in_name[PATH_MAX];
+        char out_name[PATH_MAX];
+        char path[PATH_MAX];
+        int append = 0;
+        int in_fd = -1;
+        int out_fd = -1;
+        int saved_in = -1;
+        int saved_out = -1;
+        char *c;
+
+        if (extract_redirs(stage[i], in_name, out_name, sizeof(in_name), &append) != 0) {
+            eputs("syntax error near redirection\n");
+            break;
+        }
+        for (c = stage[i]; *c != '\0'; ++c) {
+        }
+        while (c > stage[i] && c[-1] == ' ') { /* the blanks left where a redirection was */
+            *--c = '\0';
+        }
+        for (c = stage[i]; *c == ' '; ++c) {
+        }
+        if (*c == '\0' && count > 1) {
+            eputs("syntax error: empty pipeline stage\n");
+            break;
+        }
+        if (in_name[0]) {
+            resolve(in_name, path);
+            in_fd = open(path, 0);
+            if (in_fd < 0) {
+                print_status(in_name, in_fd);
+                break;
+            }
+        } else if (i > 0) {
+            in_fd = open(pipe_path[(i - 1) & 1], 0);
+        }
+        if (out_name[0]) {
+            resolve(out_name, path);
+            out_fd = open(path, O_CREAT | O_WRONLY | O_APPEND | (append ? 0 : O_TRUNC));
+            if (out_fd < 0) {
+                print_status(out_name, out_fd);
+                if (in_fd >= 0) {
+                    close(in_fd);
+                }
+                break;
+            }
+        } else if (i < count - 1) {
+            out_fd = open(pipe_path[i & 1], O_CREAT | O_WRONLY | O_APPEND | O_TRUNC);
+            if (out_fd >= 0) {
+                pipe_used[i & 1] = 1;
+            } else {
+                print_status("pipe", out_fd);
+                if (in_fd >= 0) {
+                    close(in_fd);
+                }
+                break;
+            }
+        }
+        if (in_fd >= 0) {
+            saved_in = dup(0);
+            dup2(in_fd, 0);
+            close(in_fd);
+        }
+        if (out_fd >= 0) {
+            saved_out = dup(1);
+            dup2(out_fd, 1);
+            close(out_fd);
+        }
+        exit_shell = run_line(stage[i]);
+        if (saved_in >= 0) {
+            dup2(saved_in, 0);
+            close(saved_in);
+        }
+        if (saved_out >= 0) {
+            dup2(saved_out, 1);
+            close(saved_out);
+        }
+        if (i > 0 && pipe_used[(i - 1) & 1]) {
+            unlink(pipe_path[(i - 1) & 1]); /* consumed */
+            pipe_used[(i - 1) & 1] = 0;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (pipe_used[i]) {
+            unlink(pipe_path[i]);
+        }
+    }
+    return exit_shell;
+}
+
 int main(const char *args, size_t len)
 {
     char line[LINE_MAX];
@@ -3085,17 +3829,9 @@ int main(const char *args, size_t len)
         }
         seg = line;
         for (;;) {
-            char *next = seg;
+            char *next = split_at(seg, ';');
 
-            while (*next && *next != ';') {
-                ++next;
-            }
-            if (*next) {
-                *next++ = '\0';
-            } else {
-                next = 0;
-            }
-            if (run_line(seg)) {
+            if (run_pipeline(seg)) {
                 done = 1;
                 break;
             }

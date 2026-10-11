@@ -293,7 +293,10 @@ int axys_vprintf(const char *format, axys_va_list arguments)
     char buffer[512];
     int result = axys_vsnprintf(buffer, sizeof(buffer), format, arguments);
 
-    axys_console_write_len(buffer, (axys_size_t)(result < (int)sizeof(buffer) ? result : (int)sizeof(buffer) - 1));
+    axys_size_t length = (axys_size_t)(result < (int)sizeof(buffer) ? result : (int)sizeof(buffer) - 1);
+
+    axys_console_write_len(buffer, length);
+    axys_klog_append(buffer, length);
     return result;
 }
 

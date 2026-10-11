@@ -22,6 +22,9 @@ int axys_xhci_init(void);
 /* One-line summary of what was found, for the boot log. */
 const char *axys_xhci_summary(void);
 
+/* One line per live device (slot, port, VID:PID, class, speed, kind): /proc/usb. */
+axys_size_t axys_xhci_format(char *out, axys_size_t capacity);
+
 /* Keyboards currently delivering input. */
 int axys_xhci_keyboard_count(void);
 

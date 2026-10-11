@@ -46,6 +46,11 @@ enum axys_syscall_number {
     AXYS_SYS_NET_SET_ADDR = 33, /* net_set_addr(&ip[4]) - our IPv4, root only */
     AXYS_SYS_PS = 34,         /* ps(buf, cap) - process snapshot, returns entries */
     AXYS_SYS_DMESG = 35,       /* dmesg(buf, cap) - oldest bytes of the console log */
+    AXYS_SYS_DUP = 36,         /* dup(fd) - copy a descriptor to the lowest free slot */
+    AXYS_SYS_DUP2 = 37,        /* dup2(old, new) - make `new` a copy of `old` (redirection) */
+    AXYS_SYS_TIME = 38,        /* time() - seconds since 1970 from the RTC, -ENODEV without one */
+    AXYS_SYS_SETTIME = 39,     /* settime(seconds) - root only, software offset until reboot */
+    AXYS_SYS_CONSOLE = 40,     /* console(op) - 0: clear screen and home the cursor */
     AXYS_SYS_COUNT
 };
 

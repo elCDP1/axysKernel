@@ -14,7 +14,9 @@
 #include "axys/persist.h"
 #include "axys/path.h"
 #include "axys/process.h"
+#include "axys/procfs.h"
 #include "axys/random.h"
+#include "axys/rtc.h"
 #include "axys/sched.h"
 #include "axys/string.h"
 #include "axys/vfs.h"
@@ -403,6 +405,12 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     }
     if ((flags & (AXYS_O_TRUNC | AXYS_O_APPEND)) && !writable) {
         return err(AXYS_EINVAL);
+    }
+    if (!writable) {
+        /* /proc files are regenerated from live kernel state as they are
+         * opened, before any critical section below: they can take a moment
+         * (formatting, device queries) and must not run with interrupts off. */
+        axys_procfs_refresh(path);
     }
     /* Reserve the descriptor slot before any creation: creating the file and
      * only then discovering a full table used to return EMFILE while leaving
@@ -988,6 +996,50 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         axys_net_set_addr(ip);
         return 0;
     }
+    case AXYS_SYS_DUP: {
+        /* Copy descriptor a0 into the lowest free slot above the standard
+         * streams. The copy has its own file offset. */
+        if (fd_get(proc, a0) == AXYS_NULL) {
+            return err(AXYS_EBADF);
+        }
+        for (axys_uint64_t i = 3; i < AXYS_MAX_FDS; ++i) {
+            if (!proc->fds[i].used) {
+                proc->fds[i] = proc->fds[a0];
+                return (axys_int64_t)i;
+            }
+        }
+        return err(AXYS_EMFILE);
+    }
+    case AXYS_SYS_DUP2: {
+        /* Make a1 a copy of a0: how the shell redirects stdin/stdout, which
+         * children inherit across spawn. */
+        if (a1 >= AXYS_MAX_FDS || fd_get(proc, a0) == AXYS_NULL) {
+            return err(AXYS_EBADF);
+        }
+        if (a0 != a1) {
+            proc->fds[a1] = proc->fds[a0];
+        }
+        return (axys_int64_t)a1;
+    }
+    case AXYS_SYS_TIME: {
+        axys_int64_t now = axys_time_now();
+
+        return now < 0 ? err(AXYS_ENODEV) : now;
+    }
+    case AXYS_SYS_SETTIME:
+        if (proc->uid != 0) {
+            return err(AXYS_EPERM);
+        }
+        if (a0 > 0x7fffffffffffull) {
+            return err(AXYS_EINVAL);
+        }
+        return axys_time_set((axys_int64_t)a0) == 0 ? 0 : err(AXYS_ENODEV);
+    case AXYS_SYS_CONSOLE:
+        if (a0 != 0) {
+            return err(AXYS_EINVAL);
+        }
+        axys_console_clear();
+        return 0;
     case AXYS_SYS_PS: {
         /* Process snapshot for `ps`: up to 32 fixed-size entries. A NULL
          * buffer only queries how many entries exist right now. */

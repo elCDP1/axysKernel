@@ -14,7 +14,7 @@ the kernel has a functional driver for it.
 | Display | VGA text console; bootloader framebuffer metadata is parsed and reserved | No framebuffer console: GRUB's multiboot2 loader hands over an EGA-text framebuffer tag even with `gfxpayload=keep`, so a console would need a bootloader change or kernel-side VBE modesetting. No Intel/AMD/NVIDIA GPU driver |
 | USB | xHCI host controller (PCI 0c/03/0x30, polled command/event rings, port reset, full/low/high-speed address/configure); USB hubs with route-string routing up to 5 levels deep; boot keyboards (HID); bulk-only mass storage (512-byte sectors, READ/WRITE(10), TEST UNIT READY) usable as the system disk; /proc/pci, /proc/usb, /proc/disk, /proc/net, /proc/acpi, /proc/version inventories; `make check-usb`, `check-usb-hub`, `check-usb-storage`, `check-usb-storage-hub` | Polled only (no event-interrupt path), no isochronous endpoints, no HID beyond boot keyboards, no SCSI pass-through or multiple LUNs; devices are removed and re-enumerated at run time (root ports every 8 ms, hub ports on a ~2 s scan, nothing above 5 levels deep) but a mass-storage disk is adopted only at boot: if it is pulled, I/O fails with ENODEV and a replacement is not attached; no UHCI/OHCI/EHCI |
 | Keyboard | PS/2 set-1 through i8042; USB HID boot keyboards through xHCI polling, directly or behind hubs; serial input | Native USB host controllers other than xHCI are absent; USB HID mice and non-boot HID reports are not supported |
-| Shell | Busybox-style builtins (files incl. `cut`/`uniq`/`tr`/`strings`/`hexdump`/`cmp`, users, `ps`/`dmesg`/`lscpu`/`lsblk`/`lspci`/`lsusb`/`sysinfo`/`df`/`ip` over live kernel state, `help <cmd>`, `;` chaining, multi-path args, `cp -r`, `chmod -R`), relative paths with `cd`/`pwd`, /bin programs (ping, dhcp, probe, ...) | No pipes, quoting, symlinks, `mount`, `ln`, `tar`, `vi`, `top` |
+| Shell | 75 commands (builtins and /bin programs) with `help` by category, quoting, `;`, `|`, `<`, `>`, `>>` for builtins and programs (fd 0/1 are `dup2()`ed and inherited by `spawn`), text filters reading stdin (`grep -i -n -v -c -r`, `sort`, `wc`, `cut`, `uniq`, `tac`, `nl`, ...), CMOS RTC `date`, real `clear`, kernel-log `dmesg`, live `/proc` files, relative paths with `cd`/`pwd`, /bin programs (ping, dhcp, probe, ...) | No `&&`/`||`, variables, globbing, background jobs, symlinks, `mount`, `ln`, `tar`, `vi`, `top`; pipes are temporary files, so stages run sequentially |
 | Storage | PCI NVMe polling (first controller, namespace 1, 512-byte LBAs, one outstanding command); primary-channel ATA PIO (LBA28); PCI AHCI polling; USB BOT mass storage; QEMU tests for NVMe/AHCI/IDE/USB persistence across two boots | No secondary ATA channel, DMA for ATA PIO, NCQ, interrupt-driven queues, USB device removal, other NVMe namespaces/controllers, or RAID |
 | Network | Intel 82540EM-compatible PCI Ethernet, polled (TX/RX rings, link detection, factory MAC); ARP + ICMP echo in /bin/ping and DHCPv4 (DISCOVER/OFFER/REQUEST/ACK, option 3 router) in /bin/dhcp over QEMU user-network defaults; `make check-net` leases 10.0.2.15 and pings the gateway | Raw Ethernet in user space only: no kernel socket layer, TCP/UDP, IPv6, DNS, Wi-Fi, VLANs, or other NIC models (virtio-net included) |
 | Audio | None | No HDA, AC'97, USB audio, or audio stack |
@@ -180,6 +180,29 @@ bursts, 20 hot-plug cycles, fuzzing with live USB devices) found and fixed:
   address checks. `NET_SET_ADDR` already was.
 - `xhci-dbg` traces printed on every event were removed.
 
+## Audit notes: shell and system interface (2026-10-08)
+
+- `dmesg` retained all console output in 4 KiB, so after a few shell commands the
+  boot messages were gone. It now keeps a 32 KiB log fed only by the kernel's own
+  `axys_printf`, separate from what user programs write.
+- `/proc/usb`, `/proc/net` and `/proc/disk` were boot snapshots presented as live
+  data. `kernel/procfs.c` regenerates each file just before it is opened.
+  `/proc/usb` now lists every device (slot, port, VID:PID, class, speed, kind).
+- `date` printed uptime ("no RTC"). `kernel/rtc.c` reads the CMOS clock (waits out
+  the update-in-progress flag, requires two identical snapshots, decodes BCD,
+  12-hour and century registers) over `lib/timeconv.c`, which the shell links as
+  well. `tests/test_time.c` round-trips every day from 1970 to 2200 and decodes
+  absent/garbage RTC values.
+- `clear` only scrolled; a `CONSOLE` syscall now clears VGA and the serial terminal.
+- `ls a b c` skipped the second path (the loop that counted arguments consumed
+  them); `ls` now has `-l`/`-R`, accepts files, and names the failing path.
+- Redirection and pipes: new `DUP`/`DUP2` syscalls plus inheritance of fd 0-2 by
+  `spawn` give every command, builtin or program, `<`, `>`, `>>` and `|`.
+  `tests/test_shparse.c` fuzzes the quoting/redirection parser in exactly-sized
+  buffers under ASan, and `user/fuzz.c` gained a redirect/clock/console phase (it
+  fails if child inheritance is disabled).
+- `NET_SEND`/`NET_RECV` were already root-only; `SETTIME` follows the same rule.
+
 ## Verification
 
 Run here, on this tree: `make test` (host units: PCI, USB HID, USB descriptors,
@@ -187,7 +210,7 @@ heap, VFS, persistence, paths), `make fuzz` (ASan/UBSan; 7 seeds x 20000),
 `make check`, `check-ahci`, `check-nvme`, `check-fuzz` (7 seeds x 6000, also
 with an xHCI keyboard and USB disk attached), `check-usb` and `check-usb-hub`
 (400 keys at 25 keys/s each), `check-usb-hotplug`, `check-usb-storage`,
-`check-usb-storage-hub`, `check-pci` and `check-net`. `check-highmem` needs a
+`check-usb-storage-hub`, `check-pci`, `check-shell` and `check-net`. `check-highmem` needs a
 host that can give QEMU 5 GiB and was not run in the 4 GiB environment used for
 this review.
 

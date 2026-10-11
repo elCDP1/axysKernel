@@ -24,6 +24,7 @@ make check-usb-storage
 make check-usb-storage-hub
 make check-usb-hotplug
 make check-pci
+make check-shell      # drives the shell over serial: ~80 command cases
 make check-net
 make check-drivers   # every driver scenario above in one run
 make fuzz            # ASan/UBSan host fuzzing (FUZZ_SEED, FUZZ_ITERS)
@@ -90,35 +91,49 @@ format and compiler constraints.
 
 ## Shell
 
-`/sbin/init` is an interactive shell with embedded-linux builtins plus
-`/bin` programs; `help <cmd>` prints usage inside the guest. Paths may be
-absolute or relative to the working directory (`cd`, `pwd`).
+`/sbin/init` is an interactive shell with embedded Linux-style builtins plus
+`/bin` programs. `help` lists every command by category with a one-line
+description; `help <cmd>` prints its usage. Paths may be absolute or relative to
+the working directory (`cd`, `pwd`).
 
 ```text
-files & dirs:  ls cat echo mkdir rm mv rmtree touch cp head tail wc grep
-               stat du find cut uniq tr strings hexdump cmp basename dirname
-               pwd cd tee clear
-system & users: meminfo free uptime date random pid id su chmod chown sync
-               sleep kill hostname uname whoami which seq time run poweroff
-               halt shutdown reboot exit
-processes & drivers: ps dmesg lscpu lsblk lspci lsusb sysinfo df ip ifconfig
-               (/bin has ping, dhcp)
-/bin programs: hello crash heap fileio perms probe fuzz ping dhcp
+files & dirs:   ls cd pwd mkdir touch cp mv rm rmtree stat du find basename
+                dirname tee
+text & data:    cat echo head tail wc grep cut sort uniq tac nl tr strings
+                hexdump cmp seq
+system & users: clear date uptime uname hostname whoami id su chmod chown sync
+                sleep time which random run poweroff halt reboot exit help
+processes & hw: ps kill pid meminfo free df dmesg lscpu lsblk lspci lsusb
+                sysinfo ip ifconfig
+/bin programs:  hello crash heap fileio perms probe fuzz ping dhcp
 ```
 
-Commands accept several paths (`cat`, `rm`, `touch`, `mkdir`, `ls`), `cp`
-/`chmod`/`chown` take `-r`/`-R`, `cat`/`head`/`tail`/`grep`/`cut` stream
-without loading whole files, and `;` chains commands on one line (no
-quoting, no pipes yet).
+**Command lines.** Words are separated by spaces; `'...'` and `"..."` group
+words (a backslash escapes the next byte); `;` separates commands, `|` connects
+them and `<`, `>`, `>>` redirect stdin/stdout. Redirection and pipes work for
+every command, builtin or program: the shell `dup2()`s its own fd 0/1 and
+children inherit descriptors 0-2 across `spawn`. A pipe is a temporary file in
+`/tmp` (stages run one after another, at most 8 per pipeline). Diagnostics go to
+stderr, so `cmd > file` only captures data. There are no `&&`/`||`, variables,
+globbing or background jobs.
 
-Driver commands read live state, not canned text: `ip` uses the `NET_STAT`
-syscall (e1000 link/MAC/counters), `free` uses `MEMINFO`, `ps` uses the new
-`PS` syscall (pid, ppid, uid, state, name), `dmesg` streams the retained
-console log via `DMESG`, and `lscpu`, `lspci`, `lsusb`, `lsblk`, `sysinfo`,
-`df`, `uname` read the `/proc/cpu`, `/proc/pci`, `/proc/usb`, `/proc/disk`,
-`/proc/net`, `/proc/acpi` and `/proc/version` snapshots the kernel publishes
-at boot (RAM-only, never persisted). Deliberately absent (no kernel support
-yet): `mount`, `ln`, `tar`, `vi`, `top`, pipes.
+Filters read standard input when given no file (`cat`, `head`, `tail`, `wc`,
+`grep`, `cut`, `sort`, `tac`, `nl`...). `grep` matches a plain substring
+(`-i -n -v -c -r`); `sort` handles up to 64 KiB / 4096 lines.
+
+**Real state, not canned text.** `date` reads the CMOS RTC (UTC; `date -s` as
+root sets a software offset until reboot), `clear` clears VGA and the serial
+terminal, `ps` uses the `PS` syscall, `dmesg` shows the *kernel* log (32 KiB, a
+full boot; user programs' output is not mixed in), `free` uses `MEMINFO` and
+`ip` uses `NET_STAT`. `lscpu`, `lspci`,
+`lsusb`, `lsblk`, `sysinfo`, `df` and `uname` read `/proc/cpu`, `/proc/pci`,
+`/proc/usb`, `/proc/disk`, `/proc/net`, `/proc/acpi` and `/proc/version`. Those
+files are regenerated from live kernel state each time they are opened, so
+`cat /proc/usb` after unplugging a keyboard or `ip` after DHCP is current. They
+are RAM-only and never persisted.
+
+Deliberately absent (no kernel support yet): `mount`, `ln`, `tar`, `vi`, `top`,
+signals, `fork`, job control.
 
 ## Source layout
 

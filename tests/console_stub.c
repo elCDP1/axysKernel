@@ -5,3 +5,9 @@ void axys_console_write_len(const char *string, axys_size_t length)
     (void)string;
     (void)length;
 }
+
+void axys_klog_append(const char *text, axys_size_t length)
+{
+    (void)text;
+    (void)length;
+}

@@ -167,6 +167,9 @@ struct xhci_dev {
     axys_uint8_t slot;
     void *dcbaa_buf; /* 1 KiB Output Device Context for `slot`, 0 = none */
     axys_uint8_t speed;
+    axys_uint16_t vendor_id;  /* from the device descriptor, for /proc/usb */
+    axys_uint16_t product_id;
+    axys_uint8_t dev_class;
     axys_uint8_t root_port;
     axys_uint32_t route;
     axys_uint8_t parent_slot; /* Transaction Translator hub slot: only set under a high-speed hub */
@@ -1501,12 +1504,16 @@ static int enumerate_device(unsigned port, axys_uint32_t route, axys_uint8_t par
         abandon_device(dev, deadline);
         return -1;
     }
-    /* Device descriptor: only the class triple matters here. */
+    /* Device descriptor: the class triple drives driver choice; the vendor and
+     * product IDs are only kept for /proc/usb. */
     if (get_descriptor(dev, 0x80, DESC_DEVICE, 0, buf_phys, 18, 0, deadline) != 0) {
         axys_dma_free(buf);
         abandon_device(dev, deadline);
         return -1;
     }
+    dev->dev_class = buf[4];
+    dev->vendor_id = (axys_uint16_t)(buf[8] | ((axys_uint16_t)buf[9] << 8));
+    dev->product_id = (axys_uint16_t)(buf[10] | ((axys_uint16_t)buf[11] << 8));
     /* Configuration header first (to learn the total length), then all of it. */
     if (get_descriptor(dev, 0x80, DESC_CONFIG, 0, buf_phys, 9, 0, deadline) != 0) {
         axys_dma_free(buf);
@@ -1794,6 +1801,41 @@ int axys_xhci_keyboard_count(void)
 const char *axys_xhci_summary(void)
 {
     return summary;
+}
+
+/* One line per live device for /proc/usb. Read without the transaction mutex:
+ * a device appearing or vanishing mid-read can at worst make one line stale,
+ * and taking the mutex here could stall `lsusb` behind a multi-second
+ * enumeration. */
+axys_size_t axys_xhci_format(char *out, axys_size_t capacity)
+{
+    static const char *const speeds[] = {"?", "full", "low", "high", "super"};
+    axys_size_t length = 0;
+
+    if (out == AXYS_NULL || capacity == 0u) {
+        return 0;
+    }
+    out[0] = '\0';
+    for (unsigned i = 0; i < MAX_SLOTS; ++i) {
+        const struct xhci_dev *d = &devs[i];
+        int n;
+
+        if (!d->used || length + 1u >= capacity) {
+            continue;
+        }
+        n = axys_snprintf(out + length, capacity - length,
+                          "dev slot %u port %u%s ID %04x:%04x class %02x %s-speed %s\n", (unsigned)d->slot,
+                          (unsigned)d->root_port + 1u, d->hub_slot != 0u ? " (behind hub)" : "",
+                          (unsigned)d->vendor_id, (unsigned)d->product_id, (unsigned)d->dev_class,
+                          speeds[d->speed <= 4u ? d->speed : 0u],
+                          d->is_kbd ? "keyboard" : (d->is_hub ? "hub" : (d->has_bulk ? "mass-storage" : "other")));
+        if (n > 0) {
+            axys_size_t room = capacity - length - 1u;
+
+            length += (axys_size_t)n < room ? (axys_size_t)n : room;
+        }
+    }
+    return length;
 }
 
 int axys_xhci_init(void)

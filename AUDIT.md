@@ -610,3 +610,13 @@ New kernel surface, all covered by QEMU stage 2 and `/bin/probe`:
 - One `make check-net` run failed with a gutted stage 2 (many MISSINGs);
   immediate rerun passed clean. Root cause not isolated (no log kept);
   treated as timing flake, stage-2 TIMEOUT raised 120 to 150 s.
+
+### Shell and system interface
+
+Retained kernel log, live `/proc` files, the RTC and `date`, `clear`, `ls`
+argument handling, `DUP`/`DUP2` redirection with inheritance across `spawn`, and
+the quote/pipe/redirect parser are described in `docs/PLATFORM_SUPPORT.md`
+("Audit notes: shell and system interface"). Coverage: `tests/test_time.c`,
+`tests/test_shparse.c`, `make check-shell` (79 cases, including error paths,
+stderr separation, live `/proc/usb` through USB hot-plug, and permissions) and the
+redirect phase of the in-guest fuzzer.

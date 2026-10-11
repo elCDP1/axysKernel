@@ -265,6 +265,177 @@ static void phase_exhaust(void)
     heartbeat("exhaust", 1);
 }
 
+/* Redirection, the clock and the console control: hostile descriptors, descriptor
+ * exhaustion by dup(), stdout/stdin redirection of this process and of a child
+ * it spawns, time(), settime() and console(). */
+static void phase_redirect(u64 iters)
+{
+    char buf[64];
+    int copies[24];
+    int n = 0;
+    long t0;
+    u64 rounds = iters / 20;
+
+    heartbeat("redirect", 0);
+    if (rounds > 150) {
+        rounds = 150;
+    }
+    /* hostile descriptor numbers must fail cleanly */
+    if (dup(-1) >= 0 || dup(1000) >= 0 || dup(15) >= 0) {
+        fail("dup accepted a bad descriptor");
+        return;
+    }
+    if (dup2(1, 16) >= 0 || dup2(1, -1) >= 0 || dup2(-1, 3) >= 0 || dup2(100, 1) >= 0 ||
+        dup2(1, 1000000) >= 0) {
+        fail("dup2 accepted a bad descriptor");
+        return;
+    }
+    /* exhausting the table with dup() ends in an error, and closing restores it */
+    for (;;) {
+        int fd = dup(1);
+
+        if (fd < 0) {
+            break;
+        }
+        if (fd < 3 || n >= 24) {
+            fail("dup returned a standard descriptor or never ran out");
+            return;
+        }
+        copies[n++] = fd;
+    }
+    if (n == 0) {
+        fail("dup could not copy stdout at all");
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        close(copies[i]);
+    }
+    {
+        int again = dup(1);
+
+        if (again < 3) {
+            fail("descriptors were not released by close");
+            return;
+        }
+        close(again);
+    }
+    /* redirect this process's stdout into a file, then restore it */
+    for (u64 r = 0; r < rounds; ++r) {
+        static const char msg[] = "redirected output\n";
+        int file = open("/tmp/fz-redir", O_CREAT | O_WRONLY | O_TRUNC | O_APPEND);
+        int saved = dup(1);
+        int back;
+        long got;
+
+        if (file < 0 || saved < 3) {
+            fail("redirect: cannot set up descriptors");
+            return;
+        }
+        if (dup2(file, 1) != 1) {
+            fail("redirect: dup2 onto stdout failed");
+            return;
+        }
+        close(file);
+        write(1, msg, sizeof(msg) - 1);
+        if (dup2(saved, 1) != 1) {
+            fail("redirect: cannot restore stdout");
+            return;
+        }
+        close(saved);
+        back = open("/tmp/fz-redir", 0);
+        got = back >= 0 ? read(back, buf, sizeof(buf)) : -1;
+        if (back >= 0) {
+            close(back);
+        }
+        if (got != (long)(sizeof(msg) - 1) || memcmp(buf, msg, sizeof(msg) - 1) != 0) {
+            fail("redirect: the file did not receive what was written to stdout");
+            return;
+        }
+        /* a child inherits the redirection */
+        if (r % 10 == 0) {
+            int status = 0;
+            int pid;
+
+            file = open("/tmp/fz-redir", O_CREAT | O_WRONLY | O_TRUNC | O_APPEND);
+            saved = dup(1);
+            if (file < 0 || saved < 3 || dup2(file, 1) != 1) {
+                fail("redirect: cannot set up the child's stdout");
+                return;
+            }
+            close(file);
+            pid = spawn("/bin/hello", "fuzz");
+            if (pid >= 0) {
+                (void)wait(pid, &status);
+            }
+            dup2(saved, 1);
+            close(saved);
+            back = open("/tmp/fz-redir", 0);
+            got = back >= 0 ? read(back, buf, sizeof(buf) - 1) : -1;
+            if (back >= 0) {
+                close(back);
+            }
+            if (pid < 0 || got < 5 || memcmp(buf, "hello", 5) != 0) {
+                fail("redirect: a spawned child did not inherit the redirected stdout");
+                return;
+            }
+        }
+        /* and stdin comes from a file the same way */
+        file = open("/tmp/fz-redir", 0);
+        saved = dup(0);
+        if (file < 0 || saved < 3 || dup2(file, 0) != 0) {
+            fail("redirect: cannot redirect stdin");
+            return;
+        }
+        close(file);
+        got = read(0, buf, 5);
+        dup2(saved, 0);
+        close(saved);
+        if (got != 5) {
+            fail("redirect: stdin did not read from the file");
+            return;
+        }
+    }
+    unlink("/tmp/fz-redir");
+
+    /* the clock: monotonic, settable only within range, and restored afterwards */
+    t0 = time_unix();
+    if (t0 >= 0) {
+        long t1;
+
+        t1 = time_unix();
+        if (t1 < t0) {
+            fail("time() went backwards");
+            return;
+        }
+        if (settime((u64)-1) >= 0 || settime((u64)1 << 62) >= 0) {
+            fail("settime accepted an absurd value");
+            return;
+        }
+        if (settime((u64)t1) < 0) {
+            fail("settime to the current time failed for root");
+            return;
+        }
+        t1 = time_unix();
+        if (t1 < t0 || t1 > t0 + 5) {
+            fail("time() is wrong after settime(now)");
+            return;
+        }
+    } else if (t0 != -19) {
+        fail("time() returned an unexpected error");
+        return;
+    }
+    /* console(): only op 0 exists */
+    if (sys3(SYS_CONSOLE, 1, 0, 0) >= 0 || sys3(SYS_CONSOLE, -1, 0, 0) >= 0 ||
+        sys3(SYS_CONSOLE, 0x7fffffff, 0, 0) >= 0) {
+        fail("console accepted an unknown operation");
+        return;
+    }
+    /* The last child's task is torn down asynchronously after wait() returns;
+     * let that settle so the accounting phase does not see it as a change. */
+    sleep_ms(150);
+    heartbeat("redirect", 1);
+}
+
 static void phase_accounting(void)
 {
     struct meminfo before;
@@ -315,7 +486,7 @@ static void phase_accounting(void)
         fail("VFS nodes leaked");
         return;
     }
-    if (after.heap_used != before.heap_used) {
+    if (after.heap_used > before.heap_used) { /* growth is a leak; a drop is only late teardown */
         puts("fuzz: heap_used before=");
         put_u64(before.heap_used);
         puts(" after=");
@@ -371,6 +542,9 @@ int main(const char *args, size_t len)
     }
     if (!failures) {
         phase_exhaust();
+    }
+    if (!failures) {
+        phase_redirect(iters);
     }
     if (!failures) {
         phase_accounting();

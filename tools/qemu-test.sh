@@ -46,7 +46,7 @@ if [ "$status" -ne 0 ]; then echo "--- boot log ---"; cat "$LOG"; exit 1; fi
 # -1), so the root half runs again after `exit`, which restarts init as root.
 LONG="echo $(printf 'a%.0s' $(seq 1 400))"
 (sleep 7
- for cmd in "$LONG" "su abc" "su 99999999999" "echo it-works > /tmp/t.txt" "cat /tmp/t.txt" "hello" "crash kexec" "crash spin" "heap" "fileio" "probe" "ls /sbin" \
+ for cmd in "$LONG" "su abc" "su 99999999999" "echo it-works > /tmp/t.txt" "cat /tmp/t.txt" "hello" "crash kexec" "crash spin" "heap" "fileio" "probe" "ls -l /sbin" \
      "pwd" "uname" "uname -a" "hostname" "date" "free" "df" "lspci" "lsusb" "sysinfo" "ip" \
      "echo abc > /tmp/sh-src" "cat /tmp/sh-src" "cp /tmp/sh-src /tmp/sh-dst" "cat /tmp/sh-dst" \
      "head -n 1 /tmp/sh-src" "tail -n 1 /tmp/sh-src" "wc /tmp/sh-src" "grep b /tmp/sh-src" \
@@ -83,12 +83,12 @@ fi
 for want in "^it-works" "hello from ring 3" "\[exit 42\]" "\[killed by exception 14\]" \
             "\[killed by exception 9\]" "rwxr-xr-x 0 0 [0-9]*.init" "cat: -13" "rm: -13" "poweroff: -1" "su: -1" "uid=1000 gid=1000" "uid=0 gid=0" "powering off" \
             "probe: all checks passed" "line too long" "su: -22" \
-            "fileio: all checks passed" "rmtree: -13" "sub/$" "^rootfile" "rmtree: 3" "ls: -2" \
-            "^/$" "axysOS 1.0 x86_64" "^axys$" "since boot" "Heap: " "capacity: " "backend: " \
+            "fileio: all checks passed" "rmtree: -13" "sub/$" "^rootfile" "rmtree: 3" "/home/user/rt: -2" \
+            "^/$" "axysOS 1.0 x86_64" "^axys$" "UTC 20[0-9][0-9]" "Heap: " "capacity: " "backend: " \
             "Host bridge" "keyboards:" "== axys sysinfo ==" "-- usb --" "link: up" \
-            "^abc" "1 1 4" "size: 4 bytes" "^/tmp$" "kill: -3" \
+            "^abc" "1  *1  *4" "size: 4 bytes" "^/tmp$" "kill: -3" \
             "PID  PPID" " R init$" "axys kernel online" "vendor: " "disk0" "7f 45 4c 46" \
-            "identical" "^root$" "/bin/hello" "^3$" "^bar$" "^/foo$" "^real " "0 1 2" "1.abc" \
+            "identical" "^root$" "/bin/hello" "^3$" "^bar$" "^/foo$" "^real " "0  *1  *2" "1.abc" \
             "^ab$" "m1" "md1" "/tmp/cpcopy/f$" "/tmp/g1:hello-w" "cptree:$" "sh-dst" "^b$" \
             "^2 dup$" "^xyz$" "unknown command: aaaaa"; do
     if ! grep -q -e "$want" "$LOG"; then echo "SHELL MISSING: $want"; status=1; fi
@@ -139,7 +139,7 @@ wait_for_shell() {
     # Restoring a larger snapshot through a polled AHCI port can take longer
     # than the blank-disk startup, so let init finish before the first key.
     : > "$LOG"
-    (wait_for_shell || exit 1; for cmd in "cat /home/user/docs/note.txt" "ls /etc" "ls /tmp" "poweroff"; do
+    (wait_for_shell || exit 1; for cmd in "cat /home/user/docs/note.txt" "ls -l /etc" "ls -l /tmp" "poweroff"; do
         printf '%s\n' "$cmd"; sleep 1; done; sleep 2) | boot
     second_boot_status=$?
     if [ "$second_boot_status" -ne 0 ]; then echo "PERSIST: second QEMU boot did not power off cleanly (status $second_boot_status)"; status=1; fi
