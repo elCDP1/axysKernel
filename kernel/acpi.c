@@ -204,6 +204,12 @@ static const volatile axys_uint8_t *find_fadt_in_root(axys_uint64_t address,
     if (root == AXYS_NULL || (length - ACPI_SDT_HEADER_SIZE) % entry_size != 0u) {
         return AXYS_NULL;
     }
+    /* Each entry below re-validates (and re-checksums) a table, so a hostile
+     * length makes this quadratic: cap the walk at far more entries than any
+     * real firmware ships (QEMU has a handful). */
+    if ((length - ACPI_SDT_HEADER_SIZE) / entry_size > 512u) {
+        return AXYS_NULL;
+    }
     for (axys_uint32_t offset = ACPI_SDT_HEADER_SIZE; offset < length;
          offset += entry_size) {
         axys_uint64_t child = extended ? load64(root + offset) : load32(root + offset);

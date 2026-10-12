@@ -244,6 +244,9 @@ static axys_vfs_node_t walk(const char *path, int create, axys_vfs_type_t create
             if (create && *cursor == '\0') {
                 return -1; /* a trailing slash names an existing node */
             }
+            if (*cursor == '\0' && nodes[current].type != AXYS_VFS_DIR) {
+                return -1; /* trailing slash on a non-directory (POSIX ENOTDIR) */
+            }
         }
     }
     return current;
@@ -457,17 +460,6 @@ static axys_int32_t vfs_read_nl(axys_vfs_node_t node, void *buffer, axys_size_t 
     return vfs_pread_nl(node, 0, buffer, length);
 }
 
-/* The returned pointer stays valid until the node is unlinked; callers that
- * race with unlink must serialise themselves (names are diagnostics only). */
-const char *axys_vfs_name(axys_vfs_node_t node)
-{
-    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
-    const char *name = node_valid(node) ? nodes[node].name : "";
-
-    axys_spin_unlock_irqrestore(&vfs_lock, flags);
-    return name;
-}
-
 axys_vfs_type_t axys_vfs_type(axys_vfs_node_t node)
 {
     axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
@@ -478,8 +470,7 @@ axys_vfs_type_t axys_vfs_type(axys_vfs_node_t node)
 }
 
 axys_int32_t axys_vfs_name_copy(axys_vfs_node_t node, char *out, axys_size_t cap)
-{
-    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+{    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
     axys_int32_t rc = -1;
 
     if (node_valid(node) && out != AXYS_NULL && cap != 0) {
@@ -487,6 +478,28 @@ axys_int32_t axys_vfs_name_copy(axys_vfs_node_t node, char *out, axys_size_t cap
 
         if (len < cap) {
             axys_memcpy(out, nodes[node].name, len + 1);
+            rc = (axys_int32_t)len;
+        }
+    }
+    axys_spin_unlock_irqrestore(&vfs_lock, flags);
+    return rc;
+}
+
+/* Name and type of one node under a single lock acquisition. readdir used
+ * to fetch them with two separate calls, so a slot recycled in between
+ * came back with the old name and the new occupant's type. */
+axys_int32_t axys_vfs_node_info(axys_vfs_node_t node, char *out, axys_size_t cap,
+                                axys_vfs_type_t *type)
+{
+    axys_uint64_t flags = axys_spin_lock_irqsave(&vfs_lock);
+    axys_int32_t rc = -1;
+
+    if (node_valid(node) && out != AXYS_NULL && type != AXYS_NULL && cap != 0) {
+        axys_size_t len = axys_strlen(nodes[node].name);
+
+        if (len < cap) {
+            axys_memcpy(out, nodes[node].name, len + 1);
+            *type = nodes[node].type;
             rc = (axys_int32_t)len;
         }
     }
@@ -1112,6 +1125,13 @@ static void dump_recursive(axys_vfs_node_t node, unsigned depth)
 {
     axys_vfs_node_t child = -1;
 
+    /* Diagnostic only, but it runs on live trees: cap the recursion so a
+     * pathological depth (reachable via rename) cannot overflow the kernel
+     * stack the way the iterative removers refuse to. */
+    if (depth > 32) {
+        axys_console_write("  [...]\n");
+        return;
+    }
     for (unsigned i = 0; i < depth; ++i) {
         axys_console_write("  ");
     }

@@ -611,6 +611,59 @@ New kernel surface, all covered by QEMU stage 2 and `/bin/probe`:
   immediate rerun passed clean. Root cause not isolated (no log kept);
   treated as timing flake, stage-2 TIMEOUT raised 120 to 150 s.
 
+### Full-repo audit round (correctness, drivers, real hardware)
+
+Four parallel audits (memory, processes, firmware/bus, VFS/persist) plus a
+manual pass over the shell pipeline. Every finding below was re-verified in
+the code before fixing; refuted ones are marked so.
+
+- Heap large path: `size + header` was overflow-checked but `total + 4095`
+  for the frame rounding was not; a ~2^64 request computed a tiny frame
+  count and corrupted the heap. Now refused.
+- `initrd_install` trusted the generated table: a `end < start` span became
+  `SIZE_MAX` and compared equal to `pwrite`'s -1 error, counting a phantom
+  empty file. Now validated (`end >= start`, 2 GiB cap).
+- Removed the racy `axys_vfs_name()` (pointer outliving the lock, zero
+  kernel callers); the fuzzer now uses `axys_vfs_name_copy()`.
+- `axys_aspace_unmap()` had no alignment/window gate: a kernel address would
+  walk shared PML4[0], free kernel frames and zero a live PTE. Same gate as
+  the mapper now.
+- VFS `walk()` accepted a trailing slash on non-directories (unreachable
+  from syscalls, whose normalizer strips it, but reachable from crafted
+  persist payloads). Now ENOTDIR; `dump_recursive()` gained a depth cap.
+- `persist components_valid()` accepted trailing slashes that
+  `apply_payload()` then rejects (validated-but-unappliable snapshot).
+  Rejected up front; the validate/apply guarantee holds again.
+- Persist serialize now re-checks the slot generation before writing a
+  node's bytes, so an unlink+create recycle under a concurrent `sync`
+  cannot persist intruder bytes under the victim path (skips like a
+  vanished node).
+- PMM contiguous allocation held the irqsave lock across a frame-by-frame
+  scan (up to ~134M iterations, seconds without timer ticks on big RAM).
+  Now a word-at-a-time run scan under the same lock.
+- ACPI root-table walk is now bounded (512 entries) against hostile
+  quadratic firmware tables.
+- Spawn: new `axys_process_spawn_checked()` re-verifies node, generation,
+  size and execute permission between the syscall check and the loader
+  read; fd inheritance to children is now under interrupts-off; the `ps`
+  snapshot skips mid-spawn slots (address space not yet created) instead
+  of showing torn entries; `readdir` fetches name+type under one lock via
+  new `axys_vfs_node_info()`.
+- `/dev/null` and `/dev/zero` are real devices (syscall path intercept +
+  0666 visibility nodes recreated every boot); reads/writes/lseek/close/dup
+  behave, bad buffers still fail EFAULT.
+- Fixed a shell hang: `cmd > file | next` left `next` reading the terminal
+  (a stage after a file redirect now reads `/dev/null`). `head`/`tail`
+  gained `-c`; `tail` spills unseekable console stdin to a temp file;
+  `df` takes an optional path.
+- Refuted, no change: heap/stack ASLR overlap (load bias caps `end` near
+  BASE+256MiB, stack lives at TOP-1GiB: terabytes apart); VMM partial
+  MMIO mapping on OOM (installed PTEs are complete and retry-idempotent,
+  only table frames leak); RNG fail-open (jitter fallback makes boot-time
+  failure unlikely; failing spawns would brick entropy-less machines).
+- Deferred: heap free-list ordering (fragmentation nicety, no correctness
+  gain for the risk).
+
 ### Shell and system interface
 
 Retained kernel log, live `/proc` files, the RTC and `date`, `clear`, `ls`

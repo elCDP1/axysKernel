@@ -106,11 +106,17 @@ int axys_process_snapshot(struct axys_ps_entry *out, int cap)
         cap = AXYS_MAX_PROCS;
     }
     /* One uninterruptible pass: spawn/exit mutate these slots, and a torn
-     * read would hand user space a pid with another process's name. */
+     * read would hand user space a pid with another process's name. Slots
+     * whose address space does not exist yet are mid-spawn (slot_alloc
+     * publishes `used` before parent/uid/name/space are filled): not dead,
+     * just not observable -- unless zombie, which implies a lived life. */
     flags = axys_cpu_save_flags();
     axys_cpu_disable_interrupts();
     for (int i = 0; i < AXYS_MAX_PROCS && n < cap; ++i) {
         if (!procs[i].used) {
+            continue;
+        }
+        if (!procs[i].zombie && procs[i].space.pml4 == 0) {
             continue;
         }
         out[n].pid = procs[i].pid;
@@ -345,11 +351,26 @@ static void install_std_fds(struct axys_process *proc)
         proc->fds[i].console = 1;
         proc->fds[i].readable = 1;
         proc->fds[i].writable = 1;
+        proc->fds[i].dev = 0;
     }
 }
 
 int axys_process_spawn_as(const char *path, const char *args, int parent,
                           axys_uint32_t uid, axys_uint32_t gid)
+{
+    return axys_process_spawn_checked(path, args, parent, uid, gid, -1, 0, 0);
+}
+
+/* Spawn with a prior check to re-verify: the syscall validated execute
+ * permission on (exe, gen, size) and the loader must refuse anything else.
+ * Without this, a writable executable swapped between the check and the
+ * read (unlink+create, truncate) would run with the victim's credentials.
+ * A same-node, same-size in-place rewrite still slips through: closing
+ * that needs pinned opens, which the VFS does not have. */
+int axys_process_spawn_checked(const char *path, const char *args, int parent,
+                               axys_uint32_t uid, axys_uint32_t gid,
+                               axys_vfs_node_t exe, axys_uint32_t gen,
+                               axys_int32_t exe_size)
 {
     axys_uint64_t flags;
     struct axys_process *proc;
@@ -373,7 +394,21 @@ int axys_process_spawn_as(const char *path, const char *args, int parent,
     if (axys_vfs_type(node) != AXYS_VFS_FILE) {
         return -AXYS_EISDIR;
     }
+    if (exe >= 0) {
+        /* The caller checked this exact object: same slot, same generation
+         * (no unlink+create cycle), same size (no truncate/replace), and it
+         * must still be executable by the new credentials. */
+        if (node != exe || axys_vfs_generation(node) != gen) {
+            return -AXYS_ENOENT; /* the checked file is gone */
+        }
+        if (axys_vfs_access(node, uid, gid, AXYS_PERM_X) != 0) {
+            return -AXYS_EACCES; /* permissions changed under us */
+        }
+    }
     size = axys_vfs_size(node);
+    if (exe >= 0 && size != exe_size) {
+        return -AXYS_ENOENT; /* replaced between check and load */
+    }
     if (size <= 0 || (axys_uint32_t)size > ELF_MAX_BYTES) {
         return -AXYS_ENOEXEC;
     }
@@ -400,6 +435,7 @@ int axys_process_spawn_as(const char *path, const char *args, int parent,
     proc->parent = parent;
     proc->uid = uid;
     proc->gid = gid;
+    proc->umask = 022u;
     {
         const char *base = path;
 
@@ -456,16 +492,24 @@ int axys_process_spawn_as(const char *path, const char *args, int parent,
     install_std_fds(proc);
     if (parent > 0) {
         /* A shell that redirected its own stdin/stdout (cmd > file, a | b)
-         * hands that to the program it starts. */
-        struct axys_process *parent_proc = find_pid(parent);
+         * hands that to the program it starts. Found and copied with
+         * interrupts off: with them on, the parent could exit and its slot
+         * be recycled between the lookup and the copy, handing the child
+         * a stranger's descriptors. */
+        axys_uint64_t fd_flags = axys_cpu_save_flags();
+        struct axys_process *parent_proc;
 
+        axys_cpu_disable_interrupts();
+        parent_proc = find_pid(parent);
         if (parent_proc != AXYS_NULL) {
             for (int i = 0; i < 3; ++i) {
                 if (parent_proc->fds[i].used && !parent_proc->fds[i].console) {
                     proc->fds[i] = parent_proc->fds[i];
                 }
             }
+            proc->umask = parent_proc->umask; /* same atomic window */
         }
+        axys_cpu_restore_flags(fd_flags);
     }
 
     info = axys_kmalloc(sizeof(*info));

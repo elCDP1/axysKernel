@@ -22,7 +22,8 @@ enum {
     SYS_UNLINK, SYS_READDIR, SYS_STAT, SYS_POWER, SYS_KILL, SYS_GETUID, SYS_GETGID, SYS_SETUID,
     SYS_SETGID, SYS_CHMOD, SYS_CHOWN, SYS_SYNC, SYS_RENAME, SYS_RMDIR_TREE, SYS_MEMINFO,
     SYS_NET_SEND, SYS_NET_RECV, SYS_NET_STAT, SYS_NET_SET_ADDR,
-    SYS_PS, SYS_DMESG, SYS_DUP, SYS_DUP2, SYS_TIME, SYS_SETTIME, SYS_CONSOLE
+    SYS_PS, SYS_DMESG, SYS_DUP, SYS_DUP2, SYS_TIME, SYS_SETTIME, SYS_CONSOLE,
+    SYS_UMASK, SYS_KLOG
 };
 
 struct meminfo {
@@ -120,6 +121,8 @@ static inline int dup2(int old_fd, int new_fd) { return (int)sys3(SYS_DUP2, old_
 static inline long time_unix(void) { return sys3(SYS_TIME, 0, 0, 0); }
 static inline int settime(u64 seconds) { return (int)sys3(SYS_SETTIME, (long)seconds, 0, 0); }
 static inline int console_clear(void) { return (int)sys3(SYS_CONSOLE, 0, 0, 0); }
+static inline int umask_set(u32 mask) { return (int)sys3(SYS_UMASK, mask, 0, 0); }
+static inline long klog(const void *buf, size_t len) { return sys3(SYS_KLOG, buf, len, 0); }
 static inline long dmesg(void *buf, size_t cap, u64 skip) { return sys4(SYS_DMESG, (long)buf, (long)cap, (long)skip, 0); }
 
 void *memcpy(void *dst, const void *src, size_t n);

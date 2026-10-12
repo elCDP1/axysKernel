@@ -162,6 +162,9 @@ static void *kmalloc_locked(axys_size_t size)
         if (total < size) {
             return AXYS_NULL; /* overflow */
         }
+        if (total > ~(axys_uint64_t)0 - (AXYS_PMM_FRAME_SIZE - 1u)) {
+            return AXYS_NULL; /* the frame rounding below would wrap */
+        }
         frames = ((axys_uint64_t)total + AXYS_PMM_FRAME_SIZE - 1u) / AXYS_PMM_FRAME_SIZE;
         base = axys_pmm_alloc_contiguous(frames);
         if (base == 0) {

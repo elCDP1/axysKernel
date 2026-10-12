@@ -125,7 +125,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe build/test_time.exe build/test_shparse.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe build/test_time.exe build/test_shparse.exe build/test_csi.exe build/test_vga.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -137,6 +137,8 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_path.exe
 	./build/test_time.exe
 	./build/test_shparse.exe
+	./build/test_csi.exe
+	./build/test_vga.exe
 	./build/test_heap.exe
 	./build/test_usb_desc.exe
 	./build/test_pci.exe
@@ -197,6 +199,14 @@ build/test_usb.exe: tests/test_usb.c kernel/usb_hid.c
 build/test_shparse.exe: tests/test_shparse.c user/shparse.h
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_shparse.c
+
+build/test_csi.exe: tests/test_csi.c include/axys/csi.h
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_csi.c
+
+build/test_vga.exe: tests/test_vga.c kernel/vga.c include/axys/vga.h include/axys/csi.h tests/stubs/axys/io.h tests/stubs/axys/cpu.h
+	@$(MKDIR)
+	$(HOST_CC) -Itests/stubs $(HOST_CFLAGS) -o $@ tests/test_vga.c kernel/vga.c
 
 build/test_path.exe: $(HOST_PATH_TEST_OBJECTS)
 	@$(MKDIR)

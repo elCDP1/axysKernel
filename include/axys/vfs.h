@@ -48,13 +48,15 @@ axys_int32_t axys_vfs_read(axys_vfs_node_t node, void *buffer, axys_size_t lengt
  * across calls must also keep this value and re-check it before use. */
 axys_uint32_t axys_vfs_generation(axys_vfs_node_t node);
 
-const char *axys_vfs_name(axys_vfs_node_t node);
-
 /* Copy a node's name into `out` (always NUL-terminated) while holding the VFS
  * lock, so the bytes cannot change under the reader. Returns the name length
- * (excluding NUL), or -1 when the node is invalid or `cap` is 0. Prefer this
- * over axys_vfs_name() for any name that outlives the call. */
+ * (excluding NUL), or -1 when the node is invalid or `cap` is 0. This is the
+ * only way to read a name: a bare pointer would dangle across unlink. */
 axys_int32_t axys_vfs_name_copy(axys_vfs_node_t node, char *out, axys_size_t cap);
+
+/* Name and type together, atomically for readdir's sake (see above). */
+axys_int32_t axys_vfs_node_info(axys_vfs_node_t node, char *out, axys_size_t cap,
+                                axys_vfs_type_t *type);
 
 /* Sticky-directory check (the /tmp rule): in a directory with mode bit 01000,
  * removing or renaming `target` additionally requires uid 0, ownership of the

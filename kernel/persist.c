@@ -143,7 +143,8 @@ static void buf_append(struct buffer *b, const void *src, axys_size_t n)
     b->len += n;
 }
 
-static void serialize_node(struct buffer *b, const char *path, axys_vfs_node_t node)
+static void serialize_node(struct buffer *b, const char *path, axys_vfs_node_t node,
+                           axys_uint32_t gen)
 {
     struct axys_vfs_attr attr;
     struct record rec;
@@ -157,6 +158,11 @@ static void serialize_node(struct buffer *b, const char *path, axys_vfs_node_t n
     }
     if (axys_vfs_getattr(node, &attr) != 0) {
         return; /* node vanished between lookup and save: nothing to record */
+    }
+    if (axys_vfs_generation(node) != gen) {
+        return; /* slot recycled under us (unlink+create): the bytes no longer
+                 * belong to this path. Skipping matches the vanished case;
+                 * the next sync picks the tree up again. */
     }
     rec.path_len = (axys_uint16_t)path_len;
     rec.type = (axys_uint8_t)attr.type;
@@ -258,7 +264,7 @@ static void serialize_tree(struct buffer *b, const char *path, axys_vfs_node_t d
         if (!path_persisted(child_path)) {
             continue;
         }
-        serialize_node(b, child_path, child);
+        serialize_node(b, child_path, child, axys_vfs_generation(child));
         if (b->failed) {
             break;
         }
@@ -289,7 +295,7 @@ static void serialize_all(struct buffer *b)
         if (root < 0) {
             continue;
         }
-        serialize_node(b, persist_roots[i], root);
+        serialize_node(b, persist_roots[i], root, axys_vfs_generation(root));
         serialize_tree(b, persist_roots[i], root);
     }
     buf_append(b, &end, sizeof(end));
@@ -342,12 +348,17 @@ static int dir_available(const axys_uint8_t *payload, const struct seen_dir *see
 }
 
 /* Every component must satisfy the same rules walk() enforces: non-empty,
- * shorter than AXYS_VFS_NAME_MAX, and never "." or "..". */
+ * shorter than AXYS_VFS_NAME_MAX, and never "." or "..". A trailing slash
+ * is refused too: validation promises apply_payload() can apply anything
+ * accepted, and the VFS create path rejects trailing slashes. */
 static int components_valid(const char *path, axys_size_t path_len)
 {
     axys_size_t i = 1; /* skip the leading '/' */
 
     if (path_len == 0 || path[0] != '/') {
+        return 0;
+    }
+    if (path_len > 1 && path[path_len - 1] == '/') {
         return 0;
     }
     while (i < path_len) {

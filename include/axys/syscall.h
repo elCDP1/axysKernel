@@ -51,6 +51,8 @@ enum axys_syscall_number {
     AXYS_SYS_TIME = 38,        /* time() - seconds since 1970 from the RTC, -ENODEV without one */
     AXYS_SYS_SETTIME = 39,     /* settime(seconds) - root only, software offset until reboot */
     AXYS_SYS_CONSOLE = 40,     /* console(op) - 0: clear screen and home the cursor */
+    AXYS_SYS_UMASK = 41,       /* umask(mask) - set creation mask, return the old one */
+    AXYS_SYS_KLOG = 42,        /* klog(buf, len) - append bytes to the kernel log */
     AXYS_SYS_COUNT
 };
 

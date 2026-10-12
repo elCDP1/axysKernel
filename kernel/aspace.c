@@ -119,6 +119,13 @@ fail:
 
 void axys_aspace_unmap(struct axys_aspace *space, axys_uint64_t virt, axys_uint64_t length)
 {
+    /* Same gate as the mapper: without it a kernel address would walk the
+     * shared PML4[0] tables, free kernel frames back to the PMM and zero a
+     * live kernel PTE. All current callers pass mapped ranges, so this only
+     * constrains future ones. */
+    if ((virt & (PAGE - 1)) || (length & (PAGE - 1)) || !in_user_window(virt, length)) {
+        return;
+    }
     for (axys_uint64_t off = 0; off < length; off += PAGE) {
         axys_uint64_t *pte = walk(space, virt + off, 0);
 

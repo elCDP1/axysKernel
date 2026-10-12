@@ -21,7 +21,18 @@ int axys_initrd_install(void)
         axys_size_t length = axys_strlen(e->path);
         axys_size_t slash = 0;
         axys_vfs_node_t node;
-        axys_size_t size = (axys_size_t)(e->end - e->start);
+        axys_size_t size;
+
+        /* The table is generated, but a corrupt start/end pair must not
+         * become a SIZE_MAX write: a negative span used to compare equal
+         * to pwrite's -1 error below and count a phantom empty file. */
+        if (e->start == AXYS_NULL || e->end == AXYS_NULL || e->end < e->start) {
+            return -1;
+        }
+        size = (axys_size_t)(e->end - e->start);
+        if (size > 0x7fffffffu) {
+            return -1;
+        }
 
         if (length >= sizeof(dir)) {
             return -1;
@@ -70,6 +81,11 @@ int axys_initrd_install_defaults(void)
     rc |= put_file("/etc/group", 0644u, "root:x:0:\nusers:x:1000:user\n") < 0;
     rc |= put_file("/etc/motd", 0644u, "Welcome to axysOS.\n") < 0;
     rc |= put_file("/etc/secret", 0600u, "root-only data\n") < 0;
+    /* Device placeholders so ls/stat see them; open/read/write take the
+     * syscall device path instead, so these stay empty forever. /dev is
+     * never persisted, so they are recreated on every boot. */
+    rc |= put_file("/dev/null", 0666u, "") < 0;
+    rc |= put_file("/dev/zero", 0666u, "") < 0;
     if (axys_vfs_lookup("/home/user") < 0 &&
         axys_vfs_create_as("/home/user", AXYS_VFS_DIR, 0755u, 1000, 1000) < 0) {
         rc = 1;

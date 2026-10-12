@@ -113,9 +113,12 @@ words (a backslash escapes the next byte); `;` separates commands, `|` connects
 them and `<`, `>`, `>>` redirect stdin/stdout. Redirection and pipes work for
 every command, builtin or program: the shell `dup2()`s its own fd 0/1 and
 children inherit descriptors 0-2 across `spawn`. A pipe is a temporary file in
-`/tmp` (stages run one after another, at most 8 per pipeline). Diagnostics go to
+`/tmp` (stages run one after another, at most 8 per pipeline). When a stage
+redirects its output to a file, the next stage reads empty input (as on
+Linux) instead of blocking on the terminal. Diagnostics go to
 stderr, so `cmd > file` only captures data. There are no `&&`/`||`, variables,
-globbing or background jobs.
+globbing or background jobs. `/dev/null` discards writes and reads EOF,
+`/dev/zero` reads zeros (both always openable, visible in `ls /dev`).
 
 Filters read standard input when given no file (`cat`, `head`, `tail`, `wc`,
 `grep`, `cut`, `sort`, `tac`, `nl`...). `grep` matches a plain substring

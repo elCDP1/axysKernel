@@ -274,8 +274,9 @@ static void check_tree(axys_vfs_node_t dir)
     assert(checked_nodes < AXYS_VFS_MAX_NODES + 100u);
     child = -1;
     while ((child = axys_vfs_next_child(dir, child)) >= 0) {
-        const char *nm = axys_vfs_name(child);
+        char nm[AXYS_VFS_NAME_MAX];
 
+        assert(axys_vfs_name_copy(child, nm, sizeof(nm)) >= 0);
         assert(n < count);
         for (unsigned i = 0; i < n; ++i) {
             assert(strcmp(names[i], nm) != 0); /* duplicate sibling name */

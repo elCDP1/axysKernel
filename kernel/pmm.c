@@ -546,34 +546,79 @@ void axys_pmm_free_frame(axys_uint64_t address)
     axys_spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
+/* Word-at-a-time run scan; caller holds pmm_lock. The old frame-by-frame
+ * loop held interrupts off for up to ~134M iterations on a 512 GiB pool,
+ * starving the PIT (and every timeout read off it) for seconds on real
+ * hardware. Whole busy/free words resolve in one step; only mixed words
+ * drop to the bit loop. Returns the run start, or ~0. */
+static axys_uint64_t scan_contiguous_run(axys_uint64_t count)
+{
+    axys_uint64_t nwords = (total_frames + BITS_PER_WORD - 1u) / BITS_PER_WORD;
+    axys_uint64_t run = 0;
+    axys_uint64_t start = 0;
+
+    for (axys_uint64_t w = 0; w < nwords; ++w) {
+        axys_uint64_t word = bitmap[w];
+
+        if (w == nwords - 1u && (total_frames & 63u) != 0u) {
+            /* Tail past total_frames: force used (same mask as the single
+             * scan), so a run can never spill past the pool. */
+            word |= ~((((axys_uint64_t)1 << (total_frames & 63u)) - 1u));
+        }
+        if (word == ~(axys_uint64_t)0) {
+            run = 0;
+            continue;
+        }
+        if (word == 0) {
+            if (run == 0) {
+                start = w * BITS_PER_WORD;
+            }
+            run += BITS_PER_WORD;
+            if (run >= count) {
+                return start;
+            }
+            continue;
+        }
+        for (unsigned b = 0; b < BITS_PER_WORD; ++b) {
+            axys_uint64_t frame = w * BITS_PER_WORD + b;
+
+            if (frame >= total_frames) {
+                break;
+            }
+            if ((word & ((axys_uint64_t)1 << b)) != 0u) {
+                run = 0;
+                continue;
+            }
+            if (run == 0) {
+                start = frame;
+            }
+            if (++run == count) {
+                return start;
+            }
+        }
+    }
+    return ~(axys_uint64_t)0;
+}
+
 axys_uint64_t axys_pmm_alloc_contiguous(axys_uint64_t count)
 {
     axys_uint64_t flags;
-    axys_uint64_t run = 0;
-    axys_uint64_t start = 0;
+    axys_uint64_t start;
 
     if (!pmm_ready || count == 0 || count > free_frames) {
         return 0;
     }
     flags = axys_spin_lock_irqsave(&pmm_lock);
-    for (axys_uint64_t frame = 0; frame < total_frames; ++frame) {
-        if (bit_test(frame)) {
-            run = 0;
-            continue;
-        }
-        if (run == 0) {
-            start = frame;
-        }
-        if (++run == count) {
-            bitmap_fill(bitmap, start, start + count, 1);
-            bitmap_fill(allocated_bitmap, start, start + count, 1);
-            free_frames -= count;
-            axys_spin_unlock_irqrestore(&pmm_lock, flags);
-            return start * AXYS_PMM_FRAME_SIZE;
-        }
+    start = scan_contiguous_run(count);
+    if (start == ~(axys_uint64_t)0) {
+        axys_spin_unlock_irqrestore(&pmm_lock, flags);
+        return 0;
     }
+    bitmap_fill(bitmap, start, start + count, 1);
+    bitmap_fill(allocated_bitmap, start, start + count, 1);
+    free_frames -= count;
     axys_spin_unlock_irqrestore(&pmm_lock, flags);
-    return 0;
+    return start * AXYS_PMM_FRAME_SIZE;
 }
 
 void axys_pmm_free_contiguous(axys_uint64_t address, axys_uint64_t count)

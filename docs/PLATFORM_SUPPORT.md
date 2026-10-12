@@ -11,7 +11,7 @@ the kernel has a functional driver for it.
 | CPU | x86-64 long mode; CPUID feature discovery; NX is mandatory; SMEP is conditional | No SMP/AP startup, microcode loading, power/performance states, or 32-bit CPUs |
 | Firmware | Multiboot2 entry; ACPI RSDP/RSDT/XSDT/FADT parsing; conventional PM1 poweroff | No general AML interpreter, hardware-reduced ACPI sleep, UEFI runtime services, or broad firmware matrix |
 | RAM | Multiboot2 memory map; 4 KiB frame allocator; sparse identity map and runtime-sized metadata up to 512 GiB (also limited by CPU physical-address width); QEMU-tested across 4 GiB | No NUMA, hotplug, ECC reporting, general high ACPI-table mapping, or memory-controller driver |
-| Display | VGA text console; bootloader framebuffer metadata is parsed and reserved | No framebuffer console: GRUB's multiboot2 loader hands over an EGA-text framebuffer tag even with `gfxpayload=keep`, so a console would need a bootloader change or kernel-side VBE modesetting. No Intel/AMD/NVIDIA GPU driver |
+| Display | VGA text console with a minimal ANSI CSI parser (clear/home/cursor/line erase, SGR swallowed); bootloader framebuffer metadata is parsed and reserved | No framebuffer console: GRUB's multiboot2 loader hands over an EGA-text framebuffer tag even with `gfxpayload=keep`, so a console would need a bootloader change or kernel-side VBE modesetting. No Intel/AMD/NVIDIA GPU driver |
 | USB | xHCI host controller (PCI 0c/03/0x30, polled command/event rings, port reset, full/low/high-speed address/configure); USB hubs with route-string routing up to 5 levels deep; boot keyboards (HID); bulk-only mass storage (512-byte sectors, READ/WRITE(10), TEST UNIT READY) usable as the system disk; /proc/pci, /proc/usb, /proc/disk, /proc/net, /proc/acpi, /proc/version inventories; `make check-usb`, `check-usb-hub`, `check-usb-storage`, `check-usb-storage-hub` | Polled only (no event-interrupt path), no isochronous endpoints, no HID beyond boot keyboards, no SCSI pass-through or multiple LUNs; devices are removed and re-enumerated at run time (root ports every 8 ms, hub ports on a ~2 s scan, nothing above 5 levels deep) but a mass-storage disk is adopted only at boot: if it is pulled, I/O fails with ENODEV and a replacement is not attached; no UHCI/OHCI/EHCI |
 | Keyboard | PS/2 set-1 through i8042; USB HID boot keyboards through xHCI polling, directly or behind hubs; serial input | Native USB host controllers other than xHCI are absent; USB HID mice and non-boot HID reports are not supported |
 | Shell | 75 commands (builtins and /bin programs) with `help` by category, quoting, `;`, `|`, `<`, `>`, `>>` for builtins and programs (fd 0/1 are `dup2()`ed and inherited by `spawn`), text filters reading stdin (`grep -i -n -v -c -r`, `sort`, `wc`, `cut`, `uniq`, `tac`, `nl`, ...), CMOS RTC `date`, real `clear`, kernel-log `dmesg`, live `/proc` files, relative paths with `cd`/`pwd`, /bin programs (ping, dhcp, probe, ...) | No `&&`/`||`, variables, globbing, background jobs, symlinks, `mount`, `ln`, `tar`, `vi`, `top`; pipes are temporary files, so stages run sequentially |
@@ -200,7 +200,10 @@ bursts, 20 hot-plug cycles, fuzzing with live USB devices) found and fixed:
   `spawn` give every command, builtin or program, `<`, `>`, `>>` and `|`.
   `tests/test_shparse.c` fuzzes the quoting/redirection parser in exactly-sized
   buffers under ASan, and `user/fuzz.c` gained a redirect/clock/console phase (it
-  fails if child inheritance is disabled).
+  fails if child inheritance is disabled). A stage after `cmd > file | next`
+  reads empty input, never the terminal. `/dev/null` and `/dev/zero` are real
+  devices (path-based syscall intercept plus 0666 visibility nodes, recreated
+  every boot since `/dev` is never persisted).
 - `NET_SEND`/`NET_RECV` were already root-only; `SETTIME` follows the same rule.
 
 ## Verification

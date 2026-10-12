@@ -5,13 +5,15 @@
 /* /sbin/init: a small interactive shell in the spirit of busybox.
  *
  * Builtins mirror embedded-linux commands with the same behaviour, minus
- * what the kernel does not provide yet (no pipes, no symlinks, no ps/dmesg:
- * there is no process-list or log-buffer syscall, so `help` says so
- * instead of faking it). Anything showing driver state reads it live --
- * net_stat for `ip`, meminfo for `free`, /proc snapshots for the rest --
- * so no command prints canned text. Paths may be absolute or relative to
- * the shell's working directory (`cd`, `pwd`); the kernel canonicalizes
- * //, /./ and /../ on use, and the shell keeps cwd canonical itself. */
+ * what the kernel does not provide yet (no symlinks, no signals, no fork
+ * or job control: `help` says so instead of faking it). Anything showing
+ * driver state reads it live -- net_stat for `ip`, meminfo for `free`,
+ * /proc snapshots for the rest -- so no command prints canned text. Paths
+ * may be absolute or relative to the shell's working directory (`cd`,
+ * `pwd`); the kernel canonicalizes //, /./ and /../ on use, and the shell
+ * keeps cwd canonical itself. Command lines support quoting, `;` chaining,
+ * `|` pipes (temporary files) and < > >> redirection, all parsed by
+ * user/shparse.h with no quoting surprises. */
 
 #define LINE_MAX 256
 #define PATH_MAX 256
@@ -24,6 +26,9 @@
 #define E_NOSPC 28
 #define E_NODEV 19
 #define E_INVAL 22
+#define E_EXIST 17
+#define E_NOTDIR 20
+#define E_NOTEMPTY 39
 
 /* Diagnostics go to fd 2 so that `cmd > file` and pipes carry only data. */
 static void eputs(const char *s)
@@ -174,6 +179,27 @@ static void put_hex_n(u64 value, int digits)
     puts(buf);
 }
 
+/* Decimal, zero-padded on the left to `width` (`seq -w`). */
+static void put_dec_pad(u64 value, int width)
+{
+    char buf[24];
+    int n = 0;
+
+    do {
+        buf[n++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0 && n < (int)sizeof(buf));
+    while (n < width) {
+        puts("0");
+        ++n;
+    }
+    while (n > 0) {
+        char c = buf[--n];
+
+        write(1, &c, 1);
+    }
+}
+
 /* ---- working directory ---------------------------------------------- */
 
 static char cwd[PATH_MAX] = "/";
@@ -260,11 +286,30 @@ static void resolve(const char *in, char *out)
 /* Carve the next whitespace-separated token off *p (NUL-terminates it).
  * Returns 0 when nothing is left. */
 static void cmd_cat_proc(const char *name, const char *path);
+static int glob_star(const char *pat, const char *s);
+static int parse_symbolic(const char *spec, u32 old, int is_dir, u32 *out);
+static int passwd_scan(u32 want_uid, const char *want_name, u32 *uid, u32 *gid, char *name,
+                       size_t cap);
+static int passwd_resolve(const char *arg, u32 *uid, u32 *gid, char *name, size_t cap);
+static char *split_pw(char *line, u32 *uid, u32 *gid, int *ok);
+static char *split_group(char *line, u32 *gid, char **members, int *ok);
+static int group_name(u32 gid, char *out, size_t cap);
+static int group_gid(const char *name, u32 *gid);
+static int passwd_uid(const char *name, u32 *uid);
+static int passwd_name(u32 uid, char *out, size_t cap);
+static int read_line(int fd, char *line, size_t cap);
+static int confirm(const char *path);
+static int is_builtin(const char *name);
+static int confirm(const char *path);
+static int confirm(const char *path);
 
 static void ls_one(const char *path);
 static void ls_recursive(const char *path);
 
 static int ls_long; /* -l */
+static int ls_classify; /* -F: '/' for dirs, '*' for executables */
+static int ls_dirs_only; /* -d: list directories themselves, not contents */
+static int ls_human; /* -h: human sizes in -l */
 
 static void ls_print(const char *name, const struct stat_info *st)
 {
@@ -275,11 +320,21 @@ static void ls_print(const char *name, const struct stat_info *st)
         puts(" ");
         put_u64(st->gid);
         puts(" ");
-        put_u64(st->size);
+        if (ls_human) {
+            put_human(st->size);
+        } else {
+            put_u64(st->size);
+        }
         puts("\t");
     }
     puts(name);
-    puts(st->type == 2 ? "/\n" : "\n");
+    if (st->type == 2) {
+        puts("/\n");
+    } else if (ls_classify && (st->mode & 0111u) != 0) {
+        puts("*\n");
+    } else {
+        puts("\n");
+    }
 }
 
 /* List one path: the entries of a directory, or the file itself. */
@@ -320,7 +375,7 @@ static void ls_one(const char *path)
     }
 }
 
-/* ls [-l] [-R] [PATH...]: a header per path only when listing several. */
+/* ls [-lRFdh] [PATH...]: a header per path only when listing several. */
 static void cmd_ls(char *rest)
 {
     char *paths[16];
@@ -329,12 +384,18 @@ static void cmd_ls(char *rest)
     char *arg;
 
     ls_long = 0;
+    ls_classify = 0;
+    ls_dirs_only = 0;
+    ls_human = 0;
     for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
         if (arg[0] == '-' && arg[1] != '\0') {
             for (const char *f = arg + 1; *f; ++f) {
                 if (*f == 'l') ls_long = 1;
                 else if (*f == 'R') recursive = 1;
                 else if (*f == 'a') { /* no hidden files here: accepted for habit */ }
+                else if (*f == 'F') ls_classify = 1;
+                else if (*f == 'd') ls_dirs_only = 1;
+                else if (*f == 'h') ls_human = 1;
                 else {
                     print_status("ls", -E_INVAL);
                     return;
@@ -351,7 +412,15 @@ static void cmd_ls(char *rest)
         char path[PATH_MAX];
 
         memcpy(path, cwd, strlen(cwd) + 1);
-        if (recursive) {
+        if (ls_dirs_only) {
+            struct stat_info st;
+
+            if (stat(path, &st) != 0) {
+                print_status("ls", -E_NOENT);
+                return;
+            }
+            ls_print(path, &st);
+        } else if (recursive) {
             ls_recursive(path);
         } else {
             ls_one(path);
@@ -369,7 +438,15 @@ static void cmd_ls(char *rest)
             puts(paths[i]);
             puts(":\n");
         }
-        if (recursive) {
+        if (ls_dirs_only) {
+            struct stat_info st;
+
+            if (stat(path, &st) != 0) {
+                print_status(paths[i], -E_NOENT);
+                continue;
+            }
+            ls_print(path, &st);
+        } else if (recursive) {
             ls_recursive(path);
         } else {
             ls_one(path);
@@ -436,23 +513,26 @@ static int parse_num(const char **s, u32 base, u32 *out)
     return 0;
 }
 
-/* cat [-n] FILE...: concatenation keeps one numbering/begin state, like GNU. */
-static void cat_stream(int fd, int numbered, u64 *lineno, int *bol)
+/* cat [-nET] [FILE...|-]: concatenation keeps one numbering/begin state,
+ * like GNU. -E marks line ends with $, -T shows tabs as ^I, lone - is stdin. */
+static void cat_stream(int fd, int mode, u64 *lineno, int *bol)
 {
     char buf[128];
     ssize_t n;
+    int numbered = mode & 1, ends = mode & 2, tabs = mode & 4;
 
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
         size_t i = 0;
 
-        if (!numbered) {
+        if (!numbered && !ends && !tabs) {
             write(1, buf, (size_t)n);
             continue;
         }
         while (i < (size_t)n) {
             size_t j = i;
+            size_t k;
 
-            if (*bol) {
+            if (*bol && numbered) {
                 put_u64((*lineno)++);
                 puts("\t");
                 *bol = 0;
@@ -460,11 +540,30 @@ static void cat_stream(int fd, int numbered, u64 *lineno, int *bol)
             while (j < (size_t)n && buf[j] != '\n') {
                 ++j;
             }
-            if (j < (size_t)n) {
-                ++j; /* include the newline */
-                *bol = 1;
+            for (k = i; k < j;) {
+                size_t m = k;
+
+                while (m < j && (!tabs || buf[m] != '\t')) {
+                    ++m;
+                }
+                if (m > k) {
+                    write(1, buf + k, m - k);
+                }
+                if (m < j) {
+                    puts("^I");
+                    k = m + 1;
+                } else {
+                    k = m;
+                }
             }
-            write(1, buf + i, j - i);
+            if (j < (size_t)n) {
+                if (ends) {
+                    puts("$");
+                }
+                write(1, "\n", 1);
+                *bol = 1;
+                ++j;
+            }
             i = j;
         }
     }
@@ -474,59 +573,122 @@ static void cmd_cat(char *rest)
 {
     char path[PATH_MAX];
     int fd;
-    int numbered = 0;
+    int mode = 0;
     u64 lineno = 1;
     int bol = 1;
     char *file;
 
-    if (rest[0] == '-' && rest[1] == 'n' && (rest[2] == ' ' || rest[2] == '\0')) {
-        numbered = 1;
-        rest += 2;
-        while (*rest == ' ') {
-            ++rest;
+    for (file = next_arg(&rest); file && file[0] == '-' && file[1] != '\0';
+         file = next_arg(&rest)) {
+        for (const char *f = file + 1; *f; ++f) {
+            if (*f == 'n') {
+                mode |= 1;
+            } else if (*f == 'E') {
+                mode |= 2;
+            } else if (*f == 'T') {
+                mode |= 4;
+            } else {
+                print_status("cat", -E_INVAL);
+                return;
+            }
         }
     }
-    file = next_arg(&rest);
     if (!file) {
-        cat_stream(0, numbered, &lineno, &bol); /* no FILE: copy stdin */
+        cat_stream(0, mode, &lineno, &bol); /* no FILE: copy stdin */
         return;
     }
     for (; file; file = next_arg(&rest)) {
+        if (strcmp(file, "-") == 0) {
+            cat_stream(0, mode, &lineno, &bol);
+            continue;
+        }
         resolve(file, path);
         fd = open(path, 0);
         if (fd < 0) {
             print_status("cat", fd);
             return;
         }
-        cat_stream(fd, numbered, &lineno, &bol);
+        cat_stream(fd, mode, &lineno, &bol);
         close(fd);
     }
 }
 
-/* echo [-n] TEXT [> FILE | >> FILE] */
+/* echo [-n] [-e] TEXT [> FILE | >> FILE] */
+static void echo_word(const char *s, int esc, int *stop)
+{
+    for (; *s; ++s) {
+        char c = *s;
+
+        if (esc && c == '\\') {
+            char d = *++s;
+
+            if (d == '\0') {
+                write(1, "\\", 1);
+                return;
+            }
+            switch (d) {
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case 'a': c = '\x07'; break;
+            case 'b': c = '\b'; break;
+            case 'e': c = '\x1b'; break;
+            case 'f': c = '\x0c'; break;
+            case 'v': c = '\x0b'; break;
+            case 'c': *stop = 1; return; /* stop output, no newline */
+            case '\\': c = '\\'; break;
+            default: write(1, "\\", 1); c = d; break;
+            }
+        }
+        write(1, &c, 1);
+    }
+}
+
 static void cmd_echo(char *rest)
 {
     int nonl = 0;
+    int esc = 0;
     int first = 1;
     int printed = 0;
+    int stop = 0;
     char *arg;
 
     /* Redirection (`echo hi > file`) is handled for every command by the
      * pipeline layer; echo just prints its (unquoted) words. */
     for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
-        if (first && strcmp(arg, "-n") == 0) {
-            nonl = 1;
-            first = 0;
-            continue;
+        /* Single-letter flags, alone or clustered (-n, -ne). Anything else
+         * starting with '-' is an ordinary word, like GNU. */
+        if (first && arg[0] == '-' && arg[1] != '\0') {
+            int ok = 1;
+
+            for (const char *f = arg + 1; *f; ++f) {
+                if (*f == 'n') {
+                    nonl = 1;
+                } else if (*f == 'e') {
+                    esc = 1;
+                } else if (*f == 'E') {
+                    esc = 0;
+                } else {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok) {
+                first = 0;
+                continue;
+            }
         }
         first = 0;
         if (printed) {
             puts(" ");
         }
-        puts(arg);
+        echo_word(arg, esc, &stop);
+        if (stop) {
+            return;
+        }
         printed = 1;
     }
-    if (!nonl) {
+    if (!nonl && !stop) {
         puts("\n");
     }
 }
@@ -534,15 +696,31 @@ static void cmd_touch(char *rest)
 {
     char *arg = next_arg(&rest);
     char path[PATH_MAX];
+    int nocreate = 0;
 
+    if (arg && strcmp(arg, "-c") == 0) {
+        nocreate = 1;
+        arg = next_arg(&rest);
+    }
     if (!arg) {
         print_status("touch", -E_INVAL);
         return;
     }
     for (; arg; arg = next_arg(&rest)) {
         int fd;
+        struct stat_info st;
 
         resolve(arg, path);
+        if (nocreate) {
+            /* -c: never create; existing entries are already "touched"
+             * (this VFS keeps no timestamps). */
+            if (stat(path, &st) != 0) {
+                continue;
+            }
+            if (st.type != 1) {
+                continue;
+            }
+        }
         fd = open(path, O_CREAT | O_WRONLY);
         if (fd < 0) {
             print_status("touch", fd);
@@ -644,10 +822,26 @@ static void cmd_cp(char *rest)
     char *dst;
     char spath[PATH_MAX], dpath[PATH_MAX];
     int recursive = 0;
+    int interactive = 0;
     int r;
+    struct stat_info st;
 
-    if (src && strcmp(src, "-r") == 0) {
-        recursive = 1;
+    while (src && src[0] == '-' && src[1] != '\0') {
+        int ok = 1;
+
+        for (const char *f = src + 1; *f; ++f) {
+            if (*f == 'r' || *f == 'R') {
+                recursive = 1;
+            } else if (*f == 'i') {
+                interactive = 1;
+            } else {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok) {
+            break;
+        }
         src = next_arg(&rest);
     }
     dst = next_arg(&rest);
@@ -657,6 +851,9 @@ static void cmd_cp(char *rest)
     }
     resolve(src, spath);
     resolve(dst, dpath);
+    if (interactive && stat(dpath, &st) == 0 && !confirm(dpath)) {
+        return;
+    }
     if (recursive) {
         r = cp_tree(spath, dpath, 0);
     } else {
@@ -667,57 +864,33 @@ static void cmd_cp(char *rest)
     }
 }
 
-/* head [-N | -n N] FILE, tail [-N | -n N] FILE. tail rewinds and skips:
- * two streaming passes, no heap, works on any file size. */
-static void cmd_head_tail(char *rest, int is_tail)
+/* head/tail [-N | -n N | -c N | -q | -v] [FILE...]: lines by default,
+ * bytes with -c. -q never prints headers, -v always does; otherwise several
+ * files get "==> file <==" headers. tail rewinds and skips: two streaming
+ * passes, no heap, works on any file size. Console stdin cannot rewind, so
+ * tail spills it to a temp file first (same trick as pipelines); anything
+ * else streams straight off fd 0. */
+static void head_tail_fd(int fd, int is_stdin, const char *name, int is_tail, int bytes, u64 n)
 {
-    const char *name = is_tail ? "tail" : "head";
-    char *tok = next_arg(&rest);
-    char *file = tok;
-    u32 n = 10;
-    char path[PATH_MAX];
     char buf[IO_BUF];
-    int fd;
     ssize_t r;
+    int temp = 0;
+    char tpath[40];
 
-    if (tok && tok[0] == '-') {
-        if (tok[1] == 'n' && tok[2] == '\0') {
-            const char *a = next_arg(&rest);
-            u32 v = 0;
+    if (bytes && !is_tail) {
+        u64 left = n;
 
-            if (!a || parse_num(&a, 10, &v) != 0) {
-                print_status(name, -E_INVAL);
-                return;
-            }
-            n = v;
-        } else {
-            const char *a = tok + 1;
-            u32 v = 0;
+        while (left > 0 && (r = read(fd, buf, sizeof(buf))) > 0) {
+            size_t take = (u64)r < left ? (size_t)r : (size_t)left;
 
-            if (parse_num(&a, 10, &v) != 0) {
-                print_status(name, -E_INVAL);
-                return;
-            }
-            n = v;
+            write(1, buf, take);
+            left -= take;
         }
-        file = next_arg(&rest);
-    }
-    if (file && next_arg(&rest)) {
-        print_status(name, -E_INVAL);
+        close(fd);
         return;
     }
-    if (file) {
-        resolve(file, path);
-        fd = open(path, 0);
-        if (fd < 0) {
-            print_status(name, fd);
-            return;
-        }
-    } else {
-        fd = 0; /* no FILE: read stdin */
-    }
     if (!is_tail) {
-        u32 lines = 0;
+        u64 lines = 0;
 
         while (lines < n && (r = read(fd, buf, sizeof(buf))) > 0) {
             size_t stop = (size_t)r;
@@ -734,6 +907,78 @@ static void cmd_head_tail(char *rest, int is_tail)
         return;
     }
     {
+        /* Console stdin cannot rewind: spill it to a temp file first.
+         * Probe with a no-op seek (harmless on files, EBADF on consoles);
+         * pipelines already hand us rewindable files. */
+        if (is_stdin && lseek(fd, 0, 0) != 0) {
+            int tf;
+            ssize_t k;
+            char *w = tpath;
+            const char *base = "/tmp/.tail";
+            u64 v = (u64)getpid();
+            char digits[20];
+            int nd = 0;
+
+            while (*base) {
+                *w++ = *base++;
+            }
+            do {
+                digits[nd++] = (char)('0' + v % 10);
+                v /= 10;
+            } while (v != 0);
+            while (nd > 0) {
+                *w++ = digits[--nd];
+            }
+            *w = '\0';
+            tf = open(tpath, O_CREAT | O_TRUNC | O_WRONLY);
+            if (tf < 0) {
+                print_status(name, tf);
+                return;
+            }
+            while ((k = read(0, buf, sizeof(buf))) > 0) {
+                if (write(tf, buf, (size_t)k) != k) {
+                    print_status(name, -12);
+                    close(tf);
+                    unlink(tpath);
+                    return;
+                }
+            }
+            close(tf);
+            fd = open(tpath, 0);
+            if (fd < 0) {
+                print_status(name, fd);
+                unlink(tpath);
+                return;
+            }
+            temp = 1;
+        }
+        if (bytes) {
+            /* Pass 1: total bytes; pass 2: skip total-n, print the rest. */
+            u64 total = 0;
+            u64 skip;
+
+            while ((r = read(fd, buf, sizeof(buf))) > 0) {
+                total += (u64)r;
+            }
+            if (lseek(fd, 0, 0) < 0) {
+                print_status(name, -5);
+                goto tail_done;
+            }
+            skip = total > n ? total - n : 0;
+            while ((r = read(fd, buf, sizeof(buf))) > 0) {
+                size_t from = 0;
+
+                if (skip > 0) {
+                    size_t drop = (u64)r < skip ? (size_t)r : (size_t)skip;
+
+                    skip -= drop;
+                    from = drop;
+                }
+                if (from < (size_t)r) {
+                    write(1, buf + from, (size_t)r - from);
+                }
+            }
+        } else {
         /* Pass 1: count lines (a trailing partial line counts). */
         u64 total = 0;
         int partial = 0;
@@ -753,8 +998,7 @@ static void cmd_head_tail(char *rest, int is_tail)
         }
         if (lseek(fd, 0, 0) < 0) {
             print_status(name, -5);
-            close(fd);
-            return;
+            goto tail_done;
         }
         /* Pass 2: print from line (total - n). */
         {
@@ -780,7 +1024,115 @@ static void cmd_head_tail(char *rest, int is_tail)
                 write(1, buf + from, (size_t)r - from);
             }
         }
-        close(fd);
+        }
+    tail_done:
+        if (temp) {
+            close(fd);
+            unlink(tpath);
+        } else {
+            close(fd);
+        }
+    }
+}
+
+static void cmd_head_tail(char *rest, int is_tail)
+{
+    const char *name = is_tail ? "tail" : "head";
+    char *files[16];
+    int nfiles = 0;
+    char *arg;
+    u64 n = 10;
+    int bytes = 0;
+    int quiet = 0, verbose = 0;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            /* -n N, -c N, -nN, -cN, bare -N, -q, -v, clustered (-qv). */
+            if ((arg[1] == 'n' || arg[1] == 'c') && arg[2] == '\0') {
+                const char *a = next_arg(&rest);
+                u32 v = 0;
+
+                if (!a || parse_num(&a, 10, &v) != 0) {
+                    print_status(name, -E_INVAL);
+                    return;
+                }
+                n = v;
+                bytes = arg[1] == 'c';
+            } else if ((arg[1] == 'n' || arg[1] == 'c') && arg[2] >= '0' && arg[2] <= '9') {
+                const char *a = arg + 2;
+                u32 v = 0;
+
+                if (parse_num(&a, 10, &v) != 0) {
+                    print_status(name, -E_INVAL);
+                    return;
+                }
+                n = v;
+                bytes = arg[1] == 'c';
+            } else {
+                int flags_only = 1;
+
+                for (const char *f = arg + 1; *f; ++f) {
+                    if (*f == 'q') {
+                        quiet = 1;
+                    } else if (*f == 'v') {
+                        verbose = 1;
+                    } else if (*f >= '0' && *f <= '9') {
+                        const char *a = f;
+                        u32 v = 0;
+
+                        if (parse_num(&a, 10, &v) != 0) {
+                            print_status(name, -E_INVAL);
+                            return;
+                        }
+                        n = v;
+                        f = a - 1; /* the for-step advances past the digits */
+                    } else {
+                        flags_only = 0;
+                        break;
+                    }
+                }
+                if (!flags_only) {
+                    print_status(name, -E_INVAL);
+                    return;
+                }
+            }
+        } else if (nfiles < 16) {
+            files[nfiles++] = arg;
+        } else {
+            print_status(name, -E_INVAL);
+            return;
+        }
+    }
+    {
+        int header = verbose || (!quiet && nfiles > 1);
+
+        if (nfiles == 0) {
+            if (header) {
+                puts("==> standard input <==\n");
+            }
+            head_tail_fd(0, 1, name, is_tail, bytes, n);
+            return;
+        }
+        for (int i = 0; i < nfiles; ++i) {
+            char path[PATH_MAX];
+            int fd;
+
+            resolve(files[i], path);
+            fd = open(path, 0);
+            if (fd < 0) {
+                print_status(files[i], fd);
+                continue;
+            }
+            if (header) {
+                if (i > 0) {
+                    puts("\n");
+                }
+                puts("==> ");
+                puts(files[i]);
+                puts(" <==\n");
+            }
+            head_tail_fd(fd, 0, name, is_tail, bytes, n);
+        }
     }
 }
 
@@ -798,6 +1150,21 @@ static void put_u64_pad(u64 v, int width)
     }
     while (n > 0) {
         write(1, &num[--n], 1);
+    }
+}
+
+/* Same digits to fd 2, for diagnostics that must not pollute pipes. */
+static void put_u64_e(u64 v)
+{
+    char num[24];
+    int n = 0;
+
+    do {
+        num[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+    while (n > 0) {
+        write(2, &num[--n], 1);
     }
 }
 
@@ -907,6 +1274,7 @@ static void cmd_wc(char *rest)
  * matched on their first LINE_MAX-1 bytes. */
 struct grep_opts {
     int icase, number, invert, count, show_name;
+    u64 max; /* -m: stop after this many matches (0 = no limit) */
 };
 
 static char lower_c(char c)
@@ -966,7 +1334,7 @@ static int grep_stream(int fd, const char *name, const char *pat, size_t plen, c
     ssize_t r;
 
     while ((r = read(fd, buf, sizeof(buf))) > 0) {
-        for (ssize_t i = 0; i < r; ++i) {
+        for (ssize_t i = 0; i < r && !(o->max && (u64)hits >= o->max); ++i) {
             if (buf[i] != '\n') {
                 if (llen + 1 < sizeof(line)) {
                     line[llen++] = buf[i];
@@ -985,7 +1353,7 @@ static int grep_stream(int fd, const char *name, const char *pat, size_t plen, c
             partial = 0;
         }
     }
-    if (r == 0 && partial) { /* last line without a newline */
+    if (r == 0 && partial && !(o->max && (u64)hits >= o->max)) { /* last line without a newline */
         ++lineno;
         if (line_matches(line, llen, pat, plen, o->icase) != o->invert) {
             ++hits;
@@ -1063,7 +1431,7 @@ static int grep_path(const char *path, const char *pat, size_t plen, const struc
 
 static void cmd_grep(char *rest)
 {
-    struct grep_opts o = {0, 0, 0, 0, 0};
+    struct grep_opts o = {0, 0, 0, 0, 0, 0};
     int recursive = 0;
     char *arg;
     char *pat = 0;
@@ -1072,6 +1440,18 @@ static void cmd_grep(char *rest)
 
     for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
         if (!pat && arg[0] == '-' && arg[1] != '\0') {
+            /* -m takes a number: -m N or -mN, never clustered. */
+            if (arg[1] == 'm' && (arg[2] == '\0' || (arg[2] >= '0' && arg[2] <= '9'))) {
+                const char *a = arg[2] ? arg + 2 : next_arg(&rest);
+                u32 v = 0;
+
+                if (!a || parse_num(&a, 10, &v) != 0 || v == 0) {
+                    print_status("grep", -E_INVAL);
+                    return;
+                }
+                o.max = v;
+                continue;
+            }
             for (const char *f = arg + 1; *f; ++f) {
                 if (*f == 'i') o.icase = 1;
                 else if (*f == 'n') o.number = 1;
@@ -1201,8 +1581,10 @@ static int walk(const char *path, int depth, u64 *total, int print)
 
 /* Apply chmod/chown over a tree. Continues past per-entry errors the way
  * GNU does, reporting the first one. No symlinks exist in this VFS, so the
- * depth cap only guards pathological nesting. */
-static int chmod_tree(const char *path, u32 mode, u32 uid, u32 gid, int do_chown, int depth)
+ * depth cap only guards pathological nesting. With `sym` set, each node gets
+ * its own symbolic evaluation (X and copies depend on the node). */
+static int chmod_tree(const char *path, u32 mode, u32 uid, u32 gid, int do_chown, int depth,
+                      const char *sym)
 {
     struct stat_info st;
     int first = 0;
@@ -1211,7 +1593,16 @@ static int chmod_tree(const char *path, u32 mode, u32 uid, u32 gid, int do_chown
     if (stat(path, &st) != 0) {
         return -E_NOENT;
     }
-    r = do_chown ? chown(path, uid, gid) : chmod(path, mode);
+    if (sym) {
+        u32 want = 0;
+
+        if (parse_symbolic(sym, st.mode, st.type == 2, &want) != 0) {
+            return -E_INVAL;
+        }
+        r = chmod(path, want);
+    } else {
+        r = do_chown ? chown(path, uid, gid) : chmod(path, mode);
+    }
     if (r != 0) {
         first = r;
     }
@@ -1241,7 +1632,7 @@ static int chmod_tree(const char *path, u32 mode, u32 uid, u32 gid, int do_chown
             child[pl++] = '/';
         }
         memcpy(child + pl, name, strlen(name) + 1);
-        r = chmod_tree(child, mode, uid, gid, do_chown, depth + 1);
+        r = chmod_tree(child, mode, uid, gid, do_chown, depth + 1, sym);
         if (r != 0 && !first) {
             first = r;
         }
@@ -1284,24 +1675,88 @@ static void cmd_du(char *rest)
 }
 
 static int glob_star(const char *pat, const char *s);
-static int find_name(const char *path, const char *pat, int depth);
+static int find_filtered(const char *path, const char *pat, int ftype, int maxdepth, int del,
+                         int have_exec, char (*exec_argv)[64], int exec_argc, int show, int depth);
+static int parse_symbolic(const char *spec, u32 old, int is_dir, u32 *out);
+static int run_line(char *line);
 
 static void cmd_find(char *rest)
 {
     char path[PATH_MAX];
-    char *arg = next_arg(&rest);
+    char *arg;
     char *pat = 0;
-    char *dir = arg;
+    char *dir = 0;
+    int ftype = 0;   /* 0 any, 1 files only, 2 dirs only */
+    int maxdepth = -1; /* -1 unlimited */
+    int del = 0;
+    int show = 0;    /* explicit -print */
+    char exec_argv[8][64];
+    int exec_argc = 0;
+    int have_exec = 0;
 
-    if (arg && strcmp(arg, "-name") == 0) {
-        pat = next_arg(&rest);
-        dir = next_arg(&rest);
-        if (!pat) {
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (strcmp(arg, "-name") == 0) {
+            pat = next_arg(&rest);
+            if (!pat) {
+                print_status("find", -E_INVAL);
+                return;
+            }
+        } else if (strcmp(arg, "-type") == 0) {
+            char *t = next_arg(&rest);
+
+            if (!t || (t[0] != 'f' && t[0] != 'd') || t[1] != '\0') {
+                print_status("find", -E_INVAL);
+                return;
+            }
+            ftype = t[0] == 'f' ? 1 : 2;
+        } else if (strcmp(arg, "-maxdepth") == 0) {
+            const char *a = next_arg(&rest);
+            u32 v = 0;
+
+            if (!a || parse_num(&a, 10, &v) != 0) {
+                print_status("find", -E_INVAL);
+                return;
+            }
+            maxdepth = v > 16 ? 16 : (int)v;
+        } else if (strcmp(arg, "-delete") == 0) {
+            del = 1;
+        } else if (strcmp(arg, "-print") == 0) {
+            show = 1;
+        } else if (strcmp(arg, "-exec") == 0) {
+            char *a = next_arg(&rest);
+
+            if (!a) {
+                print_status("find", -E_INVAL);
+                return;
+            }
+            for (; a && strcmp(a, ";") != 0; a = next_arg(&rest)) {
+                size_t k;
+
+                if (exec_argc >= 8) {
+                    print_status("find", -E_INVAL);
+                    return;
+                }
+                k = strlen(a);
+                if (k >= sizeof(exec_argv[0])) {
+                    print_status("find", -E_INVAL);
+                    return;
+                }
+                memcpy(exec_argv[exec_argc], a, k + 1);
+                ++exec_argc;
+            }
+            if (!a || exec_argc == 0) {
+                print_status("find", -E_INVAL);
+                return;
+            }
+            have_exec = 1;
+        } else if (!dir) {
+            dir = arg;
+        } else {
             print_status("find", -E_INVAL);
             return;
         }
     }
-    if (dir && next_arg(&rest)) {
+    if (del && have_exec) {
         print_status("find", -E_INVAL);
         return;
     }
@@ -1310,13 +1765,14 @@ static void cmd_find(char *rest)
     } else {
         resolve(dir, path);
     }
-    if (!pat) {
+    if (!pat && ftype == 0 && maxdepth < 0 && !del && !have_exec) {
         if (walk(path, 0, 0, 1) != 0) {
             print_status("find", -E_NOENT);
         }
         return;
     }
-    if (find_name(path, pat, 0) != 0) {
+    if (find_filtered(path, pat, ftype, maxdepth, del, have_exec, exec_argv, exec_argc,
+                       show || (!del && !have_exec), 0) != 0) {
         print_status("find", -E_NOENT);
     }
 }
@@ -1348,7 +1804,18 @@ static int glob_star(const char *pat, const char *s)
     return *pat == '\0';
 }
 
-static int find_name(const char *path, const char *pat, int depth)
+
+/* Set when a nested -exec runs `exit`: run_pipeline() turns it into a real
+ * shell exit, since the void cmd_find cannot return one itself. */
+static int find_nested_exit;
+
+/* Filtered walk for -name/-type/-maxdepth with -print/-delete/-exec
+ * actions. Returns -1 only when the top path is missing/unreadable (the
+ * caller reports it); per-entry action errors print inline and continue,
+ * like GNU. `pat` NULL matches everything. */
+static int find_filtered(const char *path, const char *pat, int ftype, int maxdepth, int del,
+                         int have_exec, char (*exec_argv)[64], int exec_argc, int show,
+                         int depth)
 {
     struct stat_info st;
     char name[64];
@@ -1357,50 +1824,119 @@ static int find_name(const char *path, const char *pat, int depth)
     if (stat(path, &st) != 0) {
         return -1;
     }
-    if (st.type != 2) {
+    {
         const char *base = path;
         const char *slash = path;
+        int is_dir = st.type == 2;
+        int match;
+        int descend;
 
         while (*slash) {
             if (*slash++ == '/') {
                 base = slash;
             }
         }
-        if (glob_star(pat, base)) {
-            puts(path);
-            puts("\n");
-        }
-        return 0;
-    }
-    if (depth > 16) {
-        return 0;
-    }
-    for (u64 i = 0;; ++i) {
-        int r = readdir(path, i, name, sizeof(name));
-        size_t pl = strlen(path);
+        match = (!pat || glob_star(pat, base)) &&
+                (ftype == 0 || (ftype == 1 && !is_dir) || (ftype == 2 && is_dir));
+        descend = is_dir && depth <= 16 && (maxdepth < 0 || depth < maxdepth);
+        if (match && del && !(is_dir && descend)) {
+            int r = unlink(path);
 
-        if (r < 0) {
-            return -1;
+            if (r < 0) {
+                print_status("find", r);
+            }
+        } else if (match && have_exec) {
+            char cmd[LINE_MAX];
+            size_t off = 0;
+            int i;
+
+            for (i = 0; i < exec_argc; ++i) {
+                const char *a = exec_argv[i];
+                size_t k = 0;
+
+                if (i > 0) {
+                    if (off + 1 >= sizeof(cmd)) {
+                        print_status("find", -E_INVAL);
+                        return 0;
+                    }
+                    cmd[off++] = ' ';
+                }
+                for (;;) {
+                    const char *brace = a + k;
+                    size_t blen = 0;
+
+                    while (brace[blen] && (brace[blen] != '{' || brace[blen + 1] != '}')) {
+                        ++blen;
+                    }
+                    if (off + blen >= sizeof(cmd)) {
+                        print_status("find", -E_INVAL);
+                        return 0;
+                    }
+                    memcpy(cmd + off, a + k, blen);
+                    off += blen;
+                    k += blen;
+                    if (a[k] == '\0') {
+                        break;
+                    }
+                    /* Found "{}": substitute the path. */
+                    blen = strlen(path);
+                    if (off + blen >= sizeof(cmd)) {
+                        print_status("find", -E_INVAL);
+                        return 0;
+                    }
+                    memcpy(cmd + off, path, blen);
+                    off += blen;
+                    k += 2;
+                }
+            }
+            cmd[off] = '\0';
+            if (run_line(cmd)) {
+                find_nested_exit = 1;
+                return 0;
+            }
+        } else if (match && show) {
+            puts(path);
+            puts(is_dir ? "/\n" : "\n");
         }
-        if (r == 0) {
+        if (!is_dir || depth > 16 || (maxdepth >= 0 && depth >= maxdepth)) {
             return 0;
         }
-        if (pl + strlen(name) + 2 >= sizeof(child)) {
-            continue;
-        }
-        memcpy(child, path, pl);
-        if (pl == 0 || child[pl - 1] != '/') {
-            child[pl++] = '/';
-        }
-        memcpy(child + pl, name, strlen(name) + 1);
-        if (r == 2) {
-            if (find_name(child, pat, depth + 1) != 0) {
+        for (u64 i = 0;; ++i) {
+            int r = readdir(path, i, name, sizeof(name));
+            size_t pl = strlen(path);
+
+            if (r < 0) {
+                return 0; /* entries already shown stay shown */
+            }
+            if (r == 0) {
+                break;
+            }
+            if (pl + strlen(name) + 2 >= sizeof(child)) {
+                continue;
+            }
+            memcpy(child, path, pl);
+            if (pl == 0 || child[pl - 1] != '/') {
+                child[pl++] = '/';
+            }
+            memcpy(child + pl, name, strlen(name) + 1);
+            if (find_filtered(child, pat, ftype, maxdepth, del, have_exec, exec_argv,
+                               exec_argc, show, depth + 1) != 0) {
                 return -1;
             }
-        } else if (glob_star(pat, name)) {
-            puts(child);
-            puts("\n");
+            if (find_nested_exit) {
+                return 0;
+            }
         }
+        /* -delete unlinks a matched directory after its children
+         * (bottom-up), so removing a whole tree actually empties it. */
+        if (del && match) {
+            int r = unlink(path);
+
+            if (r < 0) {
+                print_status("find", r);
+            }
+        }
+        return 0;
     }
 }
 
@@ -1598,12 +2134,813 @@ static void cmd_cut(char *rest)
     }
 }
 
-/* uniq [-c] [FILE]: collapse adjacent duplicate lines (stdin by default). */
+/* xargs [-n MAX] [-0] CMD [ARGS...]: append stdin lines to CMD and run it,
+ * batching to MAX args (default: everything fitting one command line).
+ * -0 splits on NUL instead of newlines. Empty input still runs once. */
+#define XARGS_MAX_BYTES 65536u
+#define XARGS_MAX_ITEMS 1024u
+#define XARGS_ARG_CAP 112u /* spawn truncates past AXYS_ARGS_MAX */
+
+static char xargs_buf[XARGS_MAX_BYTES + 1u];
+static char *xargs_item[XARGS_MAX_ITEMS];
+
+static void cmd_xargs(char *rest)
+{
+    char *arg;
+    u64 maxargs = 0;
+    int zero = 0;
+    char *cmd_argv[16];
+    int ncmd = 0;
+    char prog[PATH_MAX];
+    int nitems = 0;
+    int r;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0' && ncmd == 0) {
+            if (strcmp(arg, "-0") == 0) {
+                zero = 1;
+            } else if (strcmp(arg, "-n") == 0) {
+                const char *a = next_arg(&rest);
+                u32 v = 0;
+
+                if (!a || parse_num(&a, 10, &v) != 0 || v == 0) {
+                    print_status("xargs", -E_INVAL);
+                    return;
+                }
+                maxargs = v;
+            } else {
+                print_status("xargs", -E_INVAL);
+                return;
+            }
+        } else if (ncmd < 16) {
+            cmd_argv[ncmd++] = arg;
+        } else {
+            print_status("xargs", -E_INVAL);
+            return;
+        }
+    }
+    if (ncmd == 0) {
+        print_status("xargs", -E_INVAL);
+        return;
+    }
+    /* Slurp stdin raw (NULs kept for -0), then split in place. */
+    {
+        char buf[IO_BUF];
+        ssize_t k;
+        size_t len = 0;
+        int truncated = 0;
+
+        while ((k = read(0, buf, sizeof(buf))) > 0) {
+            size_t take = (size_t)k;
+
+            if (len + take > XARGS_MAX_BYTES) {
+                take = XARGS_MAX_BYTES - len;
+                truncated = 1;
+            }
+            memcpy(xargs_buf + len, buf, take);
+            len += take;
+            if (truncated || len == XARGS_MAX_BYTES) {
+                char probe;
+
+                if (!truncated && read(0, &probe, 1) > 0) {
+                    truncated = 1;
+                }
+                break;
+            }
+        }
+        if (k < 0) {
+            print_status("xargs", (int)k);
+            return;
+        }
+        for (size_t i = 0; i < len && nitems < (int)XARGS_MAX_ITEMS;) {
+            size_t j = i;
+
+            while (j < len && xargs_buf[j] != (zero ? '\0' : '\n')) {
+                ++j;
+            }
+            xargs_buf[j] = '\0'; /* terminator or overwrites the delimiter */
+            if (j > i) {
+                xargs_item[nitems++] = xargs_buf + i;
+            }
+            i = j + 1;
+        }
+        if (nitems == XARGS_MAX_ITEMS) {
+            /* Extra input beyond the cap is dropped, loudly. */
+            eputs("xargs: input truncated\n");
+        }
+    }
+    if (cmd_argv[0][0] == '/') {
+        resolve(cmd_argv[0], prog);
+    } else {
+        size_t cl = strlen(cmd_argv[0]);
+
+        if (cl + 6 >= 64) {
+            print_status("xargs", -E_INVAL);
+            return;
+        }
+        memcpy(prog, "/bin/", 5);
+        memcpy(prog + 5, cmd_argv[0], cl + 1);
+    }
+    /* Fail once up front (not once per batch): missing programs and shell
+     * builtins (echo, cat, ...) cannot run here, only /bin programs. */
+    {
+        struct stat_info pst;
+
+        if (stat(prog, &pst) != 0 || pst.type != 1) {
+            print_status("xargs", -E_NOENT);
+            return;
+        }
+    }
+    /* Batch: at most maxargs items and XARGS_ARG_CAP bytes per run. */
+    {
+        int at = 0;
+
+        do {
+            char args[128];
+            size_t off = 0;
+            u64 batch = 0;
+
+            for (int i = 1; i < ncmd; ++i) {
+                size_t k = strlen(cmd_argv[i]);
+
+                if (off + k + 2 >= sizeof(args)) {
+                    print_status("xargs", -E_INVAL);
+                    return;
+                }
+                if (off > 0) {
+                    args[off++] = ' ';
+                }
+                memcpy(args + off, cmd_argv[i], k);
+                off += k;
+            }
+            while (at < nitems && (maxargs == 0 || batch < maxargs)) {
+                size_t k = strlen(xargs_item[at]);
+
+                if (off + k + 2 >= XARGS_ARG_CAP) {
+                    break;
+                }
+                if (off > 0) {
+                    args[off++] = ' ';
+                }
+                memcpy(args + off, xargs_item[at], k);
+                off += k;
+                ++at;
+                ++batch;
+            }
+            args[off] = '\0';
+            r = run(prog, off > 0 ? args : "");
+            (void)r;
+        } while (at < nitems);
+    }
+}
+
+/* file FILE...: hand-rolled magic (no magic DB here): ELF details from the
+ * header, #! scripts, empty/text/data, plus executable bit when set. */
+#define FILE_SAMPLE 512u
+static void cmd_file(char *rest)
+{
+    char *arg = next_arg(&rest);
+
+    if (!arg) {
+        print_status("file", -E_INVAL);
+        return;
+    }
+    for (; arg; arg = next_arg(&rest)) {
+        char path[PATH_MAX];
+        struct stat_info st;
+        int fd;
+        int is_elf = 0;
+        unsigned char head[FILE_SAMPLE];
+        ssize_t n;
+        ssize_t total = 0;
+
+        resolve(arg, path);
+        if (stat(path, &st) != 0) {
+            print_status(arg, -E_NOENT);
+            continue;
+        }
+        if (st.type == 2) {
+            puts(path);
+            puts(": directory\n");
+            continue;
+        }
+        fd = open(path, 0);
+        if (fd < 0) {
+            print_status(arg, fd);
+            continue;
+        }
+        while (total < (ssize_t)sizeof(head)) {
+            n = read(fd, head + total, sizeof(head) - (size_t)total);
+            if (n <= 0) {
+                break;
+            }
+            total += n;
+        }
+        close(fd);
+        if (n < 0) {
+            print_status(arg, (int)n);
+            continue;
+        }
+        puts(path);
+        puts(": ");
+        if (total == 0) {
+            puts("empty");
+        } else if (total >= 4 && head[0] == 0x7f && head[1] == 'E' && head[2] == 'L' &&
+                   head[3] == 'F') {
+            /* e_type at 16, e_machine at 18 (little-endian fields; a
+             * big-endian image still matches the magic line). */
+            unsigned type = total >= 18 ? (unsigned)head[16] | ((unsigned)head[17] << 8) : 0;
+            unsigned mach = total >= 20 ? (unsigned)head[18] | ((unsigned)head[19] << 8) : 0;
+            const char *kind = type == 2 ? "executable" :
+                               type == 3 ? "pie executable" :
+                               type == 1 ? "relocatable" : "unknown type";
+            const char *arch = mach == 62 ? "x86-64" : mach == 3 ? "i386" : "unknown-machine";
+
+            puts("ELF ");
+            put_u64(head[4] == 2 ? 64 : head[4] == 1 ? 32 : 0);
+            puts("-bit LSB ");
+            puts(kind);
+            puts(", ");
+            puts(arch);
+            if (head[4] != 1 && head[4] != 2) {
+                puts(" (odd class byte)");
+            }
+            is_elf = 1;
+        } else if (total >= 2 && head[0] == '#' && head[1] == '!') {
+            size_t e = 2;
+
+            while (e < (size_t)total && head[e] != '\n') {
+                ++e;
+            }
+            {
+                char interp[48];
+                size_t k = e - 2;
+
+                if (k >= sizeof(interp)) {
+                    k = sizeof(interp) - 1;
+                }
+                memcpy(interp, head + 2, k);
+                interp[k] = '\0';
+                puts(interp);
+                puts(" script");
+            }
+        } else {
+            int text = 1;
+
+            for (ssize_t i = 0; i < total; ++i) {
+                unsigned char c = head[i];
+
+                if (c != '\n' && c != '\t' && c != '\r' && (c < 0x20 || c > 0x7e)) {
+                    text = 0;
+                    break;
+                }
+            }
+            /* Only the first FILE_SAMPLE bytes were read: claim text only
+             * when the whole file fit (else "data" would lie about binaries
+             * with a clean-looking header). */
+            if (text && (u64)total < (u64)st.size) {
+                text = 0;
+            }
+            puts(text ? "ASCII text" : "data");
+        }
+        if (!is_elf && (st.mode & 0111u) != 0 && total > 0) {
+            puts(", executable");
+        }
+        puts("\n");
+    }
+}
+
+/* type NAME...: shell builtin, /bin path, or missing. */
+static void cmd_type(char *rest)
+{
+    char *arg = next_arg(&rest);
+
+    if (!arg) {
+        print_status("type", -E_INVAL);
+        return;
+    }
+    for (; arg; arg = next_arg(&rest)) {
+        if (is_builtin(arg)) {
+            puts(arg);
+            puts(" is a shell builtin\n");
+            continue;
+        }
+        if (arg[0] == '/') {
+            char path[PATH_MAX];
+            struct stat_info st;
+
+            resolve(arg, path);
+            if (stat(path, &st) == 0) {
+                puts(path);
+                puts("\n");
+            } else {
+                print_status("type", -E_NOENT);
+            }
+            continue;
+        }
+        {
+            char path[64];
+            struct stat_info st;
+            size_t cl = strlen(arg);
+
+            if (cl + 6 >= sizeof(path)) {
+                print_status("type", -E_INVAL);
+                continue;
+            }
+            memcpy(path, "/bin/", 5);
+            memcpy(path + 5, arg, cl + 1);
+            if (stat(path, &st) == 0) {
+                puts(path);
+                puts("\n");
+            } else {
+                print_status("type", -E_NOENT);
+            }
+        }
+    }
+}
+
+/* uniq [-cdu] [FILE]: collapse adjacent duplicate lines (stdin by default).
+ * -d prints only repeated lines, -u only unique ones. */
+
+/* gen_suffix: counter n in `base` (10 digits or 26 letters) exactly `len`
+ * chars into out (no NUL). Returns 0, or -1 when n needs more digits. */
+static int gen_suffix(char *out, u64 n, int base, int len)
+{
+    char tmp[20];
+    int nd = 0;
+
+    do {
+        tmp[nd++] = (char)(n % (u64)base);
+        n /= (u64)base;
+    } while (n != 0);
+    if (nd > len) {
+        return -1;
+    }
+    for (int i = 0; i < len; ++i) {
+        int d = (i < len - nd) ? 0 : (tmp[len - 1 - i] & 0xff);
+
+        out[i] = base == 10 ? (char)('0' + d) : (char)('a' + d);
+    }
+    return 0;
+}
+
+/* split [-l N | -b N] [-d] [-a LEN] [FILE] [PREFIX]: default 1000 lines,
+ * prefix "x", 2-letter suffixes. Suffixes exhaust at base^len. */
+/* Open PREFIX+suffix(piece) for writing. Prints diagnostics, returns the
+ * fd or a negative errno. */
+static int split_open(const char *prefix, u64 piece, int numeric, int suflen)
+{
+    char outpath[PATH_MAX];
+    char suf[9];
+    size_t pl = strlen(prefix);
+    int out;
+
+    if (gen_suffix(suf, piece, numeric ? 10 : 26, suflen) != 0 ||
+        pl + (size_t)suflen + 1 > sizeof(outpath)) {
+        print_status("split", -E_NOSPC);
+        return -E_NOSPC;
+    }
+    memcpy(outpath, prefix, pl);
+    memcpy(outpath + pl, suf, (size_t)suflen);
+    outpath[pl + (size_t)suflen] = '\0';
+    out = open(outpath, O_CREAT | O_TRUNC | O_WRONLY);
+    if (out < 0) {
+        print_status("split", out);
+    }
+    return out;
+}
+
+static void cmd_split(char *rest)
+{
+    char *arg;
+    u64 count = 1000;
+    int bytes = 0;
+    int numeric = 0;
+    int suflen = 2;
+    char *files[2];
+    int nfiles = 0;
+    char path[PATH_MAX];
+    char prefix[PATH_MAX];
+    char buf[IO_BUF];
+    int fd = 0;
+    ssize_t r = 0;
+    u64 piece = 0;
+    int out = -1;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            if ((arg[1] == 'l' || arg[1] == 'b') && arg[2] == '\0') {
+                const char *a = next_arg(&rest);
+                u32 v = 0;
+
+                if (!a || parse_num(&a, 10, &v) != 0 || v == 0) {
+                    print_status("split", -E_INVAL);
+                    return;
+                }
+                count = v;
+                bytes = arg[1] == 'b';
+            } else if ((arg[1] == 'l' || arg[1] == 'b') && arg[2] >= '0' && arg[2] <= '9') {
+                const char *a = arg + 2;
+                u32 v = 0;
+
+                if (parse_num(&a, 10, &v) != 0 || v == 0) {
+                    print_status("split", -E_INVAL);
+                    return;
+                }
+                count = v;
+                bytes = arg[1] == 'b';
+            } else if (strcmp(arg, "-d") == 0) {
+                numeric = 1;
+            } else if (strcmp(arg, "-a") == 0) {
+                const char *a = next_arg(&rest);
+                u32 v = 0;
+
+                if (!a || parse_num(&a, 10, &v) != 0 || v < 1 || v > 8) {
+                    print_status("split", -E_INVAL);
+                    return;
+                }
+                suflen = (int)v;
+            } else {
+                print_status("split", -E_INVAL);
+                return;
+            }
+        } else if (nfiles < 2) {
+            files[nfiles++] = arg;
+        } else {
+            print_status("split", -E_INVAL);
+            return;
+        }
+    }
+    if (nfiles == 0) {
+        fd = 0;
+        memcpy(prefix, "x", 2);
+    } else {
+        if (nfiles == 2) {
+            if (strlen(files[1]) >= sizeof(prefix)) {
+                print_status("split", -E_INVAL);
+                return;
+            }
+            memcpy(prefix, files[1], strlen(files[1]) + 1);
+        } else {
+            memcpy(prefix, "x", 2);
+        }
+        /* PREFIX is relative to cwd, like every other path argument. */
+        if (prefix[0] != '/') {
+            char tmp[PATH_MAX];
+            size_t c = strlen(cwd);
+            size_t pl = strlen(prefix);
+
+            if (c + 1 + pl >= sizeof(tmp)) {
+                print_status("split", -E_INVAL);
+                return;
+            }
+            memcpy(tmp, cwd, c);
+            tmp[c] = '/';
+            memcpy(tmp + c + 1, prefix, pl + 1);
+            resolve(tmp, prefix);
+        }
+        resolve(files[0], path);
+        fd = open(path, 0);
+        if (fd < 0) {
+            print_status("split", fd);
+            return;
+        }
+    }
+    if (bytes) {
+        u64 left = count;
+
+        for (;;) {
+            left = count;
+            out = split_open(prefix, piece, numeric, suflen);
+            if (out < 0) {
+                break;
+            }
+            while (left > 0 && (r = read(fd, buf, sizeof(buf))) > 0) {
+                size_t take = (u64)r < left ? (size_t)r : (size_t)left;
+
+                if (write(out, buf, take) != (ssize_t)take) {
+                    print_status("split", -12);
+                    close(out);
+                    out = -1;
+                    break;
+                }
+                left -= take;
+            }
+            if (out >= 0) {
+                close(out);
+                out = -1;
+            }
+            if (r <= 0) {
+                break;
+            }
+            ++piece;
+        }
+    } else {
+        u64 lines = 0;
+        int need_open = 1;
+
+        while ((r = read(fd, buf, sizeof(buf))) > 0) {
+            for (ssize_t i = 0; i < r;) {
+                size_t j = i;
+
+                while (j < (size_t)r && buf[j] != '\n') {
+                    ++j;
+                }
+                if (j < (size_t)r) {
+                    ++j; /* include the newline */
+                }
+                if (need_open) {
+                    out = split_open(prefix, piece, numeric, suflen);
+                    if (out < 0) {
+                        goto split_done;
+                    }
+                    need_open = 0;
+                }
+                if (write(out, buf + i, j - i) != (ssize_t)(j - i)) {
+                    print_status("split", -12);
+                    goto split_done;
+                }
+                i = j;
+                if (j > 0 && buf[j - 1] == '\n') {
+                    if (++lines >= count) {
+                        close(out);
+                        out = -1;
+                        ++piece;
+                        need_open = 1;
+                        lines = 0;
+                    }
+                }
+            }
+        }
+        if (piece == 0 && need_open && r == 0) {
+            /* Empty input still yields one empty piece, like GNU. */
+            out = split_open(prefix, piece, numeric, suflen);
+            if (out >= 0) {
+                close(out);
+                out = -1;
+            }
+        }
+    split_done:;
+    }
+    if (out >= 0) {
+        close(fd);
+        close(out);
+    } else if (nfiles > 0) {
+        close(fd);
+    }
+    if (r < 0) {
+        print_status("split", (int)r);
+    }
+}
+
+/* paste [-d LIST] [-s] FILE...: merge lines side by side (default TAB).
+ * At most 8 files; lines past 255 bytes truncate (documented subset).
+ * -d LIST cycles delimiters (\\n \\t \\ \\ \r escapes); -s joins each
+ * file's lines into one output line instead. */
+#define PASTE_MAX_FILES 8
+#define PASTE_LINE 256
+
+struct paste_src {
+    int fd;
+    char buf[PASTE_LINE];
+    size_t pos;
+    size_t len;
+    int eof;
+};
+
+/* Next line from a source (without newline); 1 ok, 0 at EOF, -1 on error.
+ * Over-long lines truncate, remainder skipped so columns stay aligned. */
+static int paste_next(struct paste_src *s, char *line)
+{
+    size_t n = 0;
+    int nl = 0;
+
+    for (;;) {
+        if (s->pos >= s->len) {
+            ssize_t r;
+
+            if (s->eof) {
+                break;
+            }
+            r = read(s->fd, s->buf, sizeof(s->buf));
+            if (r < 0) {
+                return -1;
+            }
+            if (r == 0) {
+                s->eof = 1;
+                break;
+            }
+            s->pos = 0;
+            s->len = (size_t)r;
+        }
+        while (s->pos < s->len && n + 1 < PASTE_LINE) {
+            char c = s->buf[s->pos++];
+
+            if (c == '\n') {
+                nl = 1;
+                break;
+            }
+            line[n++] = c;
+        }
+        if (nl) {
+            break;
+        }
+        if (s->pos < s->len) {
+            /* Line too long: skip to its end so the next call starts fresh. */
+            while (s->pos < s->len && s->buf[s->pos] != '\n') {
+                ++s->pos;
+            }
+            if (s->pos < s->len) {
+                ++s->pos;
+            }
+            break;
+        }
+    }
+    line[n] = '\0';
+    return (n > 0 || nl) ? 1 : 0;
+}
+
+/* Parse a paste -d list (escapes \n \t \r \\) into delims; 0 on success. */
+static int paste_parse_delims(const char *list, char *delims, size_t cap, size_t *ndelims)
+{
+    const char *p;
+    size_t n = 0;
+
+    if (!list || *list == '\0') {
+        return -E_INVAL;
+    }
+    for (p = list; *p && n < cap; ++p) {
+        if (*p == '\\') {
+            ++p;
+            if (*p == 'n') {
+                delims[n++] = '\n';
+            } else if (*p == 't') {
+                delims[n++] = '\t';
+            } else if (*p == 'r') {
+                delims[n++] = '\r';
+            } else if (*p == '\\') {
+                delims[n++] = '\\';
+            } else if (*p == '\0') {
+                break;
+            } else {
+                delims[n++] = *p;
+            }
+        } else {
+            delims[n++] = *p;
+        }
+    }
+    if (n == 0 || *p != '\0') {
+        return -E_INVAL;
+    }
+    *ndelims = n;
+    return 0;
+}
+
+static void cmd_paste(char *rest)
+{
+    char *arg;
+    char *files[PASTE_MAX_FILES];
+    int nfiles = 0;
+    char delims[32];
+    size_t ndelims = 1;
+    int serial = 0;
+    char path[PATH_MAX];
+    struct paste_src src[PASTE_MAX_FILES];
+
+    delims[0] = '\t';
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            if (strcmp(arg, "-s") == 0) {
+                serial = 1;
+            } else if (strcmp(arg, "-d") == 0 || (arg[1] == 'd' && arg[2] != '\0')) {
+                const char *list = arg[2] != '\0' ? arg + 2 : next_arg(&rest);
+
+                if (paste_parse_delims(list, delims, sizeof(delims), &ndelims) != 0) {
+                    print_status("paste", -E_INVAL);
+                    return;
+                }
+            } else {
+                print_status("paste", -E_INVAL);
+                return;
+            }
+        } else if (nfiles < PASTE_MAX_FILES) {
+            files[nfiles++] = arg;
+        } else {
+            print_status("paste", -E_INVAL);
+            return;
+        }
+    }
+    if (nfiles == 0) {
+        print_status("paste", -E_INVAL);
+        return;
+    }
+    for (int i = 0; i < nfiles; ++i) {
+        resolve(files[i], path);
+        src[i].fd = open(path, 0);
+        if (src[i].fd < 0) {
+            /* Like GNU: report, keep going with empty columns for it. */
+            print_status(files[i], src[i].fd);
+        }
+        src[i].pos = 0;
+        src[i].len = 0;
+        src[i].eof = 1;
+        if (src[i].fd >= 0) {
+            src[i].eof = 0;
+        }
+    }
+    if (serial) {
+        for (int i = 0; i < nfiles; ++i) {
+            char line[PASTE_LINE];
+            int first = 1;
+            int di = 0;
+            int r;
+
+            for (;;) {
+                r = paste_next(&src[i], line);
+                if (r < 0) {
+                    print_status("paste", -5);
+                    break;
+                }
+                if (r == 0) {
+                    break;
+                }
+                if (!first) {
+                    write(1, &delims[di % ndelims], 1);
+                    di = (di + 1) % (int)ndelims;
+                }
+                first = 0;
+                puts(line);
+            }
+            puts("\n");
+        }
+    } else {
+        for (;;) {
+            /* Fetch all columns before printing: a row goes out only when
+             * some file yields a line, so a lagging EOF flag cannot emit
+             * phantom delimiter-only rows. Finished files keep empty
+             * columns (with their delimiters, like GNU). */
+            char cols[PASTE_MAX_FILES][PASTE_LINE];
+            int got[PASTE_MAX_FILES];
+            int alive = 0;
+            int di = 0;
+
+            for (int i = 0; i < nfiles; ++i) {
+                int r = 0;
+
+                got[i] = 0;
+                if (!src[i].eof) {
+                    r = paste_next(&src[i], cols[i]);
+                    if (r < 0) {
+                        print_status("paste", -5);
+                        goto paste_done;
+                    }
+                    if (r > 0) {
+                        got[i] = 1;
+                        alive = 1;
+                    }
+                }
+            }
+            if (!alive) {
+                break;
+            }
+            for (int i = 0; i < nfiles; ++i) {
+                if (i > 0) {
+                    write(1, &delims[di % ndelims], 1);
+                    di = (di + 1) % (int)ndelims;
+                }
+                if (got[i]) {
+                    puts(cols[i]);
+                }
+            }
+            puts("\n");
+        }
+    paste_done:;
+    }
+    for (int i = 0; i < nfiles; ++i) {
+        if (src[i].fd >= 0) {
+            close(src[i].fd);
+        }
+    }
+}
+
+static void uniq_emit(int count, int dup_only, int uniq_only, u64 run, const char *line)
+{
+    if ((dup_only && run < 2) || (uniq_only && run != 1)) {
+        return;
+    }
+    if (count) {
+        put_u64(run);
+        puts(" ");
+    }
+    puts(line);
+    puts("\n");
+}
+
 static void cmd_uniq(char *rest)
 {
     char *tok = next_arg(&rest);
     char *file = tok;
-    int count = 0;
+    int count = 0, dup_only = 0, uniq_only = 0;
     char path[PATH_MAX];
     char buf[IO_BUF];
     char prev[LINE_MAX];
@@ -1613,8 +2950,19 @@ static void cmd_uniq(char *rest)
     int fd;
     ssize_t r;
 
-    if (tok && strcmp(tok, "-c") == 0) {
-        count = 1;
+    if (tok && tok[0] == '-' && tok[1] != '\0') {
+        for (const char *f = tok + 1; *f; ++f) {
+            if (*f == 'c') {
+                count = 1;
+            } else if (*f == 'd') {
+                dup_only = 1;
+            } else if (*f == 'u') {
+                uniq_only = 1;
+            } else {
+                print_status("uniq", -E_INVAL);
+                return;
+            }
+        }
         file = next_arg(&rest);
     }
     if (file && next_arg(&rest)) {
@@ -1640,12 +2988,7 @@ static void cmd_uniq(char *rest)
                     cur[clen] = '\0';
                     if (!have || strcmp(prev, cur) != 0) {
                         if (have) {
-                            if (count) {
-                                put_u64(run);
-                                puts(" ");
-                            }
-                            puts(prev);
-                            puts("\n");
+                            uniq_emit(count, dup_only, uniq_only, run, prev);
                         }
                         memcpy(prev, cur, clen + 1);
                         run = 1;
@@ -1663,12 +3006,7 @@ static void cmd_uniq(char *rest)
             cur[clen] = '\0';
             if (!have || strcmp(prev, cur) != 0) {
                 if (have) {
-                    if (count) {
-                        put_u64(run);
-                        puts(" ");
-                    }
-                    puts(prev);
-                    puts("\n");
+                    uniq_emit(count, dup_only, uniq_only, run, prev);
                 }
                 memcpy(prev, cur, clen + 1);
                 run = 1;
@@ -1678,12 +3016,7 @@ static void cmd_uniq(char *rest)
             }
         }
         if (have) {
-            if (count) {
-                put_u64(run);
-                puts(" ");
-            }
-            puts(prev);
-            puts("\n");
+            uniq_emit(count, dup_only, uniq_only, run, prev);
         }
     }
     if (file) {
@@ -1840,9 +3173,25 @@ static void cmd_cd(const char *rest)
 {
     char path[PATH_MAX];
     struct stat_info st;
+    static char prev[PATH_MAX] = "/";
+    char here[PATH_MAX];
 
     if (rest[0] == '\0') {
+        memcpy(prev, cwd, strlen(cwd) + 1);
         memcpy(cwd, "/", 2);
+        return;
+    }
+    if (strcmp(rest, "-") == 0) {
+        /* Back to the previous directory, printing it like bash. */
+        if (stat(prev, &st) != 0 || st.type != 2) {
+            print_status("cd", -E_NOENT);
+            return;
+        }
+        memcpy(here, cwd, strlen(cwd) + 1);
+        memcpy(cwd, prev, strlen(prev) + 1);
+        memcpy(prev, here, strlen(here) + 1);
+        puts(cwd);
+        puts("\n");
         return;
     }
     resolve(rest, path);
@@ -1850,7 +3199,105 @@ static void cmd_cd(const char *rest)
         print_status("cd", -E_NOENT);
         return;
     }
+    memcpy(prev, cwd, strlen(cwd) + 1);
     memcpy(cwd, path, strlen(path) + 1);
+}
+
+/* Directory stack for pushd/popd/dirs (shell memory only). */
+static char dirstack[8][PATH_MAX];
+static int dstop;
+
+static void cmd_pushd(char *rest)
+{
+    char *arg = next_arg(&rest);
+
+    if (arg && next_arg(&rest)) {
+        print_status("pushd", -E_INVAL);
+        return;
+    }
+    if (!arg) {
+        /* No argument: swap the top two, like bash. */
+        if (dstop < 1) {
+            print_status("pushd", -E_INVAL);
+            return;
+        }
+        {
+            char tmp[PATH_MAX];
+
+            memcpy(tmp, cwd, strlen(cwd) + 1);
+            memcpy(cwd, dirstack[dstop - 1], strlen(dirstack[dstop - 1]) + 1);
+            memcpy(dirstack[dstop - 1], tmp, strlen(tmp) + 1);
+        }
+        puts(cwd);
+        puts("\n");
+        return;
+    }
+    if (dstop >= 8) {
+        print_status("pushd", -E_INVAL);
+        return;
+    }
+    {
+        char path[PATH_MAX];
+        struct stat_info st;
+
+        resolve(arg, path);
+        if (stat(path, &st) != 0 || st.type != 2) {
+            print_status("pushd", -E_NOENT);
+            return;
+        }
+        memcpy(dirstack[dstop], cwd, strlen(cwd) + 1);
+        ++dstop;
+        memcpy(cwd, path, strlen(path) + 1);
+    }
+    puts(cwd);
+    puts("\n");
+}
+
+static void cmd_popd(char *rest)
+{
+    char *arg = next_arg(&rest);
+
+    if (arg || dstop < 1) {
+        print_status("popd", -E_INVAL);
+        return;
+    }
+    --dstop;
+    {
+        struct stat_info st;
+
+        if (stat(dirstack[dstop], &st) != 0 || st.type != 2) {
+            print_status("popd", -E_NOENT);
+            return;
+        }
+        memcpy(cwd, dirstack[dstop], strlen(dirstack[dstop]) + 1);
+    }
+    puts(cwd);
+    puts("\n");
+}
+
+static void cmd_dirs(char *rest)
+{
+    char *arg = next_arg(&rest);
+    int verbose = 0;
+
+    if (arg && strcmp(arg, "-v") == 0) {
+        verbose = 1;
+        arg = next_arg(&rest);
+    }
+    if (arg) {
+        print_status("dirs", -E_INVAL);
+        return;
+    }
+    puts(cwd);
+    puts("\n");
+    for (int i = dstop - 1; i >= 0; --i) {
+        if (verbose) {
+            put_u64((u64)(dstop - 1 - i));
+            puts("  ");
+        }
+        puts(dirstack[i]);
+        puts("\n");
+    }
 }
 
 /* tee [-a] FILE: stdin to file and stdout. No -i/--help subset beyond -a. */
@@ -2166,7 +3613,7 @@ static int sort_less(const char *a, const char *b, int numeric)
 
 static void cmd_sort(char *rest)
 {
-    int reverse = 0, numeric = 0, unique = 0;
+    int reverse = 0, numeric = 0, unique = 0, check = 0;
     char *files[16];
     int nfiles = 0;
     int n;
@@ -2178,6 +3625,7 @@ static void cmd_sort(char *rest)
                 if (*f == 'r') reverse = 1;
                 else if (*f == 'n') numeric = 1;
                 else if (*f == 'u') unique = 1;
+                else if (*f == 'c') check = 1;
                 else {
                     print_status("sort", -E_INVAL);
                     return;
@@ -2207,6 +3655,26 @@ static void cmd_sort(char *rest)
             }
             line_ptr[j] = tmp;
         }
+    }
+    if (check) {
+        /* -c: silent when sorted; otherwise the first disorder, like GNU. */
+        for (int k = 1; k < n; ++k) {
+            int a = reverse ? n - k : k;
+            int b = reverse ? n - k + 1 : k - 1;
+            int bad = reverse ? sort_less(line_ptr[b], line_ptr[a], numeric)
+                              : sort_less(line_ptr[a], line_ptr[b], numeric);
+
+            if (unique && strcmp(line_ptr[a], line_ptr[b]) == 0) {
+                continue;
+            }
+            if (bad) {
+                eputs("sort: disorder at line ");
+                put_u64_e((u64)(a + 1));
+                eputs("\n");
+                return;
+            }
+        }
+        return;
     }
     for (int k = 0; k < n; ++k) {
         int i = reverse ? n - 1 - k : k;
@@ -2540,15 +4008,24 @@ static long parse_long(const char *s, int *ok)
     return neg ? -v : v;
 }
 
+static void seq_print_wide(long v, int width);
+
 static void cmd_seq(char *rest)
 {
     char *a1 = next_arg(&rest);
-    char *a2 = next_arg(&rest);
-    char *a3 = next_arg(&rest);
+    int wide = 0;
+    char *a2;
+    char *a3;
     long first = 1, step = 1, last = 0;
     int ok = 1;
     long v;
 
+    while (a1 && strcmp(a1, "-w") == 0) {
+        wide = 1;
+        a1 = next_arg(&rest);
+    }
+    a2 = next_arg(&rest);
+    a3 = next_arg(&rest);
     if (!a1 || next_arg(&rest)) {
         print_status("seq", -E_INVAL);
         return;
@@ -2566,34 +4043,86 @@ static void cmd_seq(char *rest)
         print_status("seq", -E_INVAL);
         return;
     }
-    /* The wrap check is done in unsigned arithmetic (mod 2^64, defined):
-     * a wrapped step would otherwise print until heat death. */
-    if (step > 0) {
-        for (v = first; v <= last;) {
-            put_int(v);
-            puts("\n");
-            {
-                unsigned long unext = (unsigned long)v + (unsigned long)step;
+    /* -w: every value shares the width of the widest endpoint (sign counts),
+     * padded with zeros. */
+    {
+        int width = 0;
 
-                if (unext < (unsigned long)v) {
-                    break;
+        if (wide) {
+            long ends[2] = {first, last};
+
+            for (int i = 0; i < 2; ++i) {
+                u64 m = ends[i] < 0 ? (u64)(-(ends[i] + 1)) + 1u : (u64)ends[i];
+                int d = ends[i] < 0 ? 1 : 0;
+
+                do {
+                    ++d;
+                    m /= 10;
+                } while (m != 0);
+                if (d > width) {
+                    width = d;
                 }
-                v = (long)unext;
             }
         }
+        if (step > 0) {
+            for (v = first; v <= last;) {
+                if (wide) {
+                    seq_print_wide(v, width);
+                } else {
+                    put_int(v);
+                }
+                puts("\n");
+                {
+                    unsigned long unext = (unsigned long)v + (unsigned long)step;
+
+                    if (unext < (unsigned long)v) {
+                        break;
+                    }
+                    v = (long)unext;
+                }
+            }
+        } else {
+            for (v = first; v >= last;) {
+                if (wide) {
+                    seq_print_wide(v, width);
+                } else {
+                    put_int(v);
+                }
+                puts("\n");
+                {
+                    unsigned long unext = (unsigned long)v + (unsigned long)step;
+
+                    if (unext > (unsigned long)v) {
+                        break;
+                    }
+                    v = (long)unext;
+                }
+            }
+        }
+    }
+}
+
+/* One value for `seq -w`: sign, then the magnitude zero-padded so the whole
+ * field (sign included) is `width` wide. */
+static void seq_print_wide(long v, int width)
+{
+    if (v < 0) {
+        u64 m = (u64)(-(v + 1)) + 1u;
+        int d = 0;
+        u64 t = m;
+
+        puts("-");
+        do {
+            ++d;
+            t /= 10;
+        } while (t != 0);
+        while (d < width - 1) {
+            puts("0");
+            ++d;
+        }
+        put_u64(m);
     } else {
-        for (v = first; v >= last;) {
-            put_int(v);
-            puts("\n");
-            {
-                unsigned long unext = (unsigned long)v + (unsigned long)step;
-
-                if (unext > (unsigned long)v) {
-                    break;
-                }
-                v = (long)unext;
-            }
-        }
+        put_dec_pad((u64)v, width);
     }
 }
 
@@ -2663,68 +4192,621 @@ static void cmd_time(char *rest)
 }
 
 /* whoami: login name for our uid from /etc/passwd, or the bare uid. */
-static void cmd_whoami(void)
-{
-    char buf[256];
-    int fd;
-    ssize_t n, total = 0;
-    u32 me = (u32)getuid();
+#define PW_LINE 128
 
-    fd = open("/etc/passwd", 0);
-    if (fd < 0) {
-        put_u64(me);
-        puts("\n");
-        return;
+/* One '\n'-terminated line without the newline; over-long lines are
+ * truncated and the remainder skipped. Returns length, 0 on EOF, <0 on
+ * read error. */
+static int read_line(int fd, char *line, size_t cap)
+{
+    size_t n = 0;
+    int skip = 0;
+
+    for (;;) {
+        char c;
+        ssize_t r = read(fd, &c, 1);
+
+        if (r < 0) {
+            return -1;
+        }
+        if (r == 0) {
+            return (int)n;
+        }
+        if (c == '\n') {
+            return (int)n;
+        }
+        if (!skip) {
+            if (n + 1 < cap) {
+                line[n++] = c;
+            } else {
+                skip = 1;
+            }
+        }
     }
-    while (total < (ssize_t)sizeof(buf) - 1 && (n = read(fd, buf + total, sizeof(buf) - 1 - (size_t)total)) > 0) {
-        total += n;
+}
+
+/* Split "name:passwd:uid:gid:..." (NUL-terminated, mutated in place):
+ * name start, uid/gid parsed. ok=0 unless both numeric fields parse. */
+static char *split_pw(char *line, u32 *uid, u32 *gid, int *ok)
+{
+    char *name = line;
+    char *p = line;
+
+    *ok = 0;
+    while (*p && *p != ':') {
+        ++p;
+    }
+    if (*p == '\0') {
+        return name;
+    }
+    *p++ = '\0';
+    while (*p && *p != ':') {
+        ++p;
+    }
+    if (*p == '\0') {
+        return name;
+    }
+    *p++ = '\0';
+    *uid = 0;
+    {
+        int digits = 0;
+
+        while (*p >= '0' && *p <= '9') {
+            *uid = *uid * 10 + (u32)(*p - '0');
+            ++p;
+            ++digits;
+        }
+        if (digits == 0) {
+            return name;
+        }
+    }
+    if (*p != ':') {
+        return name;
+    }
+    ++p;
+    *gid = 0;
+    {
+        int digits = 0;
+
+        while (*p >= '0' && *p <= '9') {
+            *gid = *gid * 10 + (u32)(*p - '0');
+            ++p;
+            ++digits;
+        }
+        if (digits == 0) {
+            return name;
+        }
+    }
+    *ok = 1;
+    return name;
+}
+
+/* name -> uid from /etc/passwd. 0 found, -1 not. */
+static int passwd_uid(const char *name, u32 *uid)
+{
+    int fd = open("/etc/passwd", 0);
+    char line[PW_LINE];
+    int found = -1;
+
+    if (fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        u32 u = 0, g = 0;
+        int ok = 0;
+        char *nm;
+
+        if (r < 0) {
+            found = -1;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        nm = split_pw(line, &u, &g, &ok);
+        (void)g;
+        if (ok && strcmp(nm, name) == 0) {
+            *uid = u;
+            found = 0;
+            break;
+        }
     }
     close(fd);
-    if (total <= 0) {
+    return found;
+}
+
+/* uid -> login name. 0 found (NUL-terminated in out), -1 not. */
+static int passwd_name(u32 uid, char *out, size_t cap)
+{
+    int fd = open("/etc/passwd", 0);
+    char line[PW_LINE];
+    int found = -1;
+
+    if (fd < 0 || cap == 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        u32 u = 0, g = 0;
+        int ok = 0;
+        char *nm;
+
+        if (r < 0) {
+            found = -1;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        nm = split_pw(line, &u, &g, &ok);
+        (void)g;
+        if (ok && u == uid) {
+            size_t k = strlen(nm);
+
+            if (k >= cap) {
+                k = cap - 1;
+            }
+            memcpy(out, nm, k);
+            out[k] = '\0';
+            found = 0;
+            break;
+        }
+    }
+    close(fd);
+    return found;
+}
+
+/* Split "name:x:gid:m1,m2" (mutated): name start, gid parsed, members after
+ * the third colon (maybe empty). ok=0 unless the gid parses. */
+static char *split_group(char *line, u32 *gid, char **members, int *ok)
+{
+    char *name = line;
+    char *p = line;
+
+    *ok = 0;
+    *members = "";
+    while (*p && *p != ':') {
+        ++p;
+    }
+    if (*p == '\0') {
+        return name;
+    }
+    *p++ = '\0';
+    while (*p && *p != ':') {
+        ++p;
+    }
+    if (*p == '\0') {
+        return name;
+    }
+    *p++ = '\0';
+    *gid = 0;
+    {
+        int digits = 0;
+
+        while (*p >= '0' && *p <= '9') {
+            *gid = *gid * 10 + (u32)(*p - '0');
+            ++p;
+            ++digits;
+        }
+        if (digits == 0) {
+            return name;
+        }
+    }
+    if (*p == ':') {
+        *members = p + 1;
+    } else if (*p != '\0') {
+        return name;
+    }
+    *ok = 1;
+    return name;
+}
+
+/* group name -> gid from /etc/group. 0 found, -1 not. */
+static int group_gid(const char *name, u32 *gid)
+{
+    int fd = open("/etc/group", 0);
+    char line[PW_LINE];
+    int found = -1;
+
+    if (fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        u32 g = 0;
+        char *members;
+        int ok = 0;
+        char *nm;
+
+        if (r < 0) {
+            found = -1;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        nm = split_group(line, &g, &members, &ok);
+        (void)members;
+        if (ok && strcmp(nm, name) == 0) {
+            *gid = g;
+            found = 0;
+            break;
+        }
+    }
+    close(fd);
+    return found;
+}
+
+/* gid -> group name. 0 found, -1 not. */
+static int group_name(u32 gid, char *out, size_t cap)
+{
+    int fd = open("/etc/group", 0);
+    char line[PW_LINE];
+    int found = -1;
+
+    if (fd < 0 || cap == 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        u32 g = 0;
+        char *members;
+        int ok = 0;
+        char *nm;
+
+        if (r < 0) {
+            found = -1;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        nm = split_group(line, &g, &members, &ok);
+        (void)members;
+        if (ok && g == gid) {
+            size_t k = strlen(nm);
+
+            if (k >= cap) {
+                k = cap - 1;
+            }
+            memcpy(out, nm, k);
+            out[k] = '\0';
+            found = 0;
+            break;
+        }
+    }
+    close(fd);
+    return found;
+}
+
+/* Ask "overwrite PATH?" on stderr, read one line. True on y/Y. EOF or
+ * anything else means no (safe default for scripts). */
+static int confirm(const char *path)
+{
+    char buf[16];
+    ssize_t n;
+
+    eputs("overwrite ");
+    eputs(path);
+    eputs("? ");
+    n = read(0, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        return 0;
+    }
+    return buf[0] == 'y' || buf[0] == 'Y';
+}
+
+static void cmd_whoami(void)
+{
+    char name[32];
+    u32 me = (u32)getuid();
+
+    if (passwd_name(me, name, sizeof(name)) == 0) {
+        puts(name);
+    } else {
         put_u64(me);
+    }
+    puts("\n");
+}
+
+/* id [-u|-g|-G] [-n] [USER]: identity. Last of -u/-g/-G wins; -n prints
+ * names. No -Z (no SELinux), no -r (no audit ids). */
+static void cmd_id(char *rest)
+{
+    char *arg;
+    int which = 0; /* 0 both, 1 -u, 2 -g, 3 -G */
+    int names = 0;
+    char *user = 0;
+    u32 uid, gid;
+    char username[32];
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] == '-' && arg[1] != '\0') {
+            for (const char *f = arg + 1; *f; ++f) {
+                if (*f == 'u') {
+                    which = 1;
+                } else if (*f == 'g') {
+                    which = 2;
+                } else if (*f == 'G') {
+                    which = 3;
+                } else if (*f == 'n') {
+                    names = 1;
+                } else {
+                    print_status("id", -E_INVAL);
+                    return;
+                }
+            }
+        } else if (!user) {
+            user = arg;
+        } else {
+            print_status("id", -E_INVAL);
+            return;
+        }
+    }
+    if (!user) {
+        uid = (u32)getuid();
+        gid = (u32)getgid();
+        if (names && passwd_scan(uid, 0, &uid, &gid, username, sizeof(username)) != 0) {
+            print_status("id", -E_INVAL);
+            return;
+        }
+    } else if (passwd_resolve(user, &uid, &gid, username, sizeof(username)) != 0) {
+        print_status("id", -E_INVAL);
+        return;
+    }
+    if (which == 0) {
+        puts("uid=");
+        if (names) {
+            if (passwd_name(uid, username, sizeof(username)) != 0) {
+                print_status("id", -E_INVAL);
+                return;
+            }
+            puts(username);
+        } else {
+            put_u64(uid);
+        }
+        puts(" gid=");
+        if (names) {
+            char gname[32];
+
+            if (group_name(gid, gname, sizeof(gname)) != 0) {
+                print_status("id", -E_INVAL);
+                return;
+            }
+            puts(gname);
+        } else {
+            put_u64(gid);
+        }
         puts("\n");
         return;
     }
-    buf[total] = '\0';
-    for (char *l = buf; *l;) {
-        char *e = l;
-        char *f1;
-        u32 uid = 0;
-        int ok = 0;
+    if (which == 1) {
+        if (names) {
+            if (!user && passwd_scan(uid, 0, &uid, &gid, username, sizeof(username)) != 0) {
+                print_status("id", -E_INVAL);
+                return;
+            }
+            puts(username);
+        } else {
+            put_u64(uid);
+        }
+        puts("\n");
+        return;
+    }
+    if (which == 2) {
+        if (names) {
+            char gname[32];
 
-        while (*e && *e != '\n') {
-            ++e;
+            if (group_name(gid, gname, sizeof(gname)) != 0) {
+                print_status("id", -E_INVAL);
+                return;
+            }
+            puts(gname);
+        } else {
+            put_u64(gid);
         }
-        if (*e) {
-            *e++ = '\0';
+        puts("\n");
+        return;
+    }
+    /* -G: primary, then every extra group the login belongs to. */
+    if (names) {
+        char gname[32];
+
+        if (group_name(gid, gname, sizeof(gname)) != 0) {
+            print_status("id", -E_INVAL);
+            return;
         }
-        /* name:passwd:uid:gid:... */
-        f1 = l;
-        while (*l && *l != ':') {
-            ++l;
+        puts(gname);
+    } else {
+        put_u64(gid);
+    }
+    {
+        int fd = open("/etc/group", 0);
+
+        if (fd >= 0) {
+            char line[PW_LINE];
+
+            for (;;) {
+                int r = read_line(fd, line, sizeof(line));
+                u32 g = 0;
+                char *members;
+                int ok = 0;
+                char *nm;
+
+                if (r <= 0) {
+                    break;
+                }
+                nm = split_group(line, &g, &members, &ok);
+                if (!ok || g == gid) {
+                    continue;
+                }
+                for (char *m = members;;) {
+                    char *comma = m;
+                    size_t ulen = strlen(username);
+
+                    while (*comma && *comma != ',') {
+                        ++comma;
+                    }
+                    if ((size_t)(comma - m) == ulen && memcmp(m, username, ulen) == 0) {
+                        if (names) {
+                            puts(" ");
+                            puts(nm);
+                        } else {
+                            puts(" ");
+                            put_u64(g);
+                        }
+                        break;
+                    }
+                    if (*comma == '\0') {
+                        break;
+                    }
+                    m = comma + 1;
+                }
+            }
+            close(fd);
         }
-        if (*l) {
-            *l++ = '\0';
+    }
+    puts("\n");
+}
+
+/* Scan /etc/passwd by uid or login name. Fills uid/gid/name. */
+static int passwd_scan(u32 want_uid, const char *want_name, u32 *uid, u32 *gid, char *name,
+                       size_t cap)
+{
+    int fd = open("/etc/passwd", 0);
+    char line[PW_LINE];
+    int found = -1;
+
+    if (fd < 0 || cap == 0) {
+        if (fd >= 0) {
+            close(fd);
         }
-        while (*l && *l != ':') {
-            ++l;
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        u32 u = 0, g = 0;
+        int ok = 0;
+        char *nm;
+
+        if (r < 0) {
+            found = -1;
+            break;
         }
-        if (*l) {
-            *l++ = '\0';
+        if (r == 0) {
+            break;
         }
-        while (*l >= '0' && *l <= '9') {
-            uid = uid * 10 + (u32)(*l - '0');
-            ++l;
-            ok = 1;
+        nm = split_pw(line, &u, &g, &ok);
+        if (!ok) {
+            continue;
         }
-        if (ok && uid == me) {
-            puts(f1);
+        if ((want_name ? strcmp(nm, want_name) == 0 : u == want_uid)) {
+            size_t k = strlen(nm);
+
+            *uid = u;
+            *gid = g;
+            if (k >= cap) {
+                k = cap - 1;
+            }
+            memcpy(name, nm, k);
+            name[k] = '\0';
+            found = 0;
+            break;
+        }
+    }
+    close(fd);
+    return found;
+}
+
+/* Resolve a user designator (login name or decimal uid). */
+static int passwd_resolve(const char *arg, u32 *uid, u32 *gid, char *name, size_t cap)
+{
+    const char *a = arg;
+    u32 v = 0;
+
+    if (parse_num(&a, 10, &v) == 0) {
+        return passwd_scan(v, 0, uid, gid, name, cap);
+    }
+    return passwd_scan(0, arg, uid, gid, name, cap);
+}
+
+static void cmd_groups(char *rest)
+{
+    char *arg = next_arg(&rest);
+    char username[32];
+    u32 uid, gid;
+    char gname[32];
+    int fd;
+
+    if (arg && next_arg(&rest)) {
+        print_status("groups", -E_INVAL);
+        return;
+    }
+    if (!arg) {
+        uid = (u32)getuid();
+        if (passwd_scan(uid, 0, &uid, &gid, username, sizeof(username)) != 0) {
+            put_u64(uid);
             puts("\n");
             return;
         }
-        l = e;
+    } else if (passwd_resolve(arg, &uid, &gid, username, sizeof(username)) != 0) {
+        print_status("groups", -E_INVAL);
+        return;
     }
-    put_u64(me);
+    puts(username);
+    puts(" :");
+    if (group_name(gid, gname, sizeof(gname)) == 0) {
+        puts(" ");
+        puts(gname);
+    } else {
+        puts(" ");
+        put_u64(gid);
+    }
+    fd = open("/etc/group", 0);
+    if (fd >= 0) {
+        char line[PW_LINE];
+
+        for (;;) {
+            int r = read_line(fd, line, sizeof(line));
+            u32 g = 0;
+            char *members;
+            int ok = 0;
+            char *nm;
+
+            if (r <= 0) {
+                break;
+            }
+            nm = split_group(line, &g, &members, &ok);
+            if (!ok || g == gid) {
+                continue; /* primary already shown (or malformed) */
+            }
+            for (char *m = members;;) {
+                char *comma = m;
+                size_t ulen = strlen(username);
+
+                while (*comma && *comma != ',') {
+                    ++comma;
+                }
+                if ((size_t)(comma - m) == ulen && memcmp(m, username, ulen) == 0) {
+                    puts(" ");
+                    puts(nm);
+                    break;
+                }
+                if (*comma == '\0') {
+                    break;
+                }
+                m = comma + 1;
+            }
+        }
+        close(fd);
+    }
     puts("\n");
 }
 
@@ -2822,14 +4904,130 @@ static void cmd_sysinfo(void)
     }
 }
 
-static void cmd_uname(const char *rest)
+static void cmd_uname(char *rest)
 {
-    if (rest[0] == '\0') {
+    char *arg;
+    int s = 0, n = 0, r = 0, m = 0, a = 0;
+
+    for (arg = next_arg(&rest); arg; arg = next_arg(&rest)) {
+        if (arg[0] != '-' || arg[1] == '\0') {
+            print_status("uname", -E_INVAL);
+            return;
+        }
+        for (const char *f = arg + 1; *f; ++f) {
+            if (*f == 's') {
+                s = 1;
+            } else if (*f == 'n') {
+                n = 1;
+            } else if (*f == 'r') {
+                r = 1;
+            } else if (*f == 'm') {
+                m = 1;
+            } else if (*f == 'a') {
+                a = 1;
+            } else {
+                print_status("uname", -E_INVAL);
+                return;
+            }
+        }
+    }
+    if (!s && !n && !r && !m && !a) {
         puts("axysOS\n");
-    } else if (strcmp(rest, "-a") == 0) {
+        return;
+    }
+    if (a) {
         cmd_cat_proc("uname", "/proc/version");
-    } else {
-        print_status("uname", -E_INVAL);
+        return;
+    }
+    {
+        int first = 1;
+
+        /* Fixed order s n r m, like uname(1). -s: system name. -n:
+         * hostname. -r: release (2nd word of /proc/version). -m: machine. */
+        if (s) {
+            puts("axysOS");
+            first = 0;
+        }
+        if (n) {
+            char buf[64];
+            int fd = open("/etc/hostname", 0);
+            ssize_t k, total = 0;
+
+            if (!first) {
+                puts(" ");
+            }
+            first = 0;
+            if (fd >= 0) {
+                while (total < (ssize_t)sizeof(buf) - 1 &&
+                       (k = read(fd, buf + (size_t)total,
+                                 sizeof(buf) - 1 - (size_t)total)) > 0) {
+                    total += k;
+                }
+                close(fd);
+            }
+            if (total <= 0) {
+                puts("axys");
+            } else {
+                buf[total] = '\0';
+                if (total > 0 && buf[total - 1] == '\n') {
+                    buf[total - 1] = '\0';
+                }
+                puts(buf);
+            }
+        }
+        if (r) {
+            char buf[64];
+            int fd = open("/proc/version", 0);
+            ssize_t k, total = 0;
+
+            if (!first) {
+                puts(" ");
+            }
+            first = 0;
+            if (fd >= 0) {
+                while (total < (ssize_t)sizeof(buf) - 1 &&
+                       (k = read(fd, buf + (size_t)total,
+                                 sizeof(buf) - 1 - (size_t)total)) > 0) {
+                    total += k;
+                }
+                close(fd);
+            }
+            buf[total] = '\0';
+            {
+                /* Second whitespace-separated word ("axysOS 1.0 x86_64"). */
+                char *p = buf;
+
+                while (*p && *p != ' ' && *p != '\n') {
+                    ++p;
+                }
+                while (*p == ' ') {
+                    ++p;
+                }
+                {
+                    char *e = p;
+
+                    while (*e && *e != ' ' && *e != '\n') {
+                        ++e;
+                    }
+                    if (e == p) {
+                        puts("?");
+                    } else {
+                        char save = *e;
+
+                        *e = '\0';
+                        puts(p);
+                        *e = save;
+                    }
+                }
+            }
+        }
+        if (m) {
+            if (!first) {
+                puts(" ");
+            }
+            puts("x86_64");
+        }
+        puts("\n");
     }
 }
 
@@ -2858,8 +5056,134 @@ static void cmd_hostname(char *rest)
     }
 }
 
-static const char *const weekday_names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-static const char *const month_names[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+/* umask [MASK]: show or set the file mode creation mask (octal). */
+static void cmd_umask(char *rest)
+{
+    char *arg = next_arg(&rest);
+    u32 mask;
+    int r;
+
+    if (!arg) {
+        /* No getter syscall: set 0, read the old value back, restore.
+         * Single thread with per-process state, so nothing interleaves. */
+        int cur = umask_set(0);
+
+        if (cur < 0) {
+            print_status("umask", cur);
+            return;
+        }
+        umask_set((u32)cur);
+        put_octal((u32)cur);
+        puts("\n");
+        return;
+    }
+    if (next_arg(&rest)) {
+        print_status("umask", -E_INVAL);
+        return;
+    }
+    {
+        const char *a = arg;
+
+        if (parse_num(&a, 8, &mask) != 0 || mask > 0777u) {
+            print_status("umask", -E_INVAL);
+            return;
+        }
+    }
+    r = umask_set(mask);
+    if (r < 0) {
+        print_status("umask", r);
+    }
+}
+
+/* logger [-t TAG] [MSG...]: append a line to the kernel log (see dmesg).
+ * No MSG reads standard input. Over-long input is truncated to fit one
+ * klog call. */
+static void cmd_logger(char *rest)
+{
+    char *arg = next_arg(&rest);
+    char tag[32];
+    char msg[480];
+    size_t len = 0;
+
+    if (arg && strcmp(arg, "-t") == 0) {
+        size_t k;
+
+        arg = next_arg(&rest);
+        if (!arg) {
+            print_status("logger", -E_INVAL);
+            return;
+        }
+        k = strlen(arg);
+        if (k >= sizeof(tag)) {
+            k = sizeof(tag) - 1;
+        }
+        memcpy(tag, arg, k);
+        tag[k] = '\0';
+        arg = next_arg(&rest);
+    } else {
+        if (passwd_name((u32)getuid(), tag, sizeof(tag)) != 0) {
+            memcpy(tag, "user", 5);
+        }
+    }
+    /* Nested function would be a GNU extension trap; inline the appender. */
+    {
+        size_t k = strlen(tag);
+
+        if (len + k + 2 < sizeof(msg)) {
+            memcpy(msg + len, tag, k);
+            len += k;
+            msg[len++] = ':';
+            msg[len++] = ' ';
+        }
+    }
+    if (!arg) {
+        char buf[IO_BUF];
+        ssize_t r;
+
+        while (len + 1 < sizeof(msg) && (r = read(0, buf, sizeof(buf))) > 0) {
+            size_t take = (size_t)r;
+
+            if (len + take >= sizeof(msg)) {
+                take = sizeof(msg) - 1 - len;
+            }
+            memcpy(msg + len, buf, take);
+            len += take;
+        }
+    } else {
+        int first = 1;
+
+        for (; arg; arg = next_arg(&rest)) {
+            size_t k = strlen(arg);
+
+            if (!first) {
+                if (len + 1 >= sizeof(msg)) {
+                    break;
+                }
+                msg[len++] = ' ';
+            }
+            first = 0;
+            if (len + k >= sizeof(msg)) {
+                k = sizeof(msg) - 1 - len;
+            }
+            memcpy(msg + len, arg, k);
+            len += k;
+            if (len + 1 >= sizeof(msg)) {
+                break;
+            }
+        }
+    }
+    while (len > 0 && (msg[len - 1] == '\n' || msg[len - 1] == ' ')) {
+        --len; /* one trailing newline, added below */
+    }
+    if (len + 1 < sizeof(msg)) {
+        msg[len++] = '\n';
+    }
+    if (len > 0 && klog(msg, len) < 0) {
+        print_status("logger", -E_INVAL);
+    }
+}
+
+static const char *const weekday_names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};static const char *const month_names[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
 static void put_2digits(u32 v)
@@ -2987,68 +5311,136 @@ static void cmd_date(char *rest)
     puts("\n");
 }
 
+/* kill [-s SIGNAL | -SIGNAL] PID..., -l lists signals. Every signal
+ * terminates immediately and cannot be caught; the names exist so scripts
+ * written for Linux keep working. */
+static int parse_signal(const char *s)
+{
+    const char *a = s;
+    u32 v = 0;
+
+    if (parse_num(&a, 10, &v) == 0 && (v == 9 || v == 15)) {
+        return (int)v;
+    }
+    if (strcmp(s, "KILL") == 0 || strcmp(s, "SIGKILL") == 0) {
+        return 9;
+    }
+    if (strcmp(s, "TERM") == 0 || strcmp(s, "SIGTERM") == 0) {
+        return 15;
+    }
+    return -1;
+}
+
 static void cmd_kill(char *rest)
 {
     char *arg = next_arg(&rest);
-    const char *a;
-    u32 pid = 0;
-    int r;
+    int sig = 15;
 
-    if (!arg || next_arg(&rest)) {
+    if (arg && strcmp(arg, "-l") == 0) {
+        if (next_arg(&rest)) {
+            print_status("kill", -E_INVAL);
+            return;
+        }
+        puts(" 9) SIGKILL\n15) SIGTERM\n");
+        return;
+    }
+    if (arg && arg[0] == '-' && arg[1] != '\0') {
+        if (arg[1] == 's') {
+            if (arg[2] == '\0') {
+                arg = next_arg(&rest);
+                if (!arg) {
+                    print_status("kill", -E_INVAL);
+                    return;
+                }
+            } else {
+                arg += 2;
+            }
+            sig = parse_signal(arg);
+            if (sig < 0) {
+                print_status("kill", -E_INVAL);
+                return;
+            }
+            arg = next_arg(&rest);
+        } else {
+            sig = parse_signal(arg + 1);
+            if (sig < 0) {
+                print_status("kill", -E_INVAL);
+                return;
+            }
+            arg = next_arg(&rest);
+        }
+    }
+    if (!arg) {
         print_status("kill", -E_INVAL);
         return;
     }
-    a = arg;
-    r = parse_num(&a, 10, &pid);
-    if (r != 0) {
-        print_status("kill", -E_INVAL);
-        return;
-    }
-    r = kill((int)pid);
-    if (r < 0) {
-        print_status("kill", r);
+    /* Every signal terminates; numbers/names only matter for scripts. */
+    (void)sig;
+    for (; arg; arg = next_arg(&rest)) {
+        const char *a = arg;
+        u32 pid = 0;
+        int r;
+
+        r = parse_num(&a, 10, &pid);
+        if (r != 0) {
+            print_status("kill", -E_INVAL);
+            return;
+        }
+        r = kill((int)pid);
+        if (r < 0) {
+            print_status("kill", r);
+        }
     }
 }
 
 static void help_cmd(const char *c)
 {
     if (strcmp(c, "ls") == 0) {
-        puts("ls [-l] [-R] [PATH...]: names of a directory (-l: mode, uid, gid, size; -R: recurse);\n"
+        puts("ls [-l] [-R] [-F] [-d] [-h] [PATH...]: names of a directory (-l: mode, uid, gid, size;\n"
+             "  -R: recurse; -F: append / * =; -d: list arguments themselves; -h: human sizes);\n"
              "  a file argument lists that file; several paths get a header each\n");
     } else if (strcmp(c, "cat") == 0) {
-        puts("cat [-n] [FILE...]: print files (-n numbers lines); no FILE copies standard input\n");
+        puts("cat [-n] [-E] [-T] [FILE...]: print files (-n numbers lines, -E marks line ends with $,\n"
+             "  -T shows tabs as ^I); no FILE copies standard input\n");
     } else if (strcmp(c, "echo") == 0) {
-        puts("echo [-n] [WORD...]: print the words separated by spaces (-n: no newline).\n"
+        puts("echo [-n] [-e] [WORD...]: print the words separated by spaces (-n: no newline,\n"
+             "  -e: backslash escapes like \\n \\t \\\\).\n"
              "  Redirect with > or >> like any command; quote to keep spaces: echo \"a  b\"\n");
     } else if (strcmp(c, "mkdir") == 0) {
-        puts("mkdir PATH...: create directories, parents as needed\n");
+        puts("mkdir [-p] [-m MODE] PATH...: create directories (-p makes parents, -m sets the mode)\n");
     } else if (strcmp(c, "rm") == 0) {
-        puts("rm PATH...: remove files or empty directories\n");
+        puts("rm [-r] [-f] [-i] PATH...: remove files or empty directories (-r removes trees,\n"
+             "  -f never complains, -i asks for each path)\n");
     } else if (strcmp(c, "mv") == 0) {
-        puts("mv SRC DST: rename or move within the VFS\n");
+        puts("mv [-i] SRC DST: rename or move within the VFS (-i asks before overwriting)\n");
+    } else if (strcmp(c, "rmdir") == 0) {
+        puts("rmdir PATH...: remove empty directories only\n");
     } else if (strcmp(c, "rmtree") == 0) {
         puts("rmtree PATH: remove a tree recursively (rm -rf)\n");
     } else if (strcmp(c, "touch") == 0) {
-        puts("touch FILE...: create empty files if missing\n");
+        puts("touch [-c] FILE...: create empty files if missing (-c: never create)\n");
     } else if (strcmp(c, "cp") == 0) {
-        puts("cp [-r] SRC DST: copy a file, or a tree with -r\n");
+        puts("cp [-r] [-i] SRC DST: copy a file, or a tree with -r (-i asks before overwriting)\n");
     } else if (strcmp(c, "head") == 0) {
-        puts("head [-N | -n N] [FILE]: first N lines (default 10); no FILE reads standard input\n");
+        puts("head [-N | -n N | -c N] [-q] [-v] [FILE...]: first lines/bytes (default 10 lines);\n"
+             "  no FILE reads standard input; headers only with several files (-v forces them)\n");
     } else if (strcmp(c, "tail") == 0) {
-        puts("tail [-N | -n N] [FILE]: last N lines (default 10); no FILE reads standard input\n");
+        puts("tail [-N | -n N | -c N] [-q] [-v] [FILE...]: last lines/bytes (default 10 lines);\n"
+             "  no FILE reads standard input; headers only with several files (-v forces them)\n");
     } else if (strcmp(c, "wc") == 0) {
         puts("wc [-l] [-w] [-c] [FILE...]: lines, words and bytes; no FILE reads standard input;\n"
              "  several files add a total line\n");
     } else if (strcmp(c, "grep") == 0) {
-        puts("grep [-i] [-n] [-v] [-c] [-r] PATTERN [FILE...]: lines containing PATTERN (a plain\n"
+        puts("grep [-i] [-n] [-v] [-c] [-r] [-m N] PATTERN [FILE...]: lines containing PATTERN (a plain\n"
              "  substring, not a regex). -i ignore case, -n line numbers, -v invert, -c count,\n"
-             "  -r walk directories. No FILE reads standard input.\n");
+             "  -r walk directories, -m N stop after N matches. No FILE reads standard input.\n");
     } else if (strcmp(c, "stat") == 0) {
         puts("stat PATH: type, size, mode, owner\n");
     } else if (strcmp(c, "du") == 0) {
         puts("du [-h] [PATH]: bytes under a tree (default: .)\n");
     } else if (strcmp(c, "find") == 0) {
-        puts("find [PATH]: list a tree recursively (default: .)\n");
+        puts("find [PATH...] [-name PAT] [-type f|d] [-maxdepth N] [-print] [-exec CMD ;] [-delete]:\n"
+             "  walk trees (default: .); patterns allow * and ?; -exec runs CMD per match ({}: path)\n");
     } else if (strcmp(c, "hexdump") == 0) {
         puts("hexdump [-C] FILE: offset, hex bytes and ASCII\n");
     } else if (strcmp(c, "cmp") == 0) {
@@ -3058,7 +5450,7 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "dirname") == 0) {
         puts("dirname PATH: all but the last component\n");
     } else if (strcmp(c, "seq") == 0) {
-        puts("seq LAST | FIRST LAST | FIRST STEP LAST: print numbers\n");
+        puts("seq [-w] LAST | FIRST LAST | FIRST STEP LAST: print numbers (-w pads with zeros)\n");
     } else if (strcmp(c, "which") == 0) {
         puts("which PROG: where the shell would run it from\n");
     } else if (strcmp(c, "time") == 0) {
@@ -3068,7 +5460,8 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "cut") == 0) {
         puts("cut [-d DELIM] -f LIST [FILE]: delimiter fields (stdin default)\n");
     } else if (strcmp(c, "uniq") == 0) {
-        puts("uniq [-c] [FILE]: collapse adjacent duplicates (stdin default)\n");
+        puts("uniq [-c] [-d] [-u] [FILE]: collapse adjacent duplicates (stdin default);\n"
+             "  -c counts, -d only repeats, -u only one-offs\n");
     } else if (strcmp(c, "tr") == 0) {
         puts("tr SET1 SET2 [FILE]: translate bytes, ranges like a-z\n");
     } else if (strcmp(c, "strings") == 0) {
@@ -3076,11 +5469,21 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "pwd") == 0) {
         puts("pwd: print the working directory\n");
     } else if (strcmp(c, "cd") == 0) {
-        puts("cd [PATH]: change directory (default: /)\n");
+        puts("cd [PATH]: change directory (default: /); cd - goes back to the previous one\n");
+    } else if (strcmp(c, "pushd") == 0) {
+        puts("pushd [DIR]: save cwd (up to 8 deep) and change to DIR, printing the stack\n");
+    } else if (strcmp(c, "popd") == 0) {
+        puts("popd: return to the top saved directory and print the stack\n");
+    } else if (strcmp(c, "dirs") == 0) {
+        puts("dirs: show the saved directory stack, newest last\n");
     } else if (strcmp(c, "tee") == 0) {
         puts("tee [-a] FILE: stdin to file and stdout (-a appends)\n");
     } else if (strcmp(c, "clear") == 0) {
         puts("clear: clear the screen (VGA and serial terminal)\n");
+    } else if (strcmp(c, "reset") == 0) {
+        puts("reset: same as clear\n");
+    } else if (strcmp(c, "yes") == 0) {
+        puts("yes [WORD...]: print the words (default y) forever, until killed or piped out\n");
     } else if (strcmp(c, "meminfo") == 0) {
         puts("meminfo: raw kernel allocator counters\n");
     } else if (strcmp(c, "free") == 0) {
@@ -3094,7 +5497,7 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "lsblk") == 0) {
         puts("lsblk: system disk sectors and capacity (/proc/disk)\n");
     } else if (strcmp(c, "uptime") == 0) {
-        puts("uptime: seconds since boot\n");
+        puts("uptime [-s]: seconds since boot (-s: the boot moment as UTC date and time)\n");
     } else if (strcmp(c, "date") == 0) {
         puts("date [+FORMAT | -s \"YYYY-MM-DD HH:MM:SS\"]: current UTC date and time from the RTC.\n"
              "  FORMAT: %Y %m %d %H %M %S %s %a %b %F %T %%. -s (root) sets a software offset\n"
@@ -3104,28 +5507,34 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "pid") == 0) {
         puts("pid: print our process id\n");
     } else if (strcmp(c, "id") == 0) {
-        puts("id: print uid and gid\n");
+        puts("id [-u] [-g] [-G] [-n] [USER]: uid, gid and groups (-u/-g print one id, -n names)\n");
+    } else if (strcmp(c, "groups") == 0) {
+        puts("groups [USER]: group names for USER (default: us) from /etc/group\n");
     } else if (strcmp(c, "su") == 0) {
         puts("su UID: root may switch down; going back to 0 is refused\n");
     } else if (strcmp(c, "chmod") == 0) {
-        puts("chmod [-R] MODE PATH: octal mode, owner or root\n");
+        puts("chmod [-R] MODE PATH: octal (755) or symbolic (u+x,go-w,a=rx); owner or root\n");
     } else if (strcmp(c, "chown") == 0) {
-        puts("chown [-R] UID GID PATH: root only\n");
+        puts("chown [-R] OWNER[:GROUP] PATH: uid/gid numbers or names from /etc/passwd and /etc/group (root only)\n");
     } else if (strcmp(c, "sync") == 0) {
         puts("sync: flush the file system to disk\n");
     } else if (strcmp(c, "sleep") == 0) {
-        puts("sleep SECS: wait\n");
+        puts("sleep SECS: wait (whole or fractional seconds, up to one hour)\n");
+    } else if (strcmp(c, "umask") == 0) {
+        puts("umask [MODE]: show the creation mask, or set it (octal, root may use -S style too)\n");
+    } else if (strcmp(c, "logger") == 0) {
+        puts("logger [-t TAG] MESSAGE...: append a line to the kernel log (shows in dmesg)\n");
     } else if (strcmp(c, "kill") == 0) {
-        puts("kill PID: terminate a process\n");
+        puts("kill [-s SIGNAL | -SIGNAL] PID...: terminate processes (-l lists signals)\n");
     } else if (strcmp(c, "hostname") == 0) {
         puts("hostname [NAME]: show or set /etc/hostname\n");
     } else if (strcmp(c, "uname") == 0) {
-        puts("uname [-a]: system name, or the full /proc/version line\n");
+        puts("uname [-a] [-s] [-n] [-r] [-m]: system name, or selected fields of /proc/version\n");
     } else if (strcmp(c, "run") == 0) {
         puts("run PROG [ARGS]: spawn /bin or absolute program and wait\n");
     } else if (strcmp(c, "poweroff") == 0 || strcmp(c, "halt") == 0 ||
                strcmp(c, "shutdown") == 0) {
-        puts("poweroff|halt|shutdown: halt (root only)\n");
+        puts("poweroff|halt|shutdown [-h] [-r]: halt (default, root only) or -r to reboot\n");
     } else if (strcmp(c, "reboot") == 0) {
         puts("reboot: reset (root only)\n");
     } else if (strcmp(c, "exit") == 0) {
@@ -3137,15 +5546,29 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "sysinfo") == 0) {
         puts("sysinfo: every /proc driver snapshot in one place\n");
     } else if (strcmp(c, "df") == 0) {
-        puts("df [-h] [PATH]: system disk backend and capacity (/proc/disk)\n");
+        puts("df [-h] [-i] [PATH]: system disk backend and capacity (/proc/disk; -h sizes, -i nodes)\n");
     } else if (strcmp(c, "ip") == 0 || strcmp(c, "ifconfig") == 0) {
         puts("ip [addr|link]: live NIC state from the e1000 driver\n");
     } else if (strcmp(c, "sort") == 0) {
-        puts("usage: sort [-r] [-n] [-u] [FILE...]   (no FILE: standard input; up to 64 KiB / 4096 lines)\n");
+        puts("usage: sort [-r] [-n] [-u] [-c] [FILE...]   (no FILE: standard input; up to 64 KiB / 4096 lines;\n"
+             "  -c only checks the order and reports the first disorder)\n");
     } else if (strcmp(c, "tac") == 0) {
         puts("usage: tac [FILE...]   (lines in reverse order)\n");
     } else if (strcmp(c, "nl") == 0) {
         puts("usage: nl [FILE...]   (numbers every line)\n");
+    } else if (strcmp(c, "split") == 0) {
+        puts("split [-l N] [-b N[k|m]] [-d] [-a N] [FILE [PREFIX]]: chop a file into PREFIXaa...\n"
+             "  pieces (-l lines, -b bytes; -d numeric suffixes of length -a)\n");
+    } else if (strcmp(c, "paste") == 0) {
+        puts("paste [-d LIST] [-s] [FILE...]: merge lines side by side (-d delimiters, -s serial)\n");
+    } else if (strcmp(c, "xargs") == 0) {
+        puts("xargs [-n MAX] [-0] CMD [ARGS...]: append stdin lines to CMD and run it in batches\n"
+             "  (-0 splits on NUL; empty input still runs once; CMD must be a /bin program,\n"
+             "  shell builtins like echo do not work here)\n");
+    } else if (strcmp(c, "file") == 0) {
+        puts("file FILE...: ELF details, #! scripts, empty/text/data from the first bytes\n");
+    } else if (strcmp(c, "type") == 0) {
+        puts("type NAME...: shell builtin, /bin path, or missing\n");
     } else if (strcmp(c, "help") == 0) {
         puts("help [CMD]: this list, or usage for CMD\n");
     } else {
@@ -3167,60 +5590,75 @@ static const char *const help_categories[] = {"Files and directories", "Text and
                                               "Processes and hardware", "Programs in /bin"};
 
 static const struct help_entry help_table[] = {
-    {"ls", "list a directory (-l long format, -R recursive)", 0},
-    {"cd", "change the working directory", 0},
+    {"ls", "list a directory (-l, -R, -F classify, -d, -h)", 0},
+    {"cd", "change the working directory (- goes back)", 0},
     {"pwd", "print the working directory", 0},
-    {"mkdir", "create a directory", 0},
-    {"touch", "create an empty file", 0},
-    {"cp", "copy a file", 0},
-    {"mv", "move or rename", 0},
-    {"rm", "remove a file or an empty directory", 0},
+    {"pushd", "save cwd and change directory", 0},
+    {"popd", "return to the saved directory", 0},
+    {"dirs", "show the directory stack", 0},
+    {"mkdir", "create directories (-p parents, -m MODE)", 0},
+    {"rmdir", "remove empty directories", 0},
+    {"touch", "create empty files (-c: no create)", 0},
+    {"cp", "copy files (-r trees, -i confirm)", 0},
+    {"mv", "move or rename (-i confirm)", 0},
+    {"rm", "remove files or empty dirs (-r trees, -i confirm)", 0},
     {"rmtree", "remove a directory and everything in it", 0},
     {"stat", "show type, mode, owner and size", 0},
     {"du", "disk usage of a tree", 0},
-    {"find", "search a tree for names", 0},
+    {"find", "search a tree (-name -type -maxdepth -exec -delete)", 0},
     {"basename", "strip the directory from a path", 0},
     {"dirname", "strip the last path component", 0},
     {"tee", "copy input to a file and to the screen", 0},
-    {"cat", "print files, or standard input (-n numbers lines)", 1},
-    {"echo", "print arguments (-n: no newline)", 1},
-    {"head", "first lines of a file or input", 1},
-    {"tail", "last lines of a file or input", 1},
+    {"cat", "print files, or standard input (-n -E -T)", 1},
+    {"echo", "print arguments (-n -e, -> file)", 1},
+    {"head", "first lines (-c bytes) of a file or input", 1},
+    {"tail", "last lines (-c bytes) of a file or input", 1},
     {"wc", "count lines, words and bytes (-l -w -c)", 1},
-    {"grep", "lines containing text (-i -n -v -c -r)", 1},
+    {"grep", "lines containing text (-i -n -v -c -r -m)", 1},
     {"cut", "select fields or characters from lines", 1},
-    {"sort", "sort lines (-r reverse, -n numeric, -u unique)", 1},
-    {"uniq", "collapse repeated adjacent lines", 1},
+    {"sort", "sort lines (-r reverse, -n numeric, -u unique, -c check)", 1},
+    {"uniq", "collapse repeated adjacent lines (-c -d -u)", 1},
     {"tac", "print lines in reverse order", 1},
     {"nl", "number lines", 1},
     {"tr", "translate or delete characters", 1},
     {"strings", "printable strings found in a file", 1},
     {"hexdump", "bytes of a file in hex", 1},
     {"cmp", "compare two files byte by byte", 1},
-    {"seq", "print a sequence of numbers", 1},
+    {"seq", "print a sequence of numbers (-w pads)", 1},
+    {"split", "split a file into pieces (-l -b -d -a)", 1},
+    {"paste", "merge lines side by side (-d -s)", 1},
+    {"xargs", "build /bin commands from input lines (-n -0)", 1},
+    {"file", "identify file type by contents", 1},
+    {"type", "tell builtins from /bin programs", 1},
     {"clear", "clear the screen", 2},
+    {"reset", "same as clear", 2},
     {"date", "show or set the date and time (UTC)", 2},
-    {"uptime", "time since boot", 2},
-    {"uname", "kernel name and version", 2},
+    {"uptime", "time since boot (-s: boot moment)", 2},
+    {"uname", "kernel name and version (-a -s -n -r -m)", 2},
     {"hostname", "show the host name", 2},
     {"whoami", "current user name", 2},
-    {"id", "user and group ids", 2},
+    {"groups", "group names of a user", 2},
+    {"id", "user and group ids (-u -g -G -n)", 2},
     {"su", "switch to another user id (root only)", 2},
-    {"chmod", "change file permissions", 2},
-    {"chown", "change file owner (root only)", 2},
+    {"chmod", "change file permissions, octal or symbolic", 2},
+    {"chown", "change file owner: UID GID or NAME[:GROUP]", 2},
     {"sync", "write the file system to disk", 2},
-    {"sleep", "wait for some seconds", 2},
+    {"sleep", "wait some seconds (fractions allowed)", 2},
+    {"yes", "repeat a line until killed", 2},
     {"time", "run a command and report how long it took", 2},
     {"which", "locate a command", 2},
+    {"umask", "show or set the creation mask", 2},
+    {"logger", "append a line to the kernel log", 2},
     {"random", "random numbers from the kernel generator", 2},
     {"run", "run a program by path", 2},
     {"poweroff", "power the machine off", 2},
     {"halt", "stop the machine", 2},
+    {"shutdown", "halt or reboot (-h default, -r reboots)", 2},
     {"reboot", "restart the machine", 2},
     {"exit", "leave the shell", 2},
     {"help", "this list; `help CMD` for details", 2},
     {"ps", "list processes", 3},
-    {"kill", "terminate a process by pid", 3},
+    {"kill", "terminate processes (-s SIGNAL, -l lists)", 3},
     {"pid", "pid of this shell", 3},
     {"meminfo", "physical memory, kernel heap and file-system nodes", 3},
     {"free", "memory in use and free", 3},
@@ -3246,11 +5684,24 @@ static const struct help_entry help_table[] = {
 
 #define HELP_COUNT ((int)(sizeof(help_table) / sizeof(help_table[0])))
 
+/* True when `name` is a shell builtin (for `type`). */
+static int is_builtin(const char *name)
+{
+    for (int i = 0; i < HELP_COUNT; ++i) {
+        if (strcmp(help_table[i].name, name) == 0 && help_table[i].category != 4) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void help(void)
 {
-    puts("axys shell. Type `help CMD` for the usage of one command.\n"
-         "Quote words with '...' or \"...\"; join commands with ';' or '|' (a pipe);\n"
-         "redirect with '<', '>' and '>>'. Output of any command can be redirected.\n");
+    puts("axys shell commands. `help CMD` shows one command in detail.\n"
+         "Words split on spaces unless 'quoted' or \"quoted\" (\\ escapes a byte).\n"
+         "Chain lines with ';', pipe stages with '|', redirect with < > >>.\n"
+         "Try: ls -l /bin | head -n 5     programs through a filter\n"
+         "Try: grep -ri main /bin | wc -l count hits across programs\n");
     for (int cat = 0; cat < 5; ++cat) {
         puts("\n");
         puts(help_categories[cat]);
@@ -3270,6 +5721,137 @@ static void help(void)
             puts("\n");
         }
     }
+    puts("\nEvery command above takes < > >> redirection; most filters also\n"
+         "read standard input. Unknown words run /bin/<word>.\n");
+}
+
+/* One symbolic clause [ugoa]*[+-=][rwxXst]* (copy forms g=u etc. allowed).
+ * `old` is the current mode, `is_dir` gates X. An omitted who means `a`
+ * (for `=` the umask is not applied: this shell documents the difference).
+ * `s` sets setuid/setgid for the named u/g classes (`o+s` is accepted and
+ * does nothing, like GNU); `t` always sets the sticky bit when named.
+ * Returns 0 with *out set. */
+static int apply_clause(const char *s, u32 old, int is_dir, u32 *out)
+{
+    u32 who = 0;
+    char op = 0;
+    u32 mode = old;
+    u32 perms = 0;
+
+    while (*s == 'u' || *s == 'g' || *s == 'o' || *s == 'a') {
+        if (*s == 'u') {
+            who |= 0700u;
+        } else if (*s == 'g') {
+            who |= 0070u;
+        } else if (*s == 'o') {
+            who |= 0007u;
+        } else {
+            who |= 0777u;
+        }
+        ++s;
+    }
+    if (*s != '+' && *s != '-' && *s != '=') {
+        return -1;
+    }
+    op = *s++;
+    if (who == 0) {
+        who = 0777u;
+    }
+    /* A bare operator with no perms clears (for =) or no-ops (+/-). */
+    if (*s == '\0' || *s == ',') {
+        if (op == '=') {
+            mode &= ~(who | 07000u);
+        }
+        *out = mode;
+        return 0;
+    }
+    /* Copy forms (u/g/o as the perm): replicate one class across who. */
+    if ((*s == 'u' || *s == 'g' || *s == 'o') && (s[1] == '\0' || s[1] == ',')) {
+        u32 src = old;
+
+        if (*s == 'u') {
+            src = (old >> 6) & 7u;
+        } else if (*s == 'g') {
+            src = (old >> 3) & 7u;
+        } else {
+            src = old & 7u;
+        }
+        perms = (src | (src << 3) | (src << 6)) & who;
+        ++s;
+    } else {
+        while (*s && *s != ',') {
+            if (*s == 'r') {
+                perms |= 0444u & who;
+            } else if (*s == 'w') {
+                perms |= 0222u & who;
+            } else if (*s == 'x') {
+                perms |= 0111u & who;
+            } else if (*s == 'X') {
+                if (is_dir || (old & 0111u) != 0) {
+                    perms |= 0111u & who;
+                }
+            } else if (*s == 's') {
+                if ((who & 0700u) != 0) {
+                    perms |= 04000u;
+                }
+                if ((who & 0070u) != 0) {
+                    perms |= 02000u;
+                }
+            } else if (*s == 't') {
+                perms |= 01000u;
+            } else {
+                return -1;
+            }
+            ++s;
+        }
+        perms &= who | 07000u;
+    }
+    if (op == '+') {
+        mode |= perms;
+    } else if (op == '-') {
+        mode &= ~perms;
+    } else {
+        /* = assigns exactly: who-rwx plus any named s/t, rest cleared. */
+        mode = (mode & ~(who | 07000u)) | perms;
+    }
+    *out = mode;
+    return 0;
+}
+
+/* Full symbolic spec: comma-separated clauses. */
+static int parse_symbolic(const char *spec, u32 old, int is_dir, u32 *out)
+{
+    u32 mode = old;
+
+    if (*spec == '\0') {
+        return -1;
+    }
+    for (;;) {
+        const char *comma = spec;
+
+        while (*comma && *comma != ',') {
+            ++comma;
+        }
+        {
+            char clause[32];
+            size_t k = (size_t)(comma - spec);
+
+            if (k == 0 || k >= sizeof(clause)) {
+                return -1;
+            }
+            memcpy(clause, spec, k);
+            clause[k] = '\0';
+            if (apply_clause(clause, mode, is_dir, &mode) != 0) {
+                return -1;
+            }
+        }
+        if (*comma == '\0') {
+            break;
+        }
+        spec = comma + 1;
+    }
+    *out = mode & 07777u;
+    return 0;
 }
 
 /* One command: its summary line, then the detailed usage. */
@@ -3329,6 +5911,16 @@ static int run_line(char *line)
             cmd_tac(rest);
         } else if (strcmp(cmd, "nl") == 0) {
             cmd_nl(rest);
+        } else if (strcmp(cmd, "split") == 0) {
+            cmd_split(rest);
+        } else if (strcmp(cmd, "paste") == 0) {
+            cmd_paste(rest);
+        } else if (strcmp(cmd, "xargs") == 0) {
+            cmd_xargs(rest);
+        } else if (strcmp(cmd, "file") == 0) {
+            cmd_file(rest);
+        } else if (strcmp(cmd, "type") == 0) {
+            cmd_type(rest);
         } else if (strcmp(cmd, "cat") == 0) {
             cmd_cat(rest);
         } else if (strcmp(cmd, "echo") == 0) {
@@ -3336,24 +5928,106 @@ static int run_line(char *line)
         } else if (strcmp(cmd, "mkdir") == 0) {
             char *arg = next_arg(&rest);
             char path[PATH_MAX];
+            int pflag = 0;
+            u32 mmode = 0;
+            int have_mode = 0;
 
+            /* Flags first (-p, -m MODE, clustered): paths follow. */
+            for (; arg && arg[0] == '-' && arg[1] != '\0'; arg = next_arg(&rest)) {
+                if (strcmp(arg, "-p") == 0) {
+                    pflag = 1;
+                } else if (strcmp(arg, "-m") == 0) {
+                    const char *a;
+
+                    arg = next_arg(&rest);
+                    if (!arg) {
+                        print_status("mkdir", -E_INVAL);
+                        goto mkdir_done;
+                    }
+                    a = arg;
+                    if (parse_num(&a, 8, &mmode) != 0 || mmode > 07777u) {
+                        print_status("mkdir", -E_INVAL);
+                        goto mkdir_done;
+                    }
+                    have_mode = 1;
+                    arg = next_arg(&rest);
+                    break;
+                } else {
+                    print_status("mkdir", -E_INVAL);
+                    goto mkdir_done;
+                }
+            }
             if (!arg) {
                 print_status("mkdir", -E_INVAL);
             } else {
                 for (; arg; arg = next_arg(&rest)) {
                     int r;
+                    struct stat_info st;
 
                     resolve(arg, path);
                     r = mkdir(path);
+                    if (r == -E_EXIST && pflag) {
+                        /* -p: existing directories are fine, files are not. */
+                        if (stat(path, &st) == 0 && st.type == 2) {
+                            r = 0;
+                        }
+                    }
+                    if (r == 0 && have_mode) {
+                        r = chmod(path, mmode);
+                    }
                     if (r < 0) {
                         print_status("mkdir", r);
+                    }
+                }
+            }
+        mkdir_done:;
+        } else if (strcmp(cmd, "rmdir") == 0) {
+            char *arg = next_arg(&rest);
+
+            if (!arg) {
+                print_status("rmdir", -E_INVAL);
+            } else {
+                char path[PATH_MAX];
+
+                for (; arg; arg = next_arg(&rest)) {
+                    struct stat_info st;
+                    int r;
+
+                    resolve(arg, path);
+                    if (stat(path, &st) != 0) {
+                        print_status("rmdir", -E_NOENT);
+                        continue;
+                    }
+                    if (st.type != 2) {
+                        print_status("rmdir", -E_NOTDIR);
+                        continue;
+                    }
+                    r = unlink(path);
+                    if (r < 0) {
+                        print_status("rmdir", r);
                     }
                 }
             }
         } else if (strcmp(cmd, "rm") == 0) {
             char *arg = next_arg(&rest);
             char path[PATH_MAX];
+            int rec = 0;
+            int interactive = 0;
 
+            for (; arg && arg[0] == '-' && arg[1] != '\0'; arg = next_arg(&rest)) {
+                for (const char *f = arg + 1; *f; ++f) {
+                    if (*f == 'r' || *f == 'R') {
+                        rec = 1;
+                    } else if (*f == 'i') {
+                        interactive = 1;
+                    } else if (*f == 'f') {
+                        /* Accepted: errors are already non-fatal per path. */
+                    } else {
+                        print_status("rm", -E_INVAL);
+                        goto rm_done;
+                    }
+                }
+            }
             if (!arg) {
                 print_status("rm", -E_INVAL);
             } else {
@@ -3361,29 +6035,52 @@ static int run_line(char *line)
                     int r;
 
                     resolve(arg, path);
-                    r = unlink(path);
+                    if (interactive && !confirm(path)) {
+                        continue;
+                    }
+                    if (rec) {
+                        r = rmtree(path);
+                    } else {
+                        r = unlink(path);
+                    }
                     if (r < 0) {
                         print_status("rm", r);
                     }
                 }
             }
+        rm_done:;
         } else if (strcmp(cmd, "mv") == 0) {
             char *src = next_arg(&rest);
-            char *dst = next_arg(&rest);
+            char *dst;
             char spath[PATH_MAX], dpath[PATH_MAX];
+            int interactive = 0;
 
+            while (src && src[0] == '-' && src[1] != '\0') {
+                if (strcmp(src, "-i") != 0) {
+                    print_status("mv", -E_INVAL);
+                    goto mv_done;
+                }
+                interactive = 1;
+                src = next_arg(&rest);
+            }
+            dst = next_arg(&rest);
             if (!src || !dst || next_arg(&rest)) {
                 print_status("mv", -E_INVAL);
             } else {
                 int r;
+                struct stat_info st;
 
                 resolve(src, spath);
                 resolve(dst, dpath);
+                if (interactive && stat(dpath, &st) == 0 && !confirm(dpath)) {
+                    goto mv_done;
+                }
                 r = rename(spath, dpath);
                 if (r < 0) {
                     print_status("mv", r);
                 }
             }
+        mv_done:;
         } else if (strcmp(cmd, "rmtree") == 0) {
             char path[PATH_MAX];
 
@@ -3423,9 +6120,15 @@ static int run_line(char *line)
             cmd_pwd();
         } else if (strcmp(cmd, "cd") == 0) {
             cmd_cd(rest);
+        } else if (strcmp(cmd, "pushd") == 0) {
+            cmd_pushd(rest);
+        } else if (strcmp(cmd, "popd") == 0) {
+            cmd_popd(rest);
+        } else if (strcmp(cmd, "dirs") == 0) {
+            cmd_dirs(rest);
         } else if (strcmp(cmd, "tee") == 0) {
             cmd_tee(rest);
-        } else if (strcmp(cmd, "clear") == 0) {
+        } else if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "reset") == 0) {
             cmd_clear();
         } else if (strcmp(cmd, "meminfo") == 0) {
             struct meminfo mi;
@@ -3447,11 +6150,39 @@ static int run_line(char *line)
         } else if (strcmp(cmd, "free") == 0) {
             cmd_free(rest);
         } else if (strcmp(cmd, "uptime") == 0) {
+            char *arg = next_arg(&rest);
             u64 ms = uptime_ms();
-            put_u64(ms / 1000);
-            puts(".");
-            put_u64((ms % 1000) / 100);
-            puts(" s\n");
+
+            if (arg && strcmp(arg, "-s") == 0) {
+                /* Boot moment = wall clock minus uptime, as UTC. */
+                long now = time_unix();
+                struct axys_civil c;
+
+                if (next_arg(&rest) || now < 0 || (u64)now < ms / 1000) {
+                    print_status("uptime", -E_INVAL);
+                } else {
+                    axys_civil_from_unix(now - (long)(ms / 1000), &c);
+                    put_u64(c.year);
+                    puts("-");
+                    put_2digits(c.month);
+                    puts("-");
+                    put_2digits(c.day);
+                    puts(" ");
+                    put_2digits(c.hour);
+                    puts(":");
+                    put_2digits(c.minute);
+                    puts(":");
+                    put_2digits(c.second);
+                    puts("\n");
+                }
+            } else if (arg) {
+                print_status("uptime", -E_INVAL);
+            } else {
+                put_u64(ms / 1000);
+                puts(".");
+                put_u64((ms % 1000) / 100);
+                puts(" s\n");
+            }
         } else if (strcmp(cmd, "date") == 0) {
             cmd_date(rest);
         } else if (strcmp(cmd, "random") == 0) {
@@ -3469,11 +6200,7 @@ static int run_line(char *line)
             put_u64((u64)getpid());
             puts("\n");
         } else if (strcmp(cmd, "id") == 0) {
-            puts("uid=");
-            put_u64((u64)getuid());
-            puts(" gid=");
-            put_u64((u64)getgid());
-            puts("\n");
+            cmd_id(rest);
         } else if (strcmp(cmd, "su") == 0) {
             const char *a = rest;
             u32 id = 0;
@@ -3489,73 +6216,215 @@ static int run_line(char *line)
                 print_status("su", r);
             }
         } else if (strcmp(cmd, "chmod") == 0) {
-            const char *a = rest;
+            char *p = rest;
+            char *tok;
             u32 mode = 0;
             int rec = 0;
-            int r;
+            int r = 0;
 
-            if (a[0] == '-' && a[1] == 'R' && (a[2] == ' ' || a[2] == '\0')) {
+            if (p[0] == '-' && p[1] == 'R' && (p[2] == ' ' || p[2] == '\0')) {
                 rec = 1;
-                a += 2;
-                while (*a == ' ') {
-                    ++a;
-                }
+                p += 2;
             }
-            r = parse_num(&a, 8, &mode) == 0 ? 0 : -22;
+            tok = next_arg(&p);
+            if (!tok) {
+                print_status("chmod", -E_INVAL);
+            } else if (tok[0] >= '0' && tok[0] <= '7') {
+                const char *a = tok;
+                char *patharg;
 
-            while (*a == ' ') {
-                ++a;
-            }
-            if (r == 0) {
-                char path[PATH_MAX];
-
-                if (*a == '\0') {
+                r = parse_num(&a, 8, &mode) == 0 ? 0 : -22;
+                patharg = next_arg(&p);
+                if (r == 0 && (!patharg || next_arg(&p))) {
                     r = -E_INVAL;
-                } else {
-                    resolve(a, path);
-                    r = rec ? chmod_tree(path, mode, 0, 0, 0, 0) : chmod(path, mode);
                 }
-            }
-            if (r < 0) {
-                print_status("chmod", r);
+                if (r == 0) {
+                    char path[PATH_MAX];
+
+                    resolve(patharg, path);
+                    r = rec ? chmod_tree(path, mode, 0, 0, 0, 0, 0)
+                            : chmod(path, mode);
+                }
+                if (r < 0) {
+                    print_status("chmod", r);
+                }
+            } else {
+                /* Symbolic mode: validate first so a bad spec fails before
+                 * touching anything, then apply per node (X and copies read
+                 * each node's own mode). */
+                char *patharg = next_arg(&p);
+                char *extra = patharg ? next_arg(&p) : 0;
+                char path[PATH_MAX];
+                struct stat_info st;
+                u32 dummy = 0;
+
+                if (!patharg || extra) {
+                    print_status("chmod", -E_INVAL);
+                } else if (parse_symbolic(tok, 0, 0, &dummy) != 0) {
+                    print_status("chmod", -22);
+                } else {
+                    resolve(patharg, path);
+                    if (!rec) {
+                        u32 want = 0;
+
+                        if (stat(path, &st) != 0) {
+                            print_status("chmod", -E_NOENT);
+                        } else if (parse_symbolic(tok, st.mode, st.type == 2,
+                                                  &want) != 0) {
+                            print_status("chmod", -22);
+                        } else {
+                            r = chmod(path, want);
+                            if (r < 0) {
+                                print_status("chmod", r);
+                            }
+                        }
+                    } else {
+                        r = chmod_tree(path, 0, 0, 0, 0, 0, tok);
+                        if (r < 0) {
+                            print_status("chmod", r);
+                        }
+                    }
+                }
             }
         } else if (strcmp(cmd, "chown") == 0) {
-            const char *a = rest;
-            u32 uid = 0;
-            u32 gid = 0;
+            char *p = rest;
+            char *tok;
             int rec = 0;
-            int r;
 
-            if (a[0] == '-' && a[1] == 'R' && (a[2] == ' ' || a[2] == '\0')) {
+            if (p[0] == '-' && p[1] == 'R' && (p[2] == ' ' || p[2] == '\0')) {
                 rec = 1;
-                a += 2;
-                while (*a == ' ') {
-                    ++a;
+                p += 2;
+            }
+            tok = next_arg(&p);
+            if (!tok) {
+                print_status("chown", -E_INVAL);
+            } else {
+                /* Forms: UID GID PATH (legacy), OWNER[:GROUP] PATH,
+                 * :GROUP PATH. A colon always means the new form. */
+                char *colon = 0;
+                char *patharg;
+                u32 uid = 0, gid = 0;
+                int keep_uid = 0, keep_gid = 0;
+                int r = 0;
+
+                for (char *c = tok; *c; ++c) {
+                    if (*c == ':') {
+                        colon = c;
+                        break;
+                    }
                 }
-            }
-            r = parse_num(&a, 10, &uid) == 0 ? 0 : -22;
+                if (!colon) {
+                    char *second = next_arg(&p);
 
-            while (*a == ' ') {
-                ++a;
-            }
-            if (r == 0 && parse_num(&a, 10, &gid) != 0) {
-                r = -22;
-            }
-            while (*a == ' ') {
-                ++a;
-            }
-            if (r == 0) {
-                char path[PATH_MAX];
+                    if (second) {
+                        /* Two leading words: legacy UID GID PATH. */
+                        const char *a = tok;
 
-                if (*a == '\0') {
-                    r = -E_INVAL;
+                        r = parse_num(&a, 10, &uid) == 0 ? 0 : -22;
+                        if (r == 0) {
+                            a = second;
+                            r = parse_num(&a, 10, &gid) == 0 ? 0 : -22;
+                        }
+                        patharg = next_arg(&p);
+                        if (r == 0 && (!patharg || next_arg(&p))) {
+                            r = -E_INVAL;
+                        }
+                        if (r != 0) {
+                            print_status("chown", r);
+                        } else {
+                            char path[PATH_MAX];
+
+                            resolve(patharg, path);
+                            r = rec ? chmod_tree(path, 0, uid, gid, 1, 0, 0)
+                                    : chown(path, uid, gid);
+                            if (r < 0) {
+                                print_status("chown", r);
+                            }
+                        }
+                        goto chown_done;
+                    }
+                    /* Single word: an owner name (or bare uid). */
+                    patharg = second;
+                    if (!patharg || next_arg(&p)) {
+                        print_status("chown", -E_INVAL);
+                        goto chown_done;
+                    }
+                    {
+                        const char *a = tok;
+                        u32 v = 0;
+
+                        if (parse_num(&a, 10, &v) == 0) {
+                            uid = v;
+                        } else if (passwd_uid(tok, &uid) != 0) {
+                            print_status("chown", -22);
+                            goto chown_done;
+                        }
+                    }
+                    keep_gid = 1;
                 } else {
-                    resolve(a, path);
-                    r = rec ? chmod_tree(path, 0, uid, gid, 1, 0) : chown(path, uid, gid);
+                    /* OWNER:GROUP, OWNER:, :GROUP (either side may be empty). */
+                    char owner[32], group[32];
+                    size_t on = (size_t)(colon - tok);
+                    size_t gn = strlen(colon + 1);
+
+                    patharg = next_arg(&p);
+                    if (on >= sizeof(owner) || gn >= sizeof(group) ||
+                        !patharg || next_arg(&p)) {
+                        print_status("chown", -E_INVAL);
+                        goto chown_done;
+                    }
+                    memcpy(owner, tok, on);
+                    owner[on] = '\0';
+                    memcpy(group, colon + 1, gn + 1);
+                    if (on == 0) {
+                        keep_uid = 1;
+                    } else {
+                        const char *a = owner;
+                        u32 v = 0;
+
+                        if (parse_num(&a, 10, &v) == 0) {
+                            uid = v;
+                        } else if (passwd_uid(owner, &uid) != 0) {
+                            print_status("chown", -22);
+                            goto chown_done;
+                        }
+                    }
+                    if (gn == 0) {
+                        keep_gid = 1;
+                    } else {
+                        const char *a = group;
+                        u32 v = 0;
+
+                        if (parse_num(&a, 10, &v) == 0) {
+                            gid = v;
+                        } else if (group_gid(group, &gid) != 0) {
+                            print_status("chown", -22);
+                            goto chown_done;
+                        }
+                    }
                 }
-            }
-            if (r < 0) {
-                print_status("chown", r);
+                {
+                    char path[PATH_MAX];
+                    struct stat_info st;
+
+                    resolve(patharg, path);
+                    if (stat(path, &st) != 0) {
+                        print_status("chown", -E_NOENT);
+                    } else {
+                        if (keep_uid) {
+                            uid = st.uid;
+                        }
+                        if (keep_gid) {
+                            gid = st.gid;
+                        }
+                        r = rec ? chmod_tree(path, 0, uid, gid, 1, 0, 0)
+                                : chown(path, uid, gid);
+                        if (r < 0) {
+                            print_status("chown", r);
+                        }
+                    }
+                }
+            chown_done:;
             }
         } else if (strcmp(cmd, "sync") == 0) {
             int r = sync();
@@ -3563,26 +6432,113 @@ static int run_line(char *line)
                 print_status("sync", r);
             }
         } else if (strcmp(cmd, "sleep") == 0) {
+            /* Seconds, with an optional fraction (sleep 0.5). */
             const char *a = rest;
             u32 s = 0;
+            u64 ms = 0;
             int r = parse_num(&a, 10, &s);
 
+            if (r == 0 && *a == '.') {
+                u32 frac = 0;
+                u32 mult = 100;
+                const char *f = a + 1;
+
+                ++a;
+                while (*a >= '0' && *a <= '9') {
+                    if (mult > 0) {
+                        frac += (u32)(*a - '0') * mult;
+                        mult /= 10;
+                    }
+                    ++a;
+                }
+                if (f == a) {
+                    r = -1; /* lone dot */
+                } else {
+                    ms = (u64)s * 1000 + frac;
+                }
+                (void)f;
+            } else if (r == 0) {
+                if (s > 86400u * 1000u) {
+                    r = -1; /* absurd, and s * 1000 would wrap u32 math */
+                } else {
+                    ms = (u64)s * 1000;
+                }
+            }
             while (*a == ' ') {
                 ++a;
             }
             if (r != 0 || *a != '\0') {
                 print_status("sleep", -22);
             } else {
-                sleep_ms((u64)s * 1000);
+                sleep_ms(ms);
+            }
+        } else if (strcmp(cmd, "yes") == 0) {
+            /* Repeat a line until killed (Ctrl-C) or the output breaks.
+             * Words join with spaces like echo; bare `yes` prints "y". */
+            char *words[16];
+            int nwords = 0;
+            char *arg;
+
+            for (arg = next_arg(&rest); arg && nwords < 16; arg = next_arg(&rest)) {
+                words[nwords++] = arg;
+            }
+            if (arg) {
+                print_status("yes", -E_INVAL);
+                return 0;
+            }
+            /* Pipes are sequential temp files, so `yes | head` first fills
+             * the disk: write 4 KiB chunks so even that finishes fast
+             * (ENOSPC still ends us, as does a closed pipe or Ctrl-C). */
+            {
+                char line[256];
+                char chunk[4096];
+                size_t llen = 0;
+                size_t off = 0;
+
+                if (nwords == 0) {
+                    line[0] = 'y';
+                    line[1] = '\n';
+                    llen = 2;
+                } else {
+                    for (int i = 0; i < nwords; ++i) {
+                        size_t k = strlen(words[i]);
+
+                        if (llen + k + 2 >= sizeof(line)) {
+                            print_status("yes", -E_INVAL);
+                            return 0;
+                        }
+                        if (i > 0) {
+                            line[llen++] = ' ';
+                        }
+                        memcpy(line + llen, words[i], k);
+                        llen += k;
+                    }
+                    line[llen++] = '\n';
+                }
+                while (off + llen <= sizeof(chunk)) {
+                    memcpy(chunk + off, line, llen);
+                    off += llen;
+                }
+                for (;;) {
+                    if (write(1, chunk, (u64)off) != (ssize_t)off) {
+                        return 0;
+                    }
+                }
             }
         } else if (strcmp(cmd, "kill") == 0) {
             cmd_kill(rest);
         } else if (strcmp(cmd, "hostname") == 0) {
             cmd_hostname(rest);
+        } else if (strcmp(cmd, "umask") == 0) {
+            cmd_umask(rest);
+        } else if (strcmp(cmd, "logger") == 0) {
+            cmd_logger(rest);
         } else if (strcmp(cmd, "uname") == 0) {
             cmd_uname(rest);
         } else if (strcmp(cmd, "whoami") == 0) {
             cmd_whoami();
+        } else if (strcmp(cmd, "groups") == 0) {
+            cmd_groups(rest);
         } else if (strcmp(cmd, "which") == 0) {
             cmd_which(rest);
         } else if (strcmp(cmd, "seq") == 0) {
@@ -3630,9 +6586,25 @@ static int run_line(char *line)
                 resolve(rest, path);
                 run(path, a);
             }
-        } else if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "halt") == 0 ||
-                   strcmp(cmd, "shutdown") == 0) {
+        } else if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "halt") == 0) {
             print_status("poweroff", power(0));
+        } else if (strcmp(cmd, "shutdown") == 0) {
+            char *arg = next_arg(&rest);
+
+            if (!arg) {
+                print_status("poweroff", power(0));
+            } else if ((strcmp(arg, "-r") == 0 ||
+                        strcmp(arg, "--reboot") == 0) &&
+                       !next_arg(&rest)) {
+                print_status("reboot", power(1));
+            } else if ((strcmp(arg, "-h") == 0 || strcmp(arg, "-H") == 0 ||
+                        strcmp(arg, "--halt") == 0 ||
+                        strcmp(arg, "--poweroff") == 0) &&
+                       !next_arg(&rest)) {
+                print_status("poweroff", power(0));
+            } else {
+                print_status("shutdown", -E_INVAL);
+            }
         } else if (strcmp(cmd, "reboot") == 0) {
             print_status("reboot", power(1));
         } else if (strcmp(cmd, "exit") == 0) {
@@ -3749,7 +6721,15 @@ static int run_pipeline(char *seg)
                 break;
             }
         } else if (i > 0) {
-            in_fd = open(pipe_path[(i - 1) & 1], 0);
+            /* The previous stage wrote the pipe, unless it redirected to
+             * a file instead: then this stage's input is empty (/dev/null),
+             * not the terminal. Reading the terminal here hung the shell
+             * until Ctrl-D (`echo x > f | cat` never came back). */
+            if (pipe_used[(i - 1) & 1]) {
+                in_fd = open(pipe_path[(i - 1) & 1], 0);
+            } else {
+                in_fd = open("/dev/null", 0);
+            }
         }
         if (out_name[0]) {
             resolve(out_name, path);
@@ -3784,6 +6764,12 @@ static int run_pipeline(char *seg)
             close(out_fd);
         }
         exit_shell = run_line(stage[i]);
+        if (find_nested_exit) {
+            /* `find ... -exec exit` above: a nested exit must leave the
+             * shell, and the void cmd_find cannot return it itself. */
+            find_nested_exit = 0;
+            exit_shell = 1;
+        }
         if (saved_in >= 0) {
             dup2(saved_in, 0);
             close(saved_in);
@@ -3811,7 +6797,11 @@ int main(const char *args, size_t len)
 
     (void)args;
     (void)len;
-    puts("axys shell ready (type 'help')\n");
+    puts("+-- axys shell ----------------------------------------+\n"
+         "| 'help' lists commands, 'help CMD' explains one.      |\n"
+         "| ';' chains, '|' pipes, < > >> redirect.              |\n"
+         "+------------------------------------------------------+\n"
+         "axys shell ready (type 'help')\n");
     for (;;) {
         ssize_t n;
         char *seg;

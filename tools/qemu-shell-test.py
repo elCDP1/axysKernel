@@ -147,6 +147,32 @@ case("hello world | cat", want=[r'args="world"'])
 case("hello world > /tmp/h; cat /tmp/h | grep -c ring", exact="1")
 case("echo a | cat | cat | cat | cat | cat | cat | cat | cat", want=[r"too many pipeline stages"])
 case("ls /tmp", forbid=[r"\.pipe"])  # every temporary pipe is removed
+case("echo hi > /tmp/x | cat", exact="")  # previous stage wrote a file: empty input, not a hang
+case("echo hi > /tmp/x | grep hi", exact="")  # grep reads the empty pipe, like Linux
+
+# ---- devices (/dev/null, /dev/zero) ------------------------------------------------------
+case("ls /dev", want=[r"^null$", r"^zero$"])
+case("ls -l /dev/null", want=[r"^-\S+ 0 0 0\t/dev/null$"])
+case("stat /dev/null", want=[r"type: file", r"size: 0 bytes"])
+case("cat /dev/null", exact="")
+case("wc -c /dev/null", exact="0 /dev/null")
+case("cmp /dev/null /dev/null", exact="identical")
+case("echo data > /tmp/devd; cat /tmp/devd > /dev/null; echo done", exact="done")
+case("head -c 8 /dev/zero | wc -c", exact="8")
+case("head -c 4 /dev/zero > /dev/null; cat /tmp/fruit | head -n 1", exact="pear")  # recycled fd slot must not stay a device
+case("head -c 5 /tmp/fruit", exact="pear")
+case("tail -c 7 /tmp/fruit", exact="banana")
+
+# ---- exact outputs -------------------------------------------------------------------------
+case("uname -a", exact="axysOS 1.0 x86_64")
+case("free", want=[r"^MemFree: \d+ KiB$", r"^Heap: \d+ used / \d+ free bytes$", r"^VfsNodes: \d+ live$"])
+case("df", want=[r"^backend: ", r"^capacity: \d+ bytes \(\d+ sectors\)$"])
+case("stat /tmp", want=[r"type: directory"])
+case("du -h /tmp", want=[r"\t/tmp$"])
+case("cat -n /tmp/fruit | head -n 1", want=[r"^1\tpear$"])
+case("seq 1 3 | tail -c 2", exact="3")
+case("basename /a/b/c", exact="c")
+case("dirname /a/b/c", exact="/a/b")
 
 # ---- ls, files ------------------------------------------------------------------------
 case("ls /tmp/f", exact="/tmp/f")

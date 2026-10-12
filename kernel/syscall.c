@@ -234,6 +234,9 @@ static axys_int64_t sys_write(struct axys_process *proc, axys_uint64_t fdn, axys
         }
         if (fd->console) {
             axys_console_write_len(chunk, n);
+        } else if (fd->dev != 0) {
+            /* /dev/null and /dev/zero: discard (the user buffer above was
+             * still validated, so a bad pointer fails EFAULT like Linux). */
         } else {
             /* Re-validate the descriptor under interrupts-off: the file could
              * be unlinked (and its VFS slot reissued) since fd_get checked. */
@@ -352,6 +355,27 @@ static axys_int64_t sys_read(struct axys_process *proc, axys_uint64_t fdn, axys_
     if (fd->console) {
         return console_read(proc, buf, len);
     }
+    if (fd->dev == 1) {
+        return 0; /* /dev/null: EOF (buffer already validated above) */
+    }
+    if (fd->dev == 2) {
+        /* /dev/zero: zeros, chunked like a file read and capped per call
+         * so a huge length cannot loop past the end of time. */
+        if (len > (1u << 20)) {
+            len = 1u << 20;
+        }
+        while (done < len) {
+            char chunk[IO_CHUNK];
+            axys_size_t n = len - done < IO_CHUNK ? (axys_size_t)(len - done) : IO_CHUNK;
+
+            axys_memset(chunk, 0, n);
+            if (axys_aspace_copy_to(&proc->space, buf + done, chunk, n) != 0) {
+                return done != 0 ? (axys_int64_t)done : err(AXYS_EFAULT);
+            }
+            done += n;
+        }
+        return (axys_int64_t)done;
+    }
     if (len > (1u << 20)) {
         len = 1u << 20;
     }
@@ -406,6 +430,40 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     if ((flags & (AXYS_O_TRUNC | AXYS_O_APPEND)) && !writable) {
         return err(AXYS_EINVAL);
     }
+    /* Device nodes, by path: no VFS object is needed. /dev/null discards
+     * writes and reads EOF; /dev/zero reads zeros. Both open for anyone
+     * (0666 semantics, no permission check); O_TRUNC/O_APPEND are accepted
+     * no-ops so redirections never fail on them. */
+    {
+        int kind = 0;
+
+        if (axys_strcmp(path, "/dev/null") == 0) {
+            kind = 1;
+        } else if (axys_strcmp(path, "/dev/zero") == 0) {
+            kind = 2;
+        }
+        if (kind != 0) {
+            for (int i = 3; i < AXYS_MAX_FDS; ++i) {
+                if (!proc->fds[i].used) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                return err(AXYS_EMFILE);
+            }
+            proc->fds[slot].used = 1;
+            proc->fds[slot].console = 0;
+            proc->fds[slot].readable = readable;
+            proc->fds[slot].writable = writable;
+            proc->fds[slot].node = -1;
+            proc->fds[slot].node_gen = 0;
+            proc->fds[slot].offset = 0;
+            proc->fds[slot].flags = (axys_uint32_t)flags;
+            proc->fds[slot].dev = kind;
+            return slot;
+        }
+    }
     if (!writable) {
         /* /proc files are regenerated from live kernel state as they are
          * opened, before any critical section below: they can take a moment
@@ -447,7 +505,7 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
         if (rc != 0) {
             goto open_done;
         }
-        node = axys_vfs_create_as(path, AXYS_VFS_FILE, 0644u, proc->uid, proc->gid);
+        node = axys_vfs_create_as(path, AXYS_VFS_FILE, 0644u & ~proc->umask, proc->uid, proc->gid);
         if (node < 0) {
             rc = err(path_errno(path)); /* name too long, bad component or table full */
             goto open_done;
@@ -474,6 +532,7 @@ static axys_int64_t sys_open(struct axys_process *proc, axys_uint64_t path_ptr, 
     proc->fds[slot].node_gen = axys_vfs_generation(node);
     proc->fds[slot].offset = 0;
     proc->fds[slot].flags = (axys_uint32_t)flags;
+    proc->fds[slot].dev = 0; /* a recycled slot may have served a device before */
     rc = slot;
 open_done:
     axys_cpu_restore_flags(irq);
@@ -503,7 +562,8 @@ static axys_int64_t sys_lseek(struct axys_process *proc, axys_uint64_t fdn, axys
     } else if (whence == 1) {
         base = (axys_int64_t)fd->offset;
     } else if (whence == 2) {
-        base = axys_vfs_size(fd->node);
+        /* Devices have no size: SEEK_END anchors at 0 like an empty file. */
+        base = fd->dev != 0 ? 0 : axys_vfs_size(fd->node);
     } else {
         axys_cpu_restore_flags(irq);
         return err(AXYS_EINVAL);
@@ -577,8 +637,11 @@ static axys_int64_t sys_readdir(struct axys_process *proc, axys_uint64_t path_pt
     {
         char name[AXYS_VFS_NAME_MAX];
         axys_size_t len;
+        axys_vfs_type_t type;
 
-        if (axys_vfs_name_copy(child, name, sizeof(name)) < 0) {
+        /* Name and type under one lock: two separate calls could straddle
+         * a slot recycle and marry the old name to the new occupant. */
+        if (axys_vfs_node_info(child, name, sizeof(name), &type) < 0) {
             return err(AXYS_ENOENT); /* node went away under us */
         }
         len = axys_strlen(name) + 1;
@@ -586,7 +649,7 @@ static axys_int64_t sys_readdir(struct axys_process *proc, axys_uint64_t path_pt
         if (size < len || axys_aspace_copy_to(&proc->space, buf, name, len) != 0) {
             return err(size < len ? AXYS_EINVAL : AXYS_EFAULT);
         }
-        return axys_vfs_type(child) == AXYS_VFS_DIR ? 2 : 1;
+        return type == AXYS_VFS_DIR ? 2 : 1;
     }
 }
 
@@ -665,6 +728,8 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         }
         {
             axys_vfs_node_t exe = axys_vfs_lookup(path);
+            axys_uint32_t gen;
+            axys_int32_t exe_size;
 
             if (exe < 0) {
                 return err(AXYS_ENOENT);
@@ -675,8 +740,14 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
             if (axys_vfs_access(exe, proc->uid, proc->gid, AXYS_PERM_X) != 0) {
                 return err(AXYS_EACCES); /* no execute permission */
             }
+            /* Identity for the loader to re-verify: slot, generation and
+             * size, so a replacement between here and the read aborts
+             * instead of running with our credentials. */
+            gen = axys_vfs_generation(exe);
+            exe_size = axys_vfs_size(exe);
+            return axys_process_spawn_checked(path, args, proc->pid, proc->uid, proc->gid,
+                                              exe, gen, exe_size);
         }
-        return axys_process_spawn_as(path, args, proc->pid, proc->uid, proc->gid);
     }
     case AXYS_SYS_WAIT: {
         int status = 0;
@@ -758,7 +829,7 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
                         prefix[j] = '\0';
                         missing_seen = 1;
                     }
-                    if (axys_vfs_create_as(prefix, AXYS_VFS_DIR, 0755u, proc->uid,
+                    if (axys_vfs_create_as(prefix, AXYS_VFS_DIR, 0755u & ~proc->umask, proc->uid,
                                            proc->gid) < 0) {
                         return err(path_errno(prefix));
                     }
@@ -1040,6 +1111,31 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         }
         axys_console_clear();
         return 0;
+    case AXYS_SYS_UMASK: {
+        axys_uint32_t old = proc->umask;
+
+        if (a0 > 0777u) {
+            return err(AXYS_EINVAL);
+        }
+        proc->umask = (axys_uint32_t)a0;
+        return (axys_int64_t)old;
+    }
+    case AXYS_SYS_KLOG: {
+        /* logger(2)-style: user bytes appended to the kernel log ring, so
+         * they show up in `dmesg` after everything the kernel printed.
+         * Bounded per call; a bad pointer fails before anything is kept. */
+        char chunk[IO_CHUNK];
+        axys_size_t len = a1 > sizeof(chunk) ? sizeof(chunk) : (axys_size_t)a1;
+
+        if (a1 == 0 || a1 > 512u) {
+            return err(AXYS_EINVAL);
+        }
+        if (axys_aspace_copy_from(&proc->space, chunk, a0, len) != 0) {
+            return err(AXYS_EFAULT);
+        }
+        axys_klog_append(chunk, len);
+        return (axys_int64_t)len;
+    }
     case AXYS_SYS_PS: {
         /* Process snapshot for `ps`: up to 32 fixed-size entries. A NULL
          * buffer only queries how many entries exist right now. */

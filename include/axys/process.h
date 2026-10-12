@@ -6,6 +6,7 @@
 #include "axys/sched.h"
 #include "axys/syscall.h"
 #include "axys/types.h"
+#include "axys/vfs.h"
 
 /*
  * User processes: one address space, one task, a small fd table.
@@ -47,10 +48,11 @@ struct axys_fd {
     int console;             /* 1: stdin/stdout/stderr */
     int readable;
     int writable;
-    axys_int32_t node;       /* VFS node when !console */
+    axys_int32_t node;       /* VFS node when !console (-1 for devices) */
     axys_uint32_t node_gen;  /* VFS slot generation recorded at open() */
     axys_uint64_t offset;
     axys_uint32_t flags;
+    int dev;                 /* 0: file/console, 1: /dev/null, 2: /dev/zero */
 };
 
 struct axys_process {
@@ -60,6 +62,7 @@ struct axys_process {
     int zombie;
     axys_uint32_t uid;
     axys_uint32_t gid;
+    axys_uint32_t umask;       /* file mode creation mask, 022 by default */
     int killed;              /* set by kill/Ctrl-C; honoured on the next kernel entry/exit */
     int exit_code;
     struct axys_aspace space;
@@ -82,7 +85,15 @@ int axys_process_spawn(const char *path, const char *args, int parent);
 /* Same, but the new process runs with the given credentials (kernel code only:
  * user programs always inherit their parent's uid/gid). */
 int axys_process_spawn_as(const char *path, const char *args, int parent,
-                          axys_uint32_t uid, axys_uint32_t gid);
+                           axys_uint32_t uid, axys_uint32_t gid);
+
+/* Spawn re-verifying a prior permission check: (exe, gen, exe_size) must
+ * still name the same executable object or the spawn aborts. Pass exe < 0
+ * to skip the check (kernel-internal spawns with no prior check). */
+int axys_process_spawn_checked(const char *path, const char *args, int parent,
+                               axys_uint32_t uid, axys_uint32_t gid,
+                               axys_vfs_node_t exe, axys_uint32_t gen,
+                               axys_int32_t exe_size);
 
 /* Wait for child `pid` of `parent` to exit; stores its status. Returns pid or
  * -errno (ECHILD if it is not a child of `parent`). Blocks. */
