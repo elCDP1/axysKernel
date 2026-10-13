@@ -29,6 +29,57 @@
 #define E_EXIST 17
 #define E_NOTDIR 20
 #define E_NOTEMPTY 39
+#define E_PERM 1
+#define E_ACCES 13
+
+/* ---- interface language: `lang [en|es]`, system-wide in /etc/lang ----
+ * Spanish strings stay ASCII-only on purpose (no accents): the VGA text
+ * console drops bytes above 0x7E, so "contrasena" reads everywhere while
+ * "contrase\xc3\xb1a" would print "contrasea". Per-command `help CMD`
+ * texts stay English for now (documented in `help lang`). */
+static int lang_es; /* 0 English, 1 Spanish */
+
+struct lang_str {
+    const char *key;
+    const char *en;
+    const char *es;
+};
+
+static const struct lang_str lang_tab[] = {
+    {"banner2", "'help' lists commands, 'help CMD' explains one.",
+                "'help' lista los comandos, 'help CMD' explica uno."},
+    {"banner3", "';' chains, '|' pipes, < > >> redirect.",
+                "';' encadena, '|' entuba, < > >> redirige."},
+    {"unknown", "unknown command: ", "comando desconocido: "},
+    {"overwrite", "overwrite ", "sobrescribir "},
+    {"newpw", "New password: ", "Nueva contrasena: "},
+    {"retype", "Retype new password: ", "Repite la nueva contrasena: "},
+    {"pwupdated", "Password updated.\n", "Contrasena actualizada.\n"},
+    {"loginname", "login: ", "usuario: "},
+    {"password", "Password: ", "Contrasena: "},
+    {"help0", "axys shell commands. `help CMD` shows one command in detail.\n",
+              "comandos del shell axys. `help CMD` muestra uno en detalle.\n"},
+    {"help1", "Words split on spaces unless 'quoted' or \"quoted\" (\\ escapes a byte).\n",
+              "Las palabras se separan por espacios salvo 'citadas' o \"citadas\" (\\ escapa un byte).\n"},
+    {"help2", "Chain lines with ';', pipe stages with '|', redirect with < > >>.\n",
+              "Encadena con ';', entuba con '|', redirige con < > >>.\n"},
+    {"help3", "Try: ls -l /bin | head -n 5     programs through a filter\n",
+              "Prueba: ls -l /bin | head -n 5     programas por un filtro\n"},
+    {"help4", "Try: grep -ri main /bin | wc -l count hits across programs\n",
+              "Prueba: grep -ri main /bin | wc -l cuenta lineas en programas\n"},
+};
+
+static const char *T(const char *key)
+{
+    size_t n = sizeof(lang_tab) / sizeof(lang_tab[0]);
+
+    for (size_t i = 0; i < n; ++i) {
+        if (strcmp(lang_tab[i].key, key) == 0) {
+            return lang_es ? lang_tab[i].es : lang_tab[i].en;
+        }
+    }
+    return key;
+}
 
 /* Diagnostics go to fd 2 so that `cmd > file` and pipes carry only data. */
 static void eputs(const char *s)
@@ -297,7 +348,9 @@ static int group_name(u32 gid, char *out, size_t cap);
 static int group_gid(const char *name, u32 *gid);
 static int passwd_uid(const char *name, u32 *uid);
 static int passwd_name(u32 uid, char *out, size_t cap);
+static int passwd_home(u32 uid, char *out, size_t cap);
 static int read_line(int fd, char *line, size_t cap);
+static ssize_t write_all(int fd, const char *buf, size_t len);
 static int confirm(const char *path);
 static int is_builtin(const char *name);
 static int confirm(const char *path);
@@ -3169,22 +3222,44 @@ static void cmd_pwd(void)
     puts("\n");
 }
 
-static void cmd_cd(const char *rest)
+static void cmd_cd(char *rest)
 {
+    char *arg = next_arg(&rest);
     char path[PATH_MAX];
+    char home[PATH_MAX];
     struct stat_info st;
     static char prev[PATH_MAX] = "/";
     char here[PATH_MAX];
 
-    if (rest[0] == '\0') {
-        memcpy(prev, cwd, strlen(cwd) + 1);
-        memcpy(cwd, "/", 2);
+    if (arg && next_arg(&rest)) {
+        print_status("cd", -E_INVAL);
         return;
     }
-    if (strcmp(rest, "-") == 0) {
-        /* Back to the previous directory, printing it like bash. */
-        if (stat(prev, &st) != 0 || st.type != 2) {
+    if (!arg || strcmp(arg, "~") == 0) {
+        /* Bare `cd` goes to our home from /etc/passwd, `/` when unknown. */
+        if (passwd_home((u32)getuid(), home, sizeof(home)) != 0 || home[0] == '\0') {
+            memcpy(home, "/", 2);
+        }
+        if (stat(home, &st) != 0) {
             print_status("cd", -E_NOENT);
+            return;
+        }
+        if (st.type != 2) {
+            print_status("cd", -E_NOTDIR);
+            return;
+        }
+        memcpy(prev, cwd, strlen(cwd) + 1);
+        memcpy(cwd, home, strlen(home) + 1);
+        return;
+    }
+    if (strcmp(arg, "-") == 0) {
+        /* Back to the previous directory, printing it like bash. */
+        if (stat(prev, &st) != 0) {
+            print_status("cd", -E_NOENT);
+            return;
+        }
+        if (st.type != 2) {
+            print_status("cd", -E_NOTDIR);
             return;
         }
         memcpy(here, cwd, strlen(cwd) + 1);
@@ -3194,9 +3269,35 @@ static void cmd_cd(const char *rest)
         puts("\n");
         return;
     }
-    resolve(rest, path);
-    if (stat(path, &st) != 0 || st.type != 2) {
+    if (arg[0] == '~' && (arg[1] == '\0' || arg[1] == '/')) {
+        /* ~/... counts from home; the rest resolves normally. */
+        char tmp[PATH_MAX];
+        size_t h, n, t;
+
+        if (passwd_home((u32)getuid(), home, sizeof(home)) != 0 || home[0] == '\0') {
+            print_status("cd", -E_NOENT);
+            return;
+        }
+        h = strlen(home);
+        n = strlen(arg + 1);
+        if (h + n >= sizeof(tmp)) {
+            n = sizeof(tmp) - h - 1;
+        }
+        memcpy(tmp, home, h);
+        t = h;
+        memcpy(tmp + t, arg + 1, n);
+        t += n;
+        tmp[t] = '\0';
+        resolve(tmp, path);
+    } else {
+        resolve(arg, path);
+    }
+    if (stat(path, &st) != 0) {
         print_status("cd", -E_NOENT);
+        return;
+    }
+    if (st.type != 2) {
+        print_status("cd", -E_NOTDIR);
         return;
     }
     memcpy(prev, cwd, strlen(cwd) + 1);
@@ -4360,6 +4461,490 @@ static int passwd_name(u32 uid, char *out, size_t cap)
     return found;
 }
 
+/* Home directory (6th field) for uid from /etc/passwd
+ * (name:passwd:uid:gid:gecos:home:shell). 0 found (empty when the field is
+ * missing), -1 when the uid is not listed. */
+static int passwd_home(u32 uid, char *out, size_t cap)
+{
+    int fd = open("/etc/passwd", 0);
+    char line[PW_LINE];
+    int found = -1;
+
+    if (fd < 0 || cap == 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        char *p = line;
+        u32 u = 0;
+        int digits = 0;
+
+        if (r < 0) {
+            found = -1;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        while (*p && *p != ':') { /* name */
+            ++p;
+        }
+        if (*p == '\0') {
+            continue;
+        }
+        ++p;
+        while (*p && *p != ':') { /* passwd */
+            ++p;
+        }
+        if (*p == '\0') {
+            continue;
+        }
+        ++p;
+        while (*p >= '0' && *p <= '9') { /* uid */
+            u = u * 10 + (u32)(*p - '0');
+            ++p;
+            ++digits;
+        }
+        if (digits == 0 || *p != ':') {
+            continue;
+        }
+        ++p;
+        while (*p >= '0' && *p <= '9') { /* gid */
+            ++p;
+        }
+        if (*p != ':') {
+            continue;
+        }
+        ++p;
+        while (*p && *p != ':') { /* gecos */
+            ++p;
+        }
+        if (*p == '\0') {
+            continue;
+        }
+        ++p; /* home runs to the next ':' or end of line */
+        if (u == uid) {
+            size_t k = 0;
+
+            while (p[k] && p[k] != ':') {
+                ++k;
+            }
+            if (k >= cap) {
+                k = cap - 1;
+            }
+            memcpy(out, p, k);
+            out[k] = '\0';
+            found = 0;
+            break;
+        }
+    }
+    close(fd);
+    return found;
+}
+
+/* ---- SHA-256 (FIPS 180-4) for /etc/shadow password hashes ---- */
+
+static const u32 sha256_k[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+};
+
+static u32 sha_rotr(u32 x, int n)
+{
+    return (x >> n) | (x << (32 - n));
+}
+
+static void sha256_block(u32 h[8], const u8 *p)
+{
+    u32 w[64];
+    u32 a, b, c, d, e, f, g, hh;
+
+    for (int i = 0; i < 16; ++i) {
+        w[i] = ((u32)p[4 * i] << 24) | ((u32)p[4 * i + 1] << 16) |
+               ((u32)p[4 * i + 2] << 8) | (u32)p[4 * i + 3];
+    }
+    for (int i = 16; i < 64; ++i) {
+        u32 s0 = sha_rotr(w[i - 15], 7) ^ sha_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        u32 s1 = sha_rotr(w[i - 2], 17) ^ sha_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = h[0];
+    b = h[1];
+    c = h[2];
+    d = h[3];
+    e = h[4];
+    f = h[5];
+    g = h[6];
+    hh = h[7];
+    for (int i = 0; i < 64; ++i) {
+        u32 s1 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
+        u32 ch = (e & f) ^ (~e & g);
+        u32 t1 = hh + s1 + ch + sha256_k[i] + w[i];
+        u32 s0 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
+        u32 maj = (a & b) ^ (a & c) ^ (b & c);
+        u32 t2 = s0 + maj;
+
+        hh = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    h[0] += a;
+    h[1] += b;
+    h[2] += c;
+    h[3] += d;
+    h[4] += e;
+    h[5] += f;
+    h[6] += g;
+    h[7] += hh;
+}
+
+/* out[32] = SHA-256(salt[0..salt_len] + pw[0..pw_len]). */
+static void sha256_salted(const u8 *salt, size_t salt_len, const char *pw, size_t pw_len,
+                          u8 out[32])
+{
+    static const u32 init[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                                0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    u32 h[8];
+    u8 block[64];
+    size_t bfill = 0;
+    u64 total = (u64)salt_len + (u64)pw_len;
+
+    for (int i = 0; i < 8; ++i) {
+        h[i] = init[i];
+    }
+    /* Feed helper: buffer into 64-byte blocks. */
+    for (size_t i = 0; i < salt_len; ++i) {
+        block[bfill++] = salt[i];
+        if (bfill == 64) {
+            sha256_block(h, block);
+            bfill = 0;
+        }
+    }
+    for (size_t i = 0; i < pw_len; ++i) {
+        block[bfill++] = (u8)pw[i];
+        if (bfill == 64) {
+            sha256_block(h, block);
+            bfill = 0;
+        }
+    }
+    block[bfill++] = 0x80;
+    if (bfill > 56) {
+        while (bfill < 64) {
+            block[bfill++] = 0;
+        }
+        sha256_block(h, block);
+        bfill = 0;
+    }
+    while (bfill < 56) {
+        block[bfill++] = 0;
+    }
+    {
+        u64 bits = total * 8;
+        int i;
+
+        for (i = 0; i < 8; ++i) {
+            block[56 + i] = (u8)(bits >> (56 - 8 * i));
+        }
+    }
+    sha256_block(h, block);
+    for (int i = 0; i < 8; ++i) {
+        out[4 * i] = (u8)(h[i] >> 24);
+        out[4 * i + 1] = (u8)(h[i] >> 16);
+        out[4 * i + 2] = (u8)(h[i] >> 8);
+        out[4 * i + 3] = (u8)h[i];
+    }
+}
+
+static void bin2hex(const u8 *in, size_t n, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < n; ++i) {
+        out[2 * i] = digits[in[i] >> 4];
+        out[2 * i + 1] = digits[in[i] & 0xf];
+    }
+    out[2 * n] = '\0';
+}
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
+/* ---- /etc/shadow: `name:salthex$hashhex` or locked `name:!` ---- */
+
+#define SHADOW_LINE 192
+#define SHADOW_MAX 8192
+
+/* 0 = password set (salt16/hash64 filled), 1 = locked, -1 = missing/unreadable.
+ * A malformed line for the name fails closed (locked). */
+static int shadow_lookup(const char *name, char *salt16, char *hash64)
+{
+    int fd = open("/etc/shadow", 0);
+    char line[SHADOW_LINE];
+    int found = -1;
+
+    if (fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        size_t nl = strlen(name);
+        size_t i;
+
+        if (r < 0) {
+            found = -1;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        {
+            size_t k = 0;
+
+            while (k < nl && line[k] == name[k]) {
+                ++k;
+            }
+            if (k != nl || line[nl] != ':') {
+                continue;
+            }
+        }
+        /* Our name: decide locked vs hash. */
+        if (line[nl + 1] == '!' && line[nl + 2] == '\0') {
+            found = 1;
+            break;
+        }
+        found = 1; /* malformed unless the full salt$hash checks out */
+        for (i = 0; i < 16; ++i) {
+            if (hexval(line[nl + 1 + i]) < 0) {
+                break;
+            }
+        }
+        if (i != 16 || line[nl + 17] != '$') {
+            break;
+        }
+        for (i = 0; i < 64; ++i) {
+            if (hexval(line[nl + 18 + i]) < 0) {
+                break;
+            }
+        }
+        if (i != 64 || line[nl + 82] != '\0') {
+            break;
+        }
+        memcpy(salt16, line + nl + 1, 16);
+        salt16[16] = '\0';
+        memcpy(hash64, line + nl + 18, 64);
+        hash64[64] = '\0';
+        found = 0;
+        break;
+    }
+    close(fd);
+    return found;
+}
+
+static ssize_t write_all(int fd, const char *buf, size_t len)
+{
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t w = write(fd, buf + done, len - done);
+
+        if (w <= 0) {
+            return w == 0 ? (ssize_t)done : w;
+        }
+        done += (size_t)w;
+    }
+    return (ssize_t)done;
+}
+
+/* Set (salt+hash) or lock (both NULL) the entry for name, adding it when
+ * missing. The file stays 0600 root. */
+static int shadow_set(const char *name, const char *salt16, const char *hash64)
+{
+    static char oldb[SHADOW_MAX];
+    static char newb[SHADOW_MAX];
+    int fd = open("/etc/shadow", 0);
+    ssize_t total = 0;
+    size_t nlen = 0;
+    int r;
+
+    if (fd >= 0) {
+        for (;;) {
+            ssize_t k = read(fd, oldb + total, sizeof(oldb) - (size_t)total);
+
+            if (k < 0) {
+                r = (int)k;
+                close(fd);
+                return r;
+            }
+            if (k == 0) {
+                break;
+            }
+            total += k;
+            if (total >= (ssize_t)sizeof(oldb)) {
+                /* Room left? Peek one byte: a full buffer means too big. */
+                char probe;
+
+                if (read(fd, &probe, 1) > 0) {
+                    close(fd);
+                    return -E_NOSPC;
+                }
+                break;
+            }
+        }
+        close(fd);
+    }
+    /* Rebuild, swapping in our entry. */
+    {
+        size_t i = 0;
+        size_t nl = strlen(name);
+
+        while (i < (size_t)total) {
+            size_t j = i;
+            int ours = 0;
+
+            while (j < (size_t)total && oldb[j] != '\n') {
+                ++j;
+            }
+            /* Line is oldb[i..j], newline at j (or EOF). */
+            if (j - i > nl && memcmp(oldb + i, name, nl) == 0 && oldb[i + nl] == ':') {
+                ours = 1;
+            }
+            if (ours) {
+                /* Drop it: the fresh entry is appended below. */
+            } else {
+                size_t k = j < (size_t)total ? j - i + 1 : j - i; /* keep the newline */
+
+                if (nlen + k >= sizeof(newb)) {
+                    return -E_NOSPC;
+                }
+                memcpy(newb + nlen, oldb + i, k);
+                nlen += k;
+            }
+            i = j < (size_t)total ? j + 1 : j;
+        }
+    }
+    {
+        char entry[128];
+        size_t k = strlen(name);
+
+        if (k + 84 >= sizeof(entry)) {
+            return -E_INVAL;
+        }
+        memcpy(entry, name, k);
+        entry[k++] = ':';
+        if (!salt16 || !hash64) {
+            entry[k++] = '!';
+        } else {
+            memcpy(entry + k, salt16, 16);
+            k += 16;
+            entry[k++] = '$';
+            memcpy(entry + k, hash64, 64);
+            k += 64;
+        }
+        entry[k++] = '\n';
+        if (nlen + k >= sizeof(newb)) {
+            return -E_NOSPC;
+        }
+        memcpy(newb + nlen, entry, k);
+        nlen += k;
+    }
+    fd = open("/etc/shadow", O_WRONLY | O_TRUNC);
+    if (fd < 0) {
+        fd = open("/etc/shadow", O_WRONLY | O_CREAT);
+        if (fd < 0) {
+            return fd;
+        }
+    }
+    r = (int)write_all(fd, newb, nlen);
+    close(fd);
+    if (r < 0) {
+        return r;
+    }
+    if ((size_t)r != nlen) {
+        return -E_NOSPC;
+    }
+    r = chmod("/etc/shadow", 0600);
+    if (r < 0) {
+        return r;
+    }
+    return 0;
+}
+
+/* Append one line (with '\n') to a root-owned config file. */
+static int append_line(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_APPEND);
+    size_t len = strlen(text);
+    int r;
+
+    if (fd < 0) {
+        return fd;
+    }
+    r = (int)write_all(fd, text, len);
+    close(fd);
+    if (r < 0) {
+        return r;
+    }
+    if ((size_t)r != len) {
+        return -E_NOSPC;
+    }
+    return 0;
+}
+
+#define SECRET_MAX 256
+
+/* One hidden line from the console (no echo, backspace still works);
+ * length without '\n', -1 on EOF/error, -2 when it does not fit. */
+static int read_secret(char *buf, size_t cap)
+{
+    size_t total = 0;
+
+    console_echo(0);
+    for (;;) {
+        ssize_t n = read(0, buf + total, cap - 1 - total);
+
+        if (n <= 0) {
+            console_echo(1);
+            return total > 0 ? (int)total : -1;
+        }
+        total += (size_t)n;
+        if (buf[total - 1] == '\n' || total >= cap - 1) {
+            break;
+        }
+    }
+    console_echo(1);
+    if (buf[total - 1] != '\n') {
+        /* Ctrl-D ended the line early (the kernel hands out everything
+         * pending, so nothing is left behind): not a complete secret. */
+        memset(buf, 0, cap);
+        return -2;
+    }
+    buf[total - 1] = '\0';
+    return (int)(total - 1);
+}
+
 /* Split "name:x:gid:m1,m2" (mutated): name start, gid parsed, members after
  * the third colon (maybe empty). ok=0 unless the gid parses. */
 static char *split_group(char *line, u32 *gid, char **members, int *ok)
@@ -4493,7 +5078,7 @@ static int confirm(const char *path)
     char buf[16];
     ssize_t n;
 
-    eputs("overwrite ");
+    eputs(T("overwrite"));
     eputs(path);
     eputs("? ");
     n = read(0, buf, sizeof(buf) - 1);
@@ -4808,6 +5393,451 @@ static void cmd_groups(char *rest)
         close(fd);
     }
     puts("\n");
+}
+
+/* ---- local users: useradd/passwd/login over /etc/passwd + /etc/shadow ----
+ * Root administers (only root can write the 0600 shadow); `login` switches
+ * identity after verifying the salted SHA-256 password. Self-service
+ * passwords need setuid executables, which the kernel does not have yet. */
+
+static void lang_load(void)
+{
+    int fd = open("/etc/lang", 0);
+    char buf[8];
+    ssize_t n;
+
+    lang_es = 0;
+    if (fd < 0) {
+        return;
+    }
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n >= 2 && buf[0] == 'e' && buf[1] == 's') {
+        lang_es = 1;
+    }
+}
+
+/* lang [en|es]: show the interface language, or set it (root only,
+ * stored in /etc/lang, applied at once). */
+static void cmd_lang(char *rest)
+{
+    char *arg = next_arg(&rest);
+    int want_es;
+    int fd;
+    ssize_t w;
+    const char *text;
+
+    if (arg && next_arg(&rest)) {
+        print_status("lang", -E_INVAL);
+        return;
+    }
+    if (!arg) {
+        puts(lang_es ? "es\n" : "en\n");
+        return;
+    }
+    if (strcmp(arg, "en") == 0) {
+        want_es = 0;
+    } else if (strcmp(arg, "es") == 0) {
+        want_es = 1;
+    } else {
+        print_status("lang", -E_INVAL);
+        return;
+    }
+    if (getuid() != 0) {
+        print_status("lang", -E_PERM);
+        return;
+    }
+    fd = open("/etc/lang", O_WRONLY | O_TRUNC);
+    if (fd < 0) {
+        fd = open("/etc/lang", O_WRONLY | O_CREAT);
+        if (fd < 0) {
+            print_status("lang", fd);
+            return;
+        }
+    }
+    text = want_es ? "es\n" : "en\n";
+    w = write_all(fd, text, 3);
+    close(fd);
+    if (w != 3) {
+        print_status("lang", w < 0 ? (int)w : -E_NOSPC);
+        return;
+    }
+    if (chmod("/etc/lang", 0644) < 0) {
+        print_status("lang", -E_ACCES);
+        return;
+    }
+    lang_es = want_es;
+    puts(text);
+}
+
+static int valid_username(const char *s)
+{
+    size_t n = strlen(s);
+    size_t i;
+
+    if (n == 0 || n > 32) {
+        return 0;
+    }
+    if (!((s[0] >= 'a' && s[0] <= 'z') || s[0] == '_')) {
+        return 0;
+    }
+    for (i = 1; i < n; ++i) {
+        char c = s[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Highest uid in /etc/passwd, or -1 when unreadable/empty. */
+static int passwd_max_uid(u32 *max_uid)
+{
+    int fd = open("/etc/passwd", 0);
+    char line[PW_LINE];
+    int any = 0;
+    u32 mx = 0;
+
+    if (fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        int r = read_line(fd, line, sizeof(line));
+        u32 u = 0, g = 0;
+        int ok = 0;
+
+        if (r < 0) {
+            close(fd);
+            return -1;
+        }
+        if (r == 0) {
+            break;
+        }
+        (void)split_pw(line, &u, &g, &ok);
+        if (!ok) {
+            continue;
+        }
+        if (!any || u > mx) {
+            mx = u;
+            any = 1;
+        }
+    }
+    close(fd);
+    if (!any) {
+        return -1;
+    }
+    *max_uid = mx;
+    return 0;
+}
+
+static int append_u32(char *buf, size_t cap, size_t *pos, u32 v)
+{
+    char rev[10];
+    int m = 0;
+
+    if (v == 0) {
+        rev[m++] = '0';
+    } else {
+        while (v > 0) {
+            rev[m++] = (char)('0' + v % 10);
+            v /= 10;
+        }
+    }
+    if (*pos + (size_t)m >= cap) {
+        return -1;
+    }
+    while (m > 0) {
+        buf[(*pos)++] = rev[--m];
+    }
+    return 0;
+}
+
+static int append_bytes(char *buf, size_t cap, size_t *pos, const char *s, size_t n)
+{
+    if (*pos + n >= cap) {
+        return -1;
+    }
+    memcpy(buf + *pos, s, n);
+    *pos += n;
+    return 0;
+}
+
+/* useradd NAME: per-user group, passwd entry, locked shadow entry, home. */
+static void cmd_useradd(char *rest)
+{
+    char *arg = next_arg(&rest);
+    u32 uid, gid, mx;
+    char home[PATH_MAX];
+    char entry[160];
+    size_t pos = 0;
+    struct stat_info st;
+    int r;
+
+    if (getuid() != 0) {
+        print_status("useradd", -E_PERM);
+        return;
+    }
+    if (!arg || next_arg(&rest)) {
+        print_status("useradd", -E_INVAL);
+        return;
+    }
+    if (!valid_username(arg)) {
+        print_status("useradd", -E_INVAL);
+        return;
+    }
+    if (passwd_uid(arg, &uid) == 0 || group_gid(arg, &gid) == 0) {
+        print_status("useradd", -E_EXIST);
+        return;
+    }
+    /* First free uid from 1000 up. */
+    uid = 1000;
+    if (passwd_max_uid(&mx) == 0 && mx >= uid) {
+        uid = mx + 1;
+    }
+    while (uid < 60000) {
+        char nm[33];
+
+        if (passwd_scan(uid, 0, &uid, &gid, nm, sizeof(nm)) != 0) {
+            break;
+        }
+        ++uid;
+    }
+    if (uid >= 60000) {
+        print_status("useradd", -E_NOSPC);
+        return;
+    }
+    gid = uid;
+    {
+        size_t hl = strlen(arg);
+
+        if (6 + hl >= sizeof(home)) {
+            print_status("useradd", -E_INVAL);
+            return;
+        }
+        memcpy(home, "/home/", 6);
+        memcpy(home + 6, arg, hl + 1);
+    }
+    if (stat(home, &st) == 0) {
+        print_status("useradd", -E_EXIST);
+        return;
+    }
+    /* passwd: name:x:uid:gid:name:/home/name:/sbin/init */
+    if (append_bytes(entry, sizeof(entry), &pos, arg, strlen(arg)) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":x:", 3) != 0 ||
+        append_u32(entry, sizeof(entry), &pos, uid) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":", 1) != 0 ||
+        append_u32(entry, sizeof(entry), &pos, gid) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":", 1) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, arg, strlen(arg)) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":", 1) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, home, strlen(home)) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":/sbin/init\n", 12) != 0) {
+        print_status("useradd", -E_INVAL);
+        return;
+    }
+    entry[pos] = '\0';
+    r = append_line("/etc/passwd", entry);
+    if (r < 0) {
+        print_status("useradd", r);
+        return;
+    }
+    /* group: name:x:gid: */
+    pos = 0;
+    if (append_bytes(entry, sizeof(entry), &pos, arg, strlen(arg)) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":x:", 3) != 0 ||
+        append_u32(entry, sizeof(entry), &pos, gid) != 0 ||
+        append_bytes(entry, sizeof(entry), &pos, ":\n", 2) != 0) {
+        print_status("useradd", -E_INVAL);
+        return;
+    }
+    entry[pos] = '\0';
+    r = append_line("/etc/group", entry);
+    if (r < 0) {
+        print_status("useradd", r);
+        return;
+    }
+    /* Locked password until `passwd` sets one. */
+    r = shadow_set(arg, 0, 0);
+    if (r < 0) {
+        print_status("useradd", r);
+        return;
+    }
+    r = mkdir(home);
+    if (r < 0) {
+        print_status("useradd", r);
+        return;
+    }
+    r = chown(home, uid, gid);
+    if (r == 0) {
+        r = chmod(home, 0755);
+    }
+    if (r < 0) {
+        print_status("useradd", r);
+    }
+}
+
+/* passwd [NAME]: root sets the login password (interactive, never echoed). */
+static void cmd_passwd(char *rest)
+{
+    char *arg = next_arg(&rest);
+    char target[33];
+    u32 uid, gid;
+    char pw1[SECRET_MAX], pw2[SECRET_MAX];
+    u8 saltb[8];
+    char salt16[17], hash64[65];
+    u8 digest[32];
+    int n1, n2, r;
+
+    if (getuid() != 0) {
+        print_status("passwd", -E_PERM);
+        return;
+    }
+    if (arg && next_arg(&rest)) {
+        print_status("passwd", -E_INVAL);
+        return;
+    }
+    if (!arg) {
+        if (passwd_name((u32)getuid(), target, sizeof(target)) != 0) {
+            print_status("passwd", -E_NOENT);
+            return;
+        }
+    } else if (passwd_resolve(arg, &uid, &gid, target, sizeof(target)) != 0) {
+        print_status("passwd", -E_NOENT);
+        return;
+    }
+    eputs(T("newpw"));
+    n1 = read_secret(pw1, sizeof(pw1));
+    if (n1 <= 0) {
+        memset(pw1, 0, sizeof(pw1));
+        print_status("passwd", n1 == -2 ? -E_INVAL : -E_ACCES);
+        return;
+    }
+    eputs(T("retype"));
+    n2 = read_secret(pw2, sizeof(pw2));
+    if (n2 != n1 || memcmp(pw1, pw2, (size_t)n1) != 0) {
+        memset(pw1, 0, sizeof(pw1));
+        memset(pw2, 0, sizeof(pw2));
+        print_status("passwd", -E_INVAL);
+        return;
+    }
+    memset(pw2, 0, sizeof(pw2));
+    if (getrandom(saltb, sizeof(saltb)) != (long)sizeof(saltb)) {
+        memset(pw1, 0, sizeof(pw1));
+        print_status("passwd", -E_NODEV);
+        return;
+    }
+    sha256_salted(saltb, sizeof(saltb), pw1, (size_t)n1, digest);
+    memset(pw1, 0, sizeof(pw1));
+    bin2hex(saltb, sizeof(saltb), salt16);
+    bin2hex(digest, sizeof(digest), hash64);
+    memset(digest, 0, sizeof(digest));
+    memset(saltb, 0, sizeof(saltb));
+    r = shadow_set(target, salt16, hash64);
+    memset(salt16, 0, sizeof(salt16));
+    memset(hash64, 0, sizeof(hash64));
+    if (r < 0) {
+        print_status("passwd", r);
+        return;
+    }
+    puts(T("pwupdated"));
+}
+
+/* login [NAME]: verify the password and take that identity (root console). */
+static void cmd_login(char *rest)
+{
+    char *arg = next_arg(&rest);
+    char name[33];
+    u32 uid, gid;
+    char salt16[17], want64[65], got64[65];
+    u8 saltb[8];
+    u8 digest[32];
+    char pw[SECRET_MAX];
+    char home[PATH_MAX];
+    struct stat_info st;
+    int n, r;
+
+    if (arg && next_arg(&rest)) {
+        print_status("login", -E_INVAL);
+        return;
+    }
+    if (getuid() != 0) {
+        print_status("login", -E_PERM);
+        return;
+    }
+    if (!arg) {
+        char buf[64];
+        char *p;
+        ssize_t k;
+
+        eputs(T("loginname"));
+        k = read(0, buf, sizeof(buf) - 1);
+        if (k <= 0) {
+            return;
+        }
+        buf[k] = '\0';
+        p = buf;
+        arg = next_arg(&p);
+        if (!arg || next_arg(&p)) {
+            print_status("login", -E_INVAL);
+            return;
+        }
+    }
+    if (passwd_resolve(arg, &uid, &gid, name, sizeof(name)) != 0) {
+        print_status("login", -E_ACCES);
+        return;
+    }
+    eputs(T("password"));
+    n = read_secret(pw, sizeof(pw));
+    if (n < 0) {
+        memset(pw, 0, sizeof(pw));
+        if (n == -2) {
+            print_status("login", -E_ACCES);
+        }
+        return;
+    }
+    if (shadow_lookup(name, salt16, want64) != 0) {
+        memset(pw, 0, sizeof(pw));
+        print_status("login", -E_ACCES);
+        return;
+    }
+    for (int i = 0; i < 8; ++i) {
+        int hi = hexval(salt16[2 * i]);
+        int lo = hexval(salt16[2 * i + 1]);
+
+        if (hi < 0 || lo < 0) { /* checked by lookup; fail closed anyway */
+            memset(pw, 0, sizeof(pw));
+            print_status("login", -E_ACCES);
+            return;
+        }
+        saltb[i] = (u8)((hi << 4) | lo);
+    }
+    sha256_salted(saltb, sizeof(saltb), pw, (size_t)n, digest);
+    memset(pw, 0, sizeof(pw));
+    memset(saltb, 0, sizeof(saltb));
+    bin2hex(digest, sizeof(digest), got64);
+    memset(digest, 0, sizeof(digest));
+    if (memcmp(got64, want64, 64) != 0) {
+        memset(got64, 0, sizeof(got64));
+        memset(want64, 0, sizeof(want64));
+        print_status("login", -E_ACCES);
+        return;
+    }
+    memset(got64, 0, sizeof(got64));
+    memset(want64, 0, sizeof(want64));
+    r = setgid(gid);
+    if (r == 0) {
+        r = setuid(uid);
+    }
+    if (r < 0) {
+        print_status("login", r);
+        return;
+    }
+    /* Land in their home when it exists; otherwise stay where we are. */
+    if (passwd_home(uid, home, sizeof(home)) == 0 && home[0] != '\0' &&
+        stat(home, &st) == 0 && st.type == 2) {
+        memcpy(cwd, home, strlen(home) + 1);
+    }
 }
 
 /* ip [addr|link], ifconfig: live NIC state from the e1000 driver. */
@@ -5469,7 +6499,8 @@ static void help_cmd(const char *c)
     } else if (strcmp(c, "pwd") == 0) {
         puts("pwd: print the working directory\n");
     } else if (strcmp(c, "cd") == 0) {
-        puts("cd [PATH]: change directory (default: /); cd - goes back to the previous one\n");
+        puts("cd [PATH]: change directory (default: your home from /etc/passwd).\n"
+             "  `cd -` goes back (and prints it), `~` means home. Missing: -2, file: -20\n");
     } else if (strcmp(c, "pushd") == 0) {
         puts("pushd [DIR]: save cwd (up to 8 deep) and change to DIR, printing the stack\n");
     } else if (strcmp(c, "popd") == 0) {
@@ -5512,6 +6543,19 @@ static void help_cmd(const char *c)
         puts("groups [USER]: group names for USER (default: us) from /etc/group\n");
     } else if (strcmp(c, "su") == 0) {
         puts("su UID: root may switch down; going back to 0 is refused\n");
+    } else if (strcmp(c, "useradd") == 0) {
+        puts("useradd NAME: root creates a login (own group, /home/NAME, locked password).\n"
+             "  NAME is [a-z_][a-z0-9_-]*, uid is the first free one from 1000\n");
+    } else if (strcmp(c, "passwd") == 0) {
+        puts("passwd [NAME]: root sets the login password (asks twice, never echoed).\n"
+             "  Stored as salt$sha256(salt+password) in /etc/shadow (0600). No match: -22\n");
+    } else if (strcmp(c, "login") == 0) {
+        puts("login [NAME]: check the password and take that identity (root console).\n"
+             "  Asks for the name when missing; wrong or locked: -13. `exit` returns to root\n");
+    } else if (strcmp(c, "lang") == 0) {
+        puts("lang [en|es]: interface language (this shell's own messages).\n"
+             "  No argument prints it; setting it is root-only, stored in\n"
+             "  /etc/lang and applied at once. Per-command help stays English\n");
     } else if (strcmp(c, "chmod") == 0) {
         puts("chmod [-R] MODE PATH: octal (755) or symbolic (u+x,go-w,a=rx); owner or root\n");
     } else if (strcmp(c, "chown") == 0) {
@@ -5569,6 +6613,13 @@ static void help_cmd(const char *c)
         puts("file FILE...: ELF details, #! scripts, empty/text/data from the first bytes\n");
     } else if (strcmp(c, "type") == 0) {
         puts("type NAME...: shell builtin, /bin path, or missing\n");
+    } else if (strcmp(c, "code") == 0) {
+        puts("code [PATH]: fullscreen file browser + text editor (/bin/code).\n"
+             "  Tree: Up/Down move, Enter opens, h hidden, Tab focuses editor, q quits.\n"
+             "  Editor: arrows/Home/End move, type/Enter/Tab edit, Backspace/Delete\n"
+             "  erase, Ctrl+S saves, Ctrl+F searches, Ctrl+W closes, Esc quits.\n"
+             "  ? shows keys, Y/N/C answers unsaved-change prompts. 64 KiB max.\n"
+             "  Copy/paste/undo need selection: not in v1.\n");
     } else if (strcmp(c, "help") == 0) {
         puts("help [CMD]: this list, or usage for CMD\n");
     } else {
@@ -5586,12 +6637,16 @@ struct help_entry {
     int category;
 };
 
-static const char *const help_categories[] = {"Files and directories", "Text and data", "System and users",
-                                              "Processes and hardware", "Programs in /bin"};
+static const char *const help_categories[2][5] = {
+    {"Files and directories", "Text and data", "System and users", "Processes and hardware",
+     "Programs in /bin"},
+    {"Archivos y directorios", "Texto y datos", "Sistema y usuarios", "Procesos y hardware",
+     "Programas en /bin"},
+};
 
 static const struct help_entry help_table[] = {
     {"ls", "list a directory (-l, -R, -F classify, -d, -h)", 0},
-    {"cd", "change the working directory (- goes back)", 0},
+    {"cd", "change directory (default: home; - back, ~ home)", 0},
     {"pwd", "print the working directory", 0},
     {"pushd", "save cwd and change directory", 0},
     {"popd", "return to the saved directory", 0},
@@ -5640,6 +6695,10 @@ static const struct help_entry help_table[] = {
     {"groups", "group names of a user", 2},
     {"id", "user and group ids (-u -g -G -n)", 2},
     {"su", "switch to another user id (root only)", 2},
+    {"useradd", "create a login with home and locked password (root)", 2},
+    {"passwd", "set a login password, salted SHA-256 (root)", 2},
+    {"login", "verify a password and take that identity (root)", 2},
+    {"lang", "show or set the interface language (en|es)", 2},
     {"chmod", "change file permissions, octal or symbolic", 2},
     {"chown", "change file owner: UID GID or NAME[:GROUP]", 2},
     {"sync", "write the file system to disk", 2},
@@ -5680,6 +6739,7 @@ static const struct help_entry help_table[] = {
     {"fuzz", "in-guest syscall fuzzer", 4},
     {"ping", "ICMP echo to an IPv4 address (root)", 4},
     {"dhcp", "obtain an IPv4 lease (root)", 4},
+    {"code", "fullscreen file browser + text editor", 4},
 };
 
 #define HELP_COUNT ((int)(sizeof(help_table) / sizeof(help_table[0])))
@@ -5697,14 +6757,14 @@ static int is_builtin(const char *name)
 
 static void help(void)
 {
-    puts("axys shell commands. `help CMD` shows one command in detail.\n"
-         "Words split on spaces unless 'quoted' or \"quoted\" (\\ escapes a byte).\n"
-         "Chain lines with ';', pipe stages with '|', redirect with < > >>.\n"
-         "Try: ls -l /bin | head -n 5     programs through a filter\n"
-         "Try: grep -ri main /bin | wc -l count hits across programs\n");
+    puts(T("help0"));
+    puts(T("help1"));
+    puts(T("help2"));
+    puts(T("help3"));
+    puts(T("help4"));
     for (int cat = 0; cat < 5; ++cat) {
         puts("\n");
-        puts(help_categories[cat]);
+        puts(help_categories[lang_es][cat]);
         puts("\n");
         for (int i = 0; i < HELP_COUNT; ++i) {
             size_t n;
@@ -6215,6 +7275,14 @@ static int run_line(char *line)
             if (r < 0) {
                 print_status("su", r);
             }
+        } else if (strcmp(cmd, "useradd") == 0) {
+            cmd_useradd(rest);
+        } else if (strcmp(cmd, "passwd") == 0) {
+            cmd_passwd(rest);
+        } else if (strcmp(cmd, "login") == 0) {
+            cmd_login(rest);
+        } else if (strcmp(cmd, "lang") == 0) {
+            cmd_lang(rest);
         } else if (strcmp(cmd, "chmod") == 0) {
             char *p = rest;
             char *tok;
@@ -6586,6 +7654,22 @@ static int run_line(char *line)
                 resolve(rest, path);
                 run(path, a);
             }
+        } else if (strcmp(cmd, "code") == 0) {
+            /* The editor needs absolute paths (it has no cwd): resolve
+             * here, defaulting to where we stand. */
+            char *arg = next_arg(&rest);
+            char path[PATH_MAX];
+
+            if (arg && next_arg(&rest)) {
+                print_status("code", -E_INVAL);
+            } else {
+                if (!arg) {
+                    memcpy(path, cwd, strlen(cwd) + 1);
+                } else {
+                    resolve(arg, path);
+                }
+                run("/bin/code", path);
+            }
         } else if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "halt") == 0) {
             print_status("poweroff", power(0));
         } else if (strcmp(cmd, "shutdown") == 0) {
@@ -6626,13 +7710,13 @@ static int run_line(char *line)
                 if (stat(path, &st) == 0) {
                     run(path, rest);
                 } else {
-                    puts("unknown command: ");
+                    puts(T("unknown"));
                     puts(cmd);
                     puts("\n");
                 }
             } else {
                 /* Too long for /bin/<cmd>: say so instead of swallowing it. */
-                puts("unknown command: ");
+                puts(T("unknown"));
                 puts(cmd);
                 puts("\n");
             }
@@ -6797,17 +7881,26 @@ int main(const char *args, size_t len)
 
     (void)args;
     (void)len;
+    lang_load();
     puts("+-- axys shell ----------------------------------------+\n"
          "| 'help' lists commands, 'help CMD' explains one.      |\n"
          "| ';' chains, '|' pipes, < > >> redirect.              |\n"
-         "+------------------------------------------------------+\n"
-         "axys shell ready (type 'help')\n");
+         "+------------------------------------------------------+\n");
+    puts(T("banner2"));
+    puts("\n");
+    puts(T("banner3"));
+    puts("\n");
+    /* Ready marker, intentionally untranslated: every test driver waits
+     * for exactly this line. */
+    puts("axys shell ready (type 'help')\n");
     for (;;) {
         ssize_t n;
         char *seg;
         int done = 0;
 
-        puts(getuid() == 0 ? "axys# " : "axys$ ");
+        puts("axys:");
+        puts(cwd);
+        puts(getuid() == 0 ? "# " : "$ ");
         n = read(0, line, sizeof(line) - 1);
         if (n <= 0) {
             puts("\n");

@@ -651,7 +651,11 @@ int axys_process_interrupt_foreground(void)
     for (int i = 0; i < AXYS_MAX_PROCS; ++i) {
         struct axys_process *p = &procs[i];
 
-        if (p->used && !p->zombie && p->parent > 0 && (victim == AXYS_NULL || p->pid > victim->pid)) {
+        /* A raw-mode reader owns its control bytes (its Ctrl-C is copy, not
+         * kill): it is never a kill victim, so the byte reaches its input.
+         * Raw programs must offer their own way out (the editor quits). */
+        if (p->used && !p->zombie && !p->raw_in && p->parent > 0 &&
+            (victim == AXYS_NULL || p->pid > victim->pid)) {
             victim = p;
         }
     }

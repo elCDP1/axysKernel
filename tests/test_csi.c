@@ -72,13 +72,21 @@ int main(void)
     seq("\x1b[K", AXYS_CSI_ERASE_LINE, 0, 0);
     seq("\x1b[1K", AXYS_CSI_ERASE_LINE, 1, 0);
     seq("\x1b[2K", AXYS_CSI_ERASE_LINE, 2, 0);
-    /* SGR completes with no action (swallowed, never printed). */
+    /* SGR completes with its own action and keeps every parameter. */
+    seq("\x1b[31m", AXYS_CSI_SGR, 31, 0);
+    seq("\x1b[m", AXYS_CSI_SGR, 0, 0);
+    seq("\x1b[0m", AXYS_CSI_SGR, 0, 0);
+    seq("\x1b[1;36;40m", AXYS_CSI_SGR, 1, 36);
     {
+        /* All four slots are readable, not just arg0/arg1. */
         int p = 0, sw = 0;
 
         axys_csi_reset(&st);
-        CHECK(feed_all(&st, "\x1b[31m", &p, &sw) == AXYS_CSI_NONE);
-        CHECK(p == 0 && sw == 4);
+        CHECK(feed_all(&st, "\x1b[1;36;40m", &p, &sw) == AXYS_CSI_SGR);
+        CHECK(axys_csi_count(&st) == 3);
+        CHECK(axys_csi_raw(&st, 0) == 1 && axys_csi_raw(&st, 1) == 36);
+        CHECK(axys_csi_raw(&st, 2) == 40 && axys_csi_raw(&st, 3) == 0);
+        CHECK(p == 0 && sw == 9);
     }
     /* Saturation instead of overflow. */
     seq("\x1b[99999J", AXYS_CSI_ERASE_DISPLAY, 9999, 0);
@@ -91,13 +99,33 @@ int main(void)
     prints = swallows = 0;
     CHECK(feed_all(&st, "\x1b[;5H", &prints, &swallows) == AXYS_CSI_CURSOR_TO);
     CHECK(st.arg0 == 0 && st.arg1 == 5);
-    /* Private '?': aborts, the tail prints as text. */
+    /* Private '?': cursor visibility and alternate screen complete;
+     * anything else swallows whole (no tail printed). */
+    seq("\x1b[?25l", AXYS_CSI_CURSOR_HIDE, 25, 0);
+    seq("\x1b[?25h", AXYS_CSI_CURSOR_SHOW, 25, 0);
+    seq("\x1b[?1049h", AXYS_CSI_ALT_ON, 1049, 0);
+    seq("\x1b[?1049l", AXYS_CSI_ALT_OFF, 1049, 0);
     {
         int p = 0, sw = 0;
 
         axys_csi_reset(&st);
-        CHECK(feed_all(&st, "\x1b[?25l", &p, &sw) == AXYS_CSI_NONE);
-        CHECK(p == 3 && sw == 3);
+        CHECK(feed_all(&st, "\x1b[?7h", &p, &sw) == AXYS_CSI_NONE);
+        CHECK(p == 0 && sw == 4);
+    }
+    {
+        /* '?' anywhere but first, or a second parameter, is not private. */
+        int p = 0, sw = 0;
+
+        axys_csi_reset(&st);
+        CHECK(feed_all(&st, "\x1b[2?25l", &p, &sw) == AXYS_CSI_NONE);
+        CHECK(p == 3 && sw == 4);
+    }
+    {
+        int p = 0, sw = 0;
+
+        axys_csi_reset(&st);
+        CHECK(feed_all(&st, "\x1b[?25;1l", &p, &sw) == AXYS_CSI_NONE);
+        CHECK(p == 0 && sw == 7);
     }
     /* Stray ESC plus follower: both dropped, text resumes. */
     {

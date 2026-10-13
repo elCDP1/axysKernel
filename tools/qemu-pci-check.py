@@ -105,7 +105,7 @@ def main():
             proc.stdin.write(b"cat /proc/pci\n")
             proc.stdin.flush()
             sent = True
-        if sent and re.search(r"cat /proc/pci\r?\n(?:.*\r?\n)+axys# $", text):
+        if sent and re.search(r"cat /proc/pci\r?\n(?:.*\r?\n)+axys:[^#]*# $", text):
             break
     time.sleep(0.3)
     try:

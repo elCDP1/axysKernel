@@ -670,6 +670,54 @@ Retained kernel log, live `/proc` files, the RTC and `date`, `clear`, `ls`
 argument handling, `DUP`/`DUP2` redirection with inheritance across `spawn`, and
 the quote/pipe/redirect parser are described in `docs/PLATFORM_SUPPORT.md`
 ("Audit notes: shell and system interface"). Coverage: `tests/test_time.c`,
-`tests/test_shparse.c`, `make check-shell` (79 cases, including error paths,
-stderr separation, live `/proc/usb` through USB hot-plug, and permissions) and the
+`tests/test_shparse.c`, `make check-shell` (142 cases, including error paths,
+stderr separation, live `/proc/usb` through USB hot-plug, users, language
+and permissions), `make check-code` (interactive edit/save/quit) and the
 redirect phase of the in-guest fuzzer.
+
+### Local users and prompt
+
+- The prompt never showed the working directory, so `cd` looked broken
+  (it worked: absolute, relative, `..`, `cd -`). The prompt is now
+  `axys:<cwd># ` (`$` for non-root). `cd` with no args goes to the home
+  from `/etc/passwd` (new `passwd_home()`, `/` fallback), `~`/`~/...`
+  expand, a file is `-20` (was `-2`), extra args are `-22`.
+  `tools/qemu-shell-test.py` and `tools/qemu-pci-check.py` match the new
+  prompt shape.
+- `useradd`/`passwd`/`login` over `/etc/passwd` + `/etc/shadow`
+  (`name:salthex$hashhex`, locked `name:!`, 0600, seeded by initrd):
+  per-user group, `/home/NAME` 0755, first free uid from 1000.
+  Passwords are salted SHA-256 (own FIPS 180-4 code, cross-checked in
+  QEMU against host hashlib) and never echoed: `SYS_CONSOLE` ops 1/2
+  toggle a per-process echo flag in `console_read`, which also zeroes
+  consumed bytes so secrets do not linger in the kernel line buffer.
+  All three commands are root-only (only root can read the shadow);
+  self-service passwords need setuid executables, which do not exist
+  yet, and the console still boots to a root shell (no boot-to-login
+  prompt), so passwords only gate `login`/`su`-style switching for now.
+
+### Editor `code`, language, raw terminal
+
+- Raw console input is `SYS_CONSOLE` ops 3/4 plus op 5 (pending bytes,
+  so a lone ESC is told from a sequence start after a 25 ms sleep);
+  a raw reader is skipped by Ctrl-C kill delivery, and per-process
+  flags die with the process. Verified in QEMU byte-exact
+  (`61 62 1b 5b 41 ... 03 ...`).
+- VGA output gained SGR colours (own ANSI-to-VGA table, bright kept
+  across colour changes), cursor hide/show (`?25l/h`, firmware scan
+  lines preserved) and alternate screen (`?1049h/l`, nesting ignored);
+  the CSI decoder swallows other private sequences whole. Host tests
+  `test_csi.c`/`test_vga.c` pin every behaviour, including the colour
+  table and save/restore round-trips.
+- `/bin/code` (`code [PATH]`) reimplements the axysCode design in C:
+  tree + single document, search/help/confirm modes, same keymap minus
+  clipboard/undo/selection (v1, said on screen). Memory safety is
+  structural: flat text with a single-writer line index rebuilt after
+  every mutation, every capacity refuses loudly (64 KiB, 4096 lines,
+  512 nodes), UTF-8 never split, key decoder and buffer covered by
+  `tests/test_code.c`, interactive flow by `make check-code`
+  (edit/save/quit byte-checked in QEMU).
+- `lang [en|es]` switches the shell's own messages (ASCII-only Spanish
+  so VGA stays clean), stored in `/etc/lang` (root-only to set, seeded
+  `en`), applied at once and reloaded at boot; per-command help stays
+  English. Covered in the shell suite including reboot persistence.

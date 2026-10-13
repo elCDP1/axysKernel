@@ -23,6 +23,10 @@ int axys_input_init(void);
 /* Next character, or -1 when nothing is buffered. Safe from any context. */
 int axys_input_getc_nonblock(void);
 
+/* Bytes currently buffered (saturates at 255). Lets raw-mode readers tell
+ * a lone ESC from a sequence start after a short sleep. */
+int axys_input_pending(void);
+
 /* Next character, blocking the calling task until one arrives. */
 int axys_input_getc(void);
 

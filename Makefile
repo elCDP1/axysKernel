@@ -30,7 +30,7 @@ KERNEL_C_SOURCES := $(wildcard kernel/*.c lib/*.c arch/$(ARCH)/*.c)
 KERNEL_AS_SOURCES := $(wildcard arch/$(ARCH)/*.S)
 # User programs (ELF64 static-PIE) embedded into the kernel image as the initial
 # file system; each is installed into the VFS at boot. Format: name:/install/path
-USER_PROGS := init:/sbin/init hello:/bin/hello crash:/bin/crash heap:/bin/heap fileio:/bin/fileio perms:/bin/perms probe:/bin/probe fuzz:/bin/fuzz ping:/bin/ping dhcp:/bin/dhcp
+USER_PROGS := init:/sbin/init hello:/bin/hello crash:/bin/crash heap:/bin/heap fileio:/bin/fileio perms:/bin/perms probe:/bin/probe fuzz:/bin/fuzz ping:/bin/ping dhcp:/bin/dhcp code:/bin/code
 USER_ELFS := $(foreach p,$(USER_PROGS),build/user/$(word 1,$(subst :, ,$(p))).elf)
 USER_CFLAGS := -std=c17 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -Iuser
 USER_LDFLAGS := -pie --no-dynamic-linker -z max-page-size=0x1000 -z noseparate-code -z norelro --build-id=none -e _start
@@ -61,7 +61,7 @@ HOST_ACPI_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ACPI_TEST_SOURCES
 HOST_ELF_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_ELF_TEST_SOURCES))
 HOST_PATH_TEST_OBJECTS := $(patsubst %.c,build/host/%.o,$(HOST_PATH_TEST_SOURCES))
 
-.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-usb-hotplug check-pci check-drivers check-shell check-net
+.PHONY: all objects kernel test clean config-print iso run check check-highmem check-nvme check-ahci fuzz check-fuzz check-usb check-usb-hub check-usb-storage check-usb-storage-hub check-usb-hotplug check-pci check-drivers check-shell check-code check-net
 
 all: kernel
 
@@ -93,6 +93,7 @@ build/user/timeconv.o: lib/timeconv.c
 	$(CC) $(USER_CFLAGS) -Iinclude -c $< -o $@
 
 build/user/init.o: USER_CFLAGS += -Iinclude
+build/user/code.o: USER_CFLAGS += -Iinclude
 
 build/user/init.elf: build/user/init.o build/user/lib.o build/user/crt0.o build/user/timeconv.o
 	$(LD) $(USER_LDFLAGS) -o $@ build/user/crt0.o build/user/init.o build/user/lib.o build/user/timeconv.o
@@ -125,7 +126,7 @@ build/%.o: %.S
 	@$(MKDIR)
 	$(CC) $(KERNEL_ASFLAGS) -MMD -MP -c $< -o $@
 
-test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe build/test_time.exe build/test_shparse.exe build/test_csi.exe build/test_vga.exe
+test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame.exe build/test_exceptions.exe build/test_vfs.exe build/test_persist.exe build/test_acpi.exe build/test_elf.exe build/test_path.exe build/test_heap.exe build/test_pci.exe build/test_usb.exe build/test_usb_desc.exe build/test_time.exe build/test_shparse.exe build/test_csi.exe build/test_vga.exe build/test_code.exe
 	./build/test_string.exe
 	./build/test_multiboot2.exe
 	./build/test_interrupt_frame.exe
@@ -139,6 +140,7 @@ test: build/test_string.exe build/test_multiboot2.exe build/test_interrupt_frame
 	./build/test_shparse.exe
 	./build/test_csi.exe
 	./build/test_vga.exe
+	./build/test_code.exe
 	./build/test_heap.exe
 	./build/test_usb_desc.exe
 	./build/test_pci.exe
@@ -203,6 +205,10 @@ build/test_shparse.exe: tests/test_shparse.c user/shparse.h
 build/test_csi.exe: tests/test_csi.c include/axys/csi.h
 	@$(MKDIR)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_csi.c
+
+build/test_code.exe: tests/test_code.c user/code_key.h user/code_buf.h include/axys/types.h
+	@$(MKDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/test_code.c
 
 build/test_vga.exe: tests/test_vga.c kernel/vga.c include/axys/vga.h include/axys/csi.h tests/stubs/axys/io.h tests/stubs/axys/cpu.h
 	@$(MKDIR)
@@ -307,8 +313,12 @@ check-pci: iso
 # Every driver scenario in one go (several minutes: each boot test also reboots).
 check-drivers: check-shell check-pci check-usb check-usb-hub check-usb-hotplug check-usb-storage check-usb-storage-hub check-ahci check-nvme check-net
 
-# Drive the shell over the serial port: ~80 commands covering quoting, pipes,
+# Drive the shell over the serial port: ~140 commands covering quoting, pipes,
 # redirection, the text filters, the RTC, the kernel log, live /proc files (with
-# USB hot-plug through QMP), errors and permissions.
+# USB hot-plug through QMP), users, language, errors and permissions.
 check-shell: iso
 	python3 tools/qemu-shell-test.py
+
+# Drive /bin/code over the serial port: open, edit, save, quit, tree browse.
+check-code: iso
+	python3 tools/qemu-code-test.py

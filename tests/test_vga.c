@@ -20,6 +20,8 @@
 
 unsigned stub_crtc_cmd;
 unsigned stub_cursor_addr;
+unsigned stub_cursor_shape_in = 0x0du; /* firmware shape: only bit 5 is ours */
+unsigned stub_cursor_shape_out;
 
 static volatile uint16_t *scr;
 
@@ -30,9 +32,16 @@ static void puts_vga(const char *s)
     }
 }
 
+static void expect_attr(unsigned row, unsigned col, char ch, unsigned attr);
+
 static void expect_cell(unsigned row, unsigned col, char ch)
 {
-    uint16_t want = (uint16_t)(0x0700u | (unsigned char)ch);
+    expect_attr(row, col, ch, 0x07);
+}
+
+static void expect_attr(unsigned row, unsigned col, char ch, unsigned attr)
+{
+    uint16_t want = (uint16_t)((attr << 8) | (unsigned char)ch);
 
     if (scr[row * WIDTH + col] != want) {
         fprintf(stderr, "cell (%u,%u) is 0x%04x, wanted 0x%04x\n", row, col, scr[row * WIDTH + col],
@@ -107,12 +116,60 @@ int main(void)
         expect_cell(0, c, ' ');
     }
 
-    /* SGR colours are swallowed, never printed */
+    /* SGR colours land on the cells: fg, then bg, then reset */
     puts_vga("\x1b[2J");
-    puts_vga("a\x1b[31mb");
-    expect_cell(0, 0, 'a');
-    expect_cell(0, 1, 'b');
-    expect_cell(0, 2, ' ');
+    puts_vga("a\x1b[31mb\x1b[44mc\x1b[0md");
+    expect_attr(0, 0, 'a', 0x07);
+    expect_attr(0, 1, 'b', 0x04);
+    expect_attr(0, 2, 'c', 0x14);
+    expect_attr(0, 3, 'd', 0x07);
+    expect_cell(0, 4, ' ');
+    /* bold keeps working after a colour, erase uses the current colour */
+    puts_vga("\x1b[1;32m");
+    puts_vga("e");
+    expect_attr(0, 4, 'e', 0x0a);
+    puts_vga("\x1b[2K");
+    for (unsigned c = 0; c < WIDTH; ++c) {
+        uint16_t cell = scr[c];
+
+        if ((cell & 0xff00u) != 0x0a00u || (char)cell != ' ') {
+            fprintf(stderr, "cell %u is 0x%04x, wanted green blank\n", c, cell);
+            exit(1);
+        }
+    }
+    puts_vga("\x1b[0m");
+
+    /* cursor hide/show keeps the firmware scan lines, flips only bit 5 */
+    puts_vga("\x1b[?25l");
+    CHECK(stub_cursor_shape_out == (0x0du | 0x20u));
+    puts_vga("\x1b[?25h");
+    CHECK(stub_cursor_shape_out == 0x0du);
+
+    /* alternate screen saves, clears, and restores everything */
+    puts_vga("\x1b[2J");
+    puts_vga("\x1b[31mSHELL");
+    puts_vga("\x1b[1;1H");
+    puts_vga("\x1b[?1049h");
+    expect_cell(0, 0, ' ');
+    puts_vga("EDITOR");
+    expect_attr(0, 0, 'E', 0x07);
+    puts_vga("\x1b[?1049l");
+    expect_attr(0, 0, 'S', 0x04);
+    expect_attr(0, 1, 'H', 0x04);
+    CHECK(stub_cursor_addr == 0);
+    /* nested enter is ignored: the one exit still restores */
+    puts_vga("\x1b[?1049h");
+    puts_vga("X");
+    puts_vga("\x1b[?1049h");
+    puts_vga("Y");
+    expect_attr(0, 0, 'X', 0x07);
+    expect_attr(0, 1, 'Y', 0x07);
+    puts_vga("\x1b[?1049l");
+    expect_attr(0, 0, 'S', 0x04);
+    /* exit without enter is a no-op */
+    puts_vga("\x1b[?1049l");
+    expect_attr(0, 0, 'S', 0x04);
+    puts_vga("\x1b[0m");
 
     /* stray ESC plus follower vanish, text resumes */
     puts_vga("\x1b[2J");

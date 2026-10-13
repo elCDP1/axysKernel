@@ -79,6 +79,9 @@ int axys_initrd_install_defaults(void)
     rc |= put_file("/etc/hostname", 0644u, "axys\n") < 0;
     rc |= put_file("/etc/passwd", 0644u, "root:x:0:0:root:/root:/sbin/init\nuser:x:1000:1000:user:/home/user:/sbin/init\n") < 0;
     rc |= put_file("/etc/group", 0644u, "root:x:0:\nusers:x:1000:user\n") < 0;
+    /* Locked logins until `passwd` sets one: `name:!`. 0600 like the secret. */
+    rc |= put_file("/etc/shadow", 0600u, "root:!\nuser:!\n") < 0;
+    rc |= put_file("/etc/lang", 0644u, "en\n") < 0;
     rc |= put_file("/etc/motd", 0644u, "Welcome to axysOS.\n") < 0;
     rc |= put_file("/etc/secret", 0600u, "root-only data\n") < 0;
     /* Device placeholders so ls/stat see them; open/read/write take the

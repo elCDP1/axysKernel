@@ -24,7 +24,8 @@ make check-usb-storage
 make check-usb-storage-hub
 make check-usb-hotplug
 make check-pci
-make check-shell      # drives the shell over serial: ~80 command cases
+make check-shell      # drives the shell over serial: ~140 command cases
+make check-code       # drives /bin/code over serial: edit, save, quit
 make check-net
 make check-drivers   # every driver scenario above in one run
 make fuzz            # ASan/UBSan host fuzzing (FUZZ_SEED, FUZZ_ITERS)
@@ -101,11 +102,12 @@ files & dirs:   ls cd pwd mkdir touch cp mv rm rmtree stat du find basename
                 dirname tee
 text & data:    cat echo head tail wc grep cut sort uniq tac nl tr strings
                 hexdump cmp seq
-system & users: clear date uptime uname hostname whoami id su chmod chown sync
+system & users: clear date uptime uname hostname whoami id su useradd passwd
+                login chmod chown sync
                 sleep time which random run poweroff halt reboot exit help
 processes & hw: ps kill pid meminfo free df dmesg lscpu lsblk lspci lsusb
                 sysinfo ip ifconfig
-/bin programs:  hello crash heap fileio perms probe fuzz ping dhcp
+/bin programs:  hello crash heap fileio perms probe fuzz ping dhcp code
 ```
 
 **Command lines.** Words are separated by spaces; `'...'` and `"..."` group

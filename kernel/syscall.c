@@ -271,10 +271,14 @@ static axys_int64_t sys_write(struct axys_process *proc, axys_uint64_t fdn, axys
 }
 
 /* Canonical-mode console input: read a whole line (with echo and backspace),
- * hand it out byte by byte. Ctrl-D on an empty line is end of file. */
+ * hand it out byte by byte. Ctrl-D on an empty line is end of file. When the
+ * process set echo off (passwords), nothing is echoed except the final
+ * newline, and consumed bytes are zeroed so the secret does not linger in
+ * the kernel line buffer. */
 static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, axys_uint64_t len)
 {
     axys_uint64_t n;
+    int quiet = proc->echo_off != 0;
 
     if (proc->line_pos >= proc->line_len) {
         int oversize = 0; /* one discarded-remainder flag per over-long line */
@@ -313,14 +317,18 @@ static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, a
             if (c == '\b') {
                 if (!oversize && proc->line_len > 0) {
                     --proc->line_len;
-                    axys_console_write("\b \b");
+                    if (!quiet) {
+                        axys_console_write("\b \b");
+                    }
                 }
                 continue;
             }
             if (c >= 0x20 && c < 0x7f) {
                 if (proc->line_len < sizeof(proc->line) - 1) {
                     proc->line[proc->line_len++] = (char)c;
-                    axys_console_putc((char)c);
+                    if (!quiet) {
+                        axys_console_putc((char)c);
+                    }
                 } else {
                     oversize = 1;
                 }
@@ -334,8 +342,43 @@ static axys_int64_t console_read(struct axys_process *proc, axys_uint64_t buf, a
     if (axys_aspace_copy_to(&proc->space, buf, proc->line + proc->line_pos, n) != 0) {
         return err(AXYS_EFAULT);
     }
+    if (quiet) {
+        axys_memset(proc->line + proc->line_pos, 0, (axys_size_t)n);
+    }
     proc->line_pos += (axys_uint32_t)n;
     return (axys_int64_t)n;
+}
+
+/* Raw-mode console input: bytes as they arrive, no line assembly, no echo,
+ * no backspace handling, no Ctrl-D translation (0x04 is data). Blocks until
+ * at least one byte is there, then hands out what is available up to len.
+ * Callers validated the user buffer before dispatch, like sys_read does. */
+static axys_int64_t console_read_raw(struct axys_process *proc, axys_uint64_t buf,
+                                     axys_uint64_t len)
+{
+    axys_uint64_t n = 0;
+
+    for (;;) {
+        int c = axys_input_getc_nonblock();
+
+        if (c < 0) {
+            if (n > 0) {
+                return (axys_int64_t)n;
+            }
+            c = axys_input_getc(); /* blocks for the first byte */
+        }
+        {
+            char ch = (char)c;
+
+            if (axys_aspace_copy_to(&proc->space, buf + n, &ch, 1) != 0) {
+                return err(AXYS_EFAULT);
+            }
+        }
+        ++n;
+        if (n >= len) {
+            return (axys_int64_t)n;
+        }
+    }
 }
 
 static axys_int64_t sys_read(struct axys_process *proc, axys_uint64_t fdn, axys_uint64_t buf, axys_uint64_t len)
@@ -353,6 +396,9 @@ static axys_int64_t sys_read(struct axys_process *proc, axys_uint64_t fdn, axys_
         return err(AXYS_EFAULT); /* before any blocking */
     }
     if (fd->console) {
+        if (proc->raw_in) {
+            return console_read_raw(proc, buf, len);
+        }
         return console_read(proc, buf, len);
     }
     if (fd->dev == 1) {
@@ -1106,11 +1152,30 @@ axys_int64_t axys_syscall_dispatch_inner(struct axys_process *proc, struct axys_
         }
         return axys_time_set((axys_int64_t)a0) == 0 ? 0 : err(AXYS_ENODEV);
     case AXYS_SYS_CONSOLE:
-        if (a0 != 0) {
-            return err(AXYS_EINVAL);
+        if (a0 == 0) {
+            axys_console_clear();
+            return 0;
         }
-        axys_console_clear();
-        return 0;
+        if (a0 == 1 || a0 == 2) {
+            /* Password input: 1 stops echoing console reads, 2 restores
+             * it. Per process, so a dying reader cannot blind the shell. */
+            proc->echo_off = (a0 == 1);
+            return 0;
+        }
+        if (a0 == 3 || a0 == 4) {
+            /* Fullscreen input: 3 returns console bytes as they arrive
+             * (no line assembly, no echo, Ctrl-C stays data), 4 restores
+             * canonical mode. Per process, like echo. */
+            proc->raw_in = (a0 == 3);
+            return 0;
+        }
+        if (a0 == 5) {
+            /* Buffered input bytes, saturating: raw readers sleep briefly
+             * after ESC and call this to tell a lone ESC (quit) from a
+             * sequence start. */
+            return axys_input_pending();
+        }
+        return err(AXYS_EINVAL);
     case AXYS_SYS_UMASK: {
         axys_uint32_t old = proc->umask;
 

@@ -9,12 +9,13 @@ permissions. Exit status 0 only if every case passes.
 
 usage: tools/qemu-shell-test.py [-v]       (env: ISO, QEMU)
 """
+import hashlib
 import json, os, re, socket, subprocess, sys, tempfile, time
 
 ISO = os.environ.get("ISO", "build/axys.iso")
 QEMU = os.environ.get("QEMU", "qemu-system-x86_64")
 VERBOSE = "-v" in sys.argv
-PROMPT = re.compile(r"axys[#$] $")
+PROMPT = re.compile(r"axys:[^#$]*[#$] ")
 
 tmp = tempfile.mkdtemp(prefix="axys-sh-")
 qsock = os.path.join(tmp, "qmp.sock")
@@ -59,7 +60,7 @@ def run(line, timeout=15.0):
     if not ok:
         text += "\n<<TIMEOUT: no prompt>>"
     # drop the echoed command line and the trailing prompt
-    text = re.sub(r"axys[#$] $", "", text)
+    text = re.sub(r"axys:[^#$]*[#$] ", "", text)
     first, _, rest = text.partition("\n")
     return rest if first.strip().endswith(line.strip()) or line.strip() in first else text
 
@@ -185,6 +186,12 @@ case("touch a; echo hi > b; ls", exact="a\nb")
 case("cp b c; cat c", exact="hi")
 case("mv c e; ls", exact="a\nb\ne")
 case("cd ..; pwd", exact="/tmp")
+case("cd; pwd", exact="/root")          # bare cd goes home (/etc/passwd)
+case("cd ~; pwd", exact="/root")
+case("cd /etc/passwd", want=[r"-20"])   # a file is ENOTDIR, not ENOENT
+case("cd /nonexistent", want=[r"-2"])
+case("cd a b", want=[r"-22"])           # at most one argument
+case("cd /; cd /tmp; cd -; pwd", exact="/\n/")  # cd - prints where it goes
 case("rmtree /tmp/d; ls /tmp/d", want=[r"-2"])
 
 # ---- system commands -------------------------------------------------------------------
@@ -248,8 +255,72 @@ qmp({"execute": "device_del", "arguments": {"id": "kb1"}})
 time.sleep(3)
 case("cat /proc/usb", want=[r"keyboards: 0"], forbid=[r"^dev slot"])
 
+# ---- users and passwords ------------------------------------------------------------
+case("useradd bob; id bob", want=[r"uid=1001 gid=1001"])
+case("grep bob /etc/passwd", want=[r"^bob:x:1001:1001:bob:/home/bob:/sbin/init$"])
+case("grep bob /etc/group", want=[r"^bob:x:1001:$"])
+case("grep bob /etc/shadow", want=[r"^bob:!$"])
+case("stat /home/bob", want=[r"type: directory", r"uid: 1001 gid: 1001", r"mode: 00755"])
+case("useradd bob", want=[r"-17"])
+case("useradd 9bad", want=[r"-22"])
+case("useradd x y", want=[r"-22"])
+case("useradd", want=[r"-22"])
+case("useradd lck")
+case("login lck\nwhatever", want=[r"-13"])  # locked accounts never get in
+out = run("login nosuch\nx")
+checks += 1
+if not re.search(r"-13", out):
+    failures.append(("login nosuch", ["missing /-13/"], out))
+    print("FAIL  login nosuch: missing /-13/")
+out = run("passwd bob\ns3cr3t\ns3cr3t")
+checks += 1
+if not re.search(r"New password:", out) or not re.search(r"Retype", out) or \
+        not re.search(r"Password updated", out) or re.search(r"s3cr3t", out):
+    failures.append(("passwd bob", ["bad interactive flow (or the secret echoed)"], out))
+    print("FAIL  passwd bob: bad interactive flow (or the secret echoed)")
+# the stored hash must match an independent SHA-256 over salt+password
+out = run("grep bob /etc/shadow")
+checks += 1
+m = re.search(r"^bob:([0-9a-f]{16})\$([0-9a-f]{64})$", out, re.M)
+if not m or hashlib.sha256(bytes.fromhex(m.group(1)) + b"s3cr3t").hexdigest() != m.group(2):
+    failures.append(("shadow hash", ["not salt$sha256(salt+password)"], out))
+    print("FAIL  shadow hash: not salt$sha256(salt+password)")
+case("passwd bob\nnope\nmismatch", want=[r"-22"])  # retry must not match
+out = run("login bob\nwrongpw")
+checks += 1
+if not re.search(r"-13", out):
+    failures.append(("login wrong password", ["missing /-13/"], out))
+    print("FAIL  login wrong password: missing /-13/")
+out = run("login bob\ns3cr3t")
+checks += 1
+if "<<TIMEOUT" in out:
+    failures.append(("login bob", ["timeout"], out))
+    print("FAIL  login bob: timeout")
+case("whoami", exact="bob")
+case("pwd", exact="/home/bob")
+case("exit")  # back to the root console for the rest of the suite
+
+# ---- interface language ------------------------------------------------------------
+case("lang", exact="en")
+case("lang es", exact="es")
+case("help", want=[r"Archivos y directorios", r"Sistema y usuarios"])
+case("lang xx", want=[r"-22"])
+case("lang en", exact="en")
+case("cat /etc/lang", exact="en")
+case("help lang", want=[r"en\|es", r"/etc/lang"])
+
+# ---- code editor (non-interactive paths; keys are driven by check-code) ------------
+case("help code", want=[r"fullscreen", r"Ctrl\+S"])
+case("type code", want=[r"/bin/code"])
+case("code /nope/f", want=[r"bad path"])
+case("code /bin/hello", want=[r"binary"])
+
 # ---- permissions --------------------------------------------------------------------------
 case("su 1000; whoami", want=[r"user|1000"])
+case("useradd zed", want=[r"-1"])  # only root manages users
+case("passwd", want=[r"-1"])
+case("login bob", want=[r"-1"])
+case("lang es", want=[r"-1"])  # only root changes it
 case("echo x > /etc/shadow", want=[r"-13"])
 case("echo x > /tmp/mine; cat /tmp/mine", exact="x")
 case("date -s '2031-01-01 00:00:00'", want=[r"-1\b|-13"])  # only root sets the clock

@@ -424,8 +424,13 @@ static void phase_redirect(u64 iters)
         fail("time() returned an unexpected error");
         return;
     }
-    /* console(): only op 0 exists */
-    if (sys3(SYS_CONSOLE, 1, 0, 0) >= 0 || sys3(SYS_CONSOLE, -1, 0, 0) >= 0 ||
+    /* console(): ops 0 (clear), 1/2 (echo off/on), 3/4 (raw off/on) and
+     * 5 (pending count) exist; echo and raw must come back to canonical
+     * so later output and input are visible and line-buffered. */
+    if (sys3(SYS_CONSOLE, 1, 0, 0) != 0 || sys3(SYS_CONSOLE, 2, 0, 0) != 0 ||
+        sys3(SYS_CONSOLE, 3, 0, 0) != 0 || sys3(SYS_CONSOLE, 4, 0, 0) != 0 ||
+        sys3(SYS_CONSOLE, 5, 0, 0) < 0 ||
+        sys3(SYS_CONSOLE, -1, 0, 0) >= 0 || sys3(SYS_CONSOLE, 6, 0, 0) >= 0 ||
         sys3(SYS_CONSOLE, 0x7fffffff, 0, 0) >= 0) {
         fail("console accepted an unknown operation");
         return;

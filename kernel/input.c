@@ -260,6 +260,17 @@ int axys_input_getc_nonblock(void)
     return c;
 }
 
+int axys_input_pending(void)
+{
+    axys_uint64_t flags = axys_cpu_save_flags();
+    axys_uint32_t n;
+
+    axys_cpu_disable_interrupts();
+    n = (ring_head - ring_tail) & (RING_SIZE - 1u);
+    axys_cpu_restore_flags(flags);
+    return n > 255u ? 255 : (int)n;
+}
+
 int axys_input_getc(void)
 {
     for (;;) {

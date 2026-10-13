@@ -63,6 +63,8 @@ struct axys_process {
     axys_uint32_t uid;
     axys_uint32_t gid;
     axys_uint32_t umask;       /* file mode creation mask, 022 by default */
+    int echo_off;            /* 1: console_read does not echo (passwords) */
+    int raw_in;              /* 1: console reads return bytes now (editors) */
     int killed;              /* set by kill/Ctrl-C; honoured on the next kernel entry/exit */
     int exit_code;
     struct axys_aspace space;
